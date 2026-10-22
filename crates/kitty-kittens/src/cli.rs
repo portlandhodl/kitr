@@ -29,6 +29,10 @@ Commands:
   run [OPTIONS] NAME [ARGS...]  Run a kitten
   @ [ARGS...]                   Pass arguments to the remote-control client
   icat [FILE...]                Display images (Rust-native kitten)
+  clipboard [OPTIONS]           Read/write the clipboard through OSC 52
+  notify [OPTIONS] TITLE        Send a desktop notification (OSC 99/777)
+  hints [OPTIONS]               Generate text/URL hints (no overlay UI)
+  unicode_input [OPTIONS]       Search/select Unicode characters (no UI)
   list                          List installed kittens
   help [NAME]                   Show help for all kittens or one kitten
   manifest [NAME]               Emit manifest JSON for all kittens or one kitten

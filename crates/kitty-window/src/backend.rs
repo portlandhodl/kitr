@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use crate::clipboard::{ClipboardError, ClipboardReply, ClipboardToken};
+use crate::dnd::DragSourceData;
 use crate::types::{
     KeyInput, MouseButton, PointerShape, Selection, WindowConfig, WindowError, WindowEvent,
 };
@@ -218,6 +219,14 @@ impl WindowBackend {
         }
     }
 
+    pub fn has_touch_input(&self) -> bool {
+        match self {
+            Self::X11(window) => window.has_touch_input(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.has_touch_input(),
+        }
+    }
+
     pub fn ime_enabled(&self) -> bool {
         match self {
             Self::X11(window) => window.ime_enabled(),
@@ -255,6 +264,170 @@ impl WindowBackend {
             Self::X11(window) => window.drag_target(),
             #[cfg(feature = "wayland")]
             Self::Wayland(window) => window.drag_target(),
+        }
+    }
+
+    pub fn start_drag(&mut self, data: impl Into<DragSourceData>) -> Result<(), WindowError> {
+        let data = data.into();
+        match self {
+            Self::X11(window) => window.start_drag(&data),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.start_drag(&data),
+        }
+    }
+
+    pub fn start_text_drag(&mut self, text: &str) -> Result<(), WindowError> {
+        match self {
+            Self::X11(window) => window.start_text_drag(text),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.start_text_drag(text),
+        }
+    }
+
+    pub fn start_file_drag(&mut self, paths: &[String]) -> Result<(), WindowError> {
+        match self {
+            Self::X11(window) => window.start_file_drag(paths),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.start_file_drag(paths),
+        }
+    }
+
+    pub fn start_drag_to_at(
+        &mut self,
+        data: impl Into<DragSourceData>,
+        target: u64,
+        root_x: i32,
+        root_y: i32,
+    ) -> Result<(), WindowError> {
+        let data = data.into();
+        match self {
+            Self::X11(window) => window.start_drag_to_at(&data, target as _, root_x, root_y),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.start_drag_to_at(&data, target, root_x, root_y),
+        }
+    }
+
+    pub fn start_drag_to(
+        &mut self,
+        data: impl Into<DragSourceData>,
+        target: u64,
+    ) -> Result<(), WindowError> {
+        let data = data.into();
+        match self {
+            Self::X11(window) => window.start_drag_to(&data, target as _),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.start_drag_to(&data, target),
+        }
+    }
+
+    pub fn drag_drop(&mut self) -> Result<(), WindowError> {
+        match self {
+            Self::X11(window) => window.drag_drop(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.drag_drop(),
+        }
+    }
+
+    pub fn finish_drag(&mut self, accepted: bool) -> bool {
+        match self {
+            Self::X11(window) => window.finish_drag(accepted),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.finish_drag(accepted),
+        }
+    }
+
+    pub fn cancel_drag(&mut self) -> bool {
+        match self {
+            Self::X11(window) => window.cancel_drag(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.cancel_drag(),
+        }
+    }
+
+    pub fn is_drag_source_active(&self) -> bool {
+        match self {
+            Self::X11(window) => window.is_drag_source_active(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.is_drag_source_active(),
+        }
+    }
+
+    pub fn drag_source_targets(&self) -> &[String] {
+        match self {
+            Self::X11(window) => window.drag_source_targets(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.drag_source_targets(),
+        }
+    }
+
+    pub fn set_cursor_scale(&mut self, scale: f64) {
+        match self {
+            Self::X11(window) => window.set_cursor_scale(scale),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.set_cursor_scale(scale),
+        }
+    }
+
+    pub fn cursor_scale(&self) -> f64 {
+        match self {
+            Self::X11(window) => window.cursor_scale(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.cursor_scale(),
+        }
+    }
+
+    pub fn set_cursor_theme<'a>(&mut self, theme: impl Into<Option<&'a str>>) {
+        let theme = theme.into();
+        match self {
+            Self::X11(window) => window.set_cursor_theme(theme),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.set_cursor_theme(theme),
+        }
+    }
+
+    /// Alias for callers that pass a theme name directly.
+    pub fn set_cursor_theme_name(&mut self, theme: &str) {
+        self.set_cursor_theme(theme);
+    }
+
+    pub fn cursor_theme_name(&self) -> &str {
+        match self {
+            Self::X11(window) => window.cursor_theme_name(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.cursor_theme_name(),
+        }
+    }
+
+    pub fn set_cursor_size(&mut self, size: impl Into<Option<u32>>) {
+        let size = size.into();
+        match self {
+            Self::X11(window) => window.set_cursor_size(size),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.set_cursor_size(size),
+        }
+    }
+
+    pub fn cursor_size(&self) -> u32 {
+        match self {
+            Self::X11(window) => window.cursor_size(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.cursor_size(),
+        }
+    }
+
+    pub fn refresh_cursor_theme(&mut self) -> bool {
+        match self {
+            Self::X11(window) => window.refresh_cursor_theme(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.refresh_cursor_theme(),
+        }
+    }
+
+    pub fn reload_cursor_theme(&mut self) -> bool {
+        match self {
+            Self::X11(window) => window.reload_cursor_theme(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.reload_cursor_theme(),
         }
     }
 

@@ -116,6 +116,16 @@ pub enum DecorationKind {
     Hyperlink,
     /// A tab-bar border segment.
     TabBarBorder,
+    /// A split-pane/window border or background gap.
+    PaneBorder,
+}
+
+/// A solid rectangle supplied by the host for window chrome (pane borders and
+/// the background gaps between splits).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SolidRect {
+    pub rect: Rect,
+    pub color: Rgba8,
 }
 
 /// A decoration rectangle in device pixels.
@@ -226,6 +236,11 @@ pub struct RenderConfig {
     pub hyperlink_hover_bg: Option<Rgba8>,
     /// Optional tab bar at the top of the viewport.
     pub tab_bar: Option<TabBarSpec>,
+    /// Solid rectangles painted below cell backgrounds, used for split-pane
+    /// background gaps.
+    pub pane_backgrounds: Vec<SolidRect>,
+    /// Solid rectangles painted as pane/split borders.
+    pub pane_borders: Vec<SolidRect>,
     /// Try to shape runs of adjacent cells into ligature/combining sprites.
     pub shaped_runs: bool,
 }
@@ -256,6 +271,8 @@ impl Default for RenderConfig {
             hyperlink_hover: None,
             hyperlink_hover_bg: None,
             tab_bar: None,
+            pane_backgrounds: Vec::new(),
+            pane_borders: Vec::new(),
             shaped_runs: true,
         }
     }
@@ -326,6 +343,9 @@ pub struct Frame {
     pub tab_bar: Option<TabBarFrame>,
     /// Counters for overlay and shaped-run work.
     pub overlay_stats: OverlayStats,
+    /// When true the backend must not clear the scissor rectangles before
+    /// drawing. Used for transparent chrome overlays drawn over pane frames.
+    pub skip_clear: bool,
 }
 
 impl Frame {
@@ -347,6 +367,7 @@ impl Frame {
         self.hyperlink_spans.clear();
         self.tab_bar = None;
         self.overlay_stats = OverlayStats::default();
+        self.skip_clear = false;
     }
 
     /// Total number of instances in the frame.
@@ -1078,15 +1099,44 @@ impl InstanceGenerator {
         }
         drop(tc);
 
+        if !self.config.pane_backgrounds.is_empty() {
+            let gaps: Vec<BackgroundInstance> = self
+                .config
+                .pane_backgrounds
+                .iter()
+                .map(|solid| BackgroundInstance {
+                    rect: solid.rect,
+                    cell_x: 0,
+                    cell_y: 0,
+                    color: solid.color,
+                    is_default_bg: false,
+                    flags: InstanceFlags::default(),
+                })
+                .collect();
+            frame.backgrounds.splice(0..0, gaps);
+        }
+        for border in &self.config.pane_borders {
+            frame.decorations.push(DecorationInstance {
+                rect: border.rect,
+                cell_x: 0,
+                cell_y: 0,
+                kind: DecorationKind::PaneBorder,
+                color: border.color,
+                flags: InstanceFlags::default(),
+            });
+        }
+
         let (viewport_width, viewport_height) = self.config.viewport_for(&frame.geometry);
         if let Some(spec) = &self.config.tab_bar {
             emit_tab_bar(spec, &self.config, frame, atlas, rasterizer, viewport_width);
         }
 
         let animations = self.animations.borrow();
-        images::collect_protocol_images_with_animations(
+        let palette = crate::colors::indexed_image_palette(resolver);
+        images::collect_protocol_images_with_palette(
             screen,
             Some(&animations),
+            &palette,
             &frame.geometry,
             viewport_width,
             viewport_height,
@@ -1410,7 +1460,7 @@ mod tests {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
         ];
         s.handle_graphics_command(image).unwrap();
-        let mut put = parse_raw(b"a=p,i=7,p=3,c=2,r=1,x=1,y=2,z=-1").unwrap();
+        let mut put = parse_raw(b"a=p,i=7,p=3,c=2,r=1,X=1,Y=2,z=-1").unwrap();
         put.payload.clear();
         s.handle_graphics_command(put).unwrap();
 
@@ -1604,6 +1654,46 @@ mod tests {
             tab_bar: Some(spec),
             ..RenderConfig::default()
         }
+    }
+
+    #[test]
+    fn pane_borders_and_background_gaps_are_emitted() {
+        let mut s = Screen::builder(2, 1).build().unwrap();
+        s.draw_text(&[b'a' as u32]);
+        let config = RenderConfig {
+            metrics: CellMetrics {
+                cell_width: 10.0,
+                cell_height: 10.0,
+                baseline: 8.0,
+                underline_position: 2.0,
+                underline_thickness: 1.0,
+                strikethrough_position: 5.0,
+                strikethrough_thickness: 1.0,
+            },
+            pane_backgrounds: vec![SolidRect {
+                rect: Rect::new(0.0, 0.0, 20.0, 10.0),
+                color: Rgba8::rgb(1, 2, 3),
+            }],
+            pane_borders: vec![SolidRect {
+                rect: Rect::new(10.0, 0.0, 1.0, 10.0),
+                color: Rgba8::rgb(4, 5, 6),
+            }],
+            ..RenderConfig::default()
+        };
+        let mut atlas = GlyphAtlas::new(AtlasConfig::default());
+        let mut r = rasterizer();
+        let res = resolver();
+        let mut frame = Frame::default();
+        InstanceGenerator::new(config).generate(&s, &mut atlas, &mut r, &res, &mut frame);
+        assert!(frame
+            .backgrounds
+            .iter()
+            .any(|b| b.color == Rgba8::rgb(1, 2, 3)));
+        assert!(frame.decorations.iter().any(|d| {
+            d.kind == DecorationKind::PaneBorder
+                && d.color == Rgba8::rgb(4, 5, 6)
+                && d.rect == Rect::new(10.0, 0.0, 1.0, 10.0)
+        }));
     }
 
     #[test]

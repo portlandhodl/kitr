@@ -232,6 +232,297 @@ impl DragSession {
     }
 }
 
+/// Payload offered by a local drag source.
+///
+/// A source can carry plain text, a list of local files, or both. File lists
+/// are encoded as an RFC 2483 `text/uri-list`; text is offered under the usual
+/// UTF-8 MIME types so that both native applications and terminals accept it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DragSourceData {
+    pub text: Option<String>,
+    pub paths: Vec<String>,
+}
+
+impl DragSourceData {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            paths: Vec::new(),
+        }
+    }
+
+    pub fn from_paths(paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            text: None,
+            paths: paths.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = Some(text.into());
+        self
+    }
+
+    pub fn with_paths(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.paths.is_empty()
+    }
+
+    /// MIME types offered by this source, in preference order.
+    pub fn targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        if !self.paths.is_empty() {
+            targets.push("text/uri-list".to_owned());
+        }
+        if self.text.is_some() {
+            for mime in [
+                "text/plain;charset=utf-8",
+                "text/plain",
+                "UTF8_STRING",
+                "STRING",
+            ] {
+                targets.push(mime.to_owned());
+            }
+        }
+        targets
+    }
+
+    /// Alias for [`DragSourceData::targets`].
+    pub fn mimes(&self) -> Vec<String> {
+        self.targets()
+    }
+
+    /// Data for a named target, if this source offers it.
+    pub fn target_data(&self, target: &str) -> Option<Vec<u8>> {
+        if target.eq_ignore_ascii_case("TARGETS") {
+            let mut payload = String::from("TARGETS\n");
+            payload.push_str(&self.targets().join("\n"));
+            if !self.targets().is_empty() {
+                payload.push('\n');
+            }
+            return Some(payload.into_bytes());
+        }
+        if target.eq_ignore_ascii_case("text/uri-list") {
+            if self.paths.is_empty() {
+                return None;
+            }
+            return Some(build_uri_list(&self.paths).into_bytes());
+        }
+        if target.eq_ignore_ascii_case("UTF8_STRING")
+            || target.eq_ignore_ascii_case("STRING")
+            || target.eq_ignore_ascii_case("text/plain")
+            || target
+                .get(..10)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/plain"))
+                && target.get(10..).is_some_and(|rest| rest.starts_with(';'))
+        {
+            return self.text.as_ref().map(|text| text.as_bytes().to_vec());
+        }
+        None
+    }
+}
+
+impl From<&str> for DragSourceData {
+    fn from(text: &str) -> Self {
+        Self::from_text(text)
+    }
+}
+
+impl From<String> for DragSourceData {
+    fn from(text: String) -> Self {
+        Self::from_text(text)
+    }
+}
+
+impl From<&String> for DragSourceData {
+    fn from(text: &String) -> Self {
+        Self::from_text(text.clone())
+    }
+}
+
+impl From<Vec<String>> for DragSourceData {
+    fn from(paths: Vec<String>) -> Self {
+        Self::from_paths(paths)
+    }
+}
+
+impl From<&[String]> for DragSourceData {
+    fn from(paths: &[String]) -> Self {
+        Self::from_paths(paths.iter().cloned())
+    }
+}
+
+impl From<&Vec<String>> for DragSourceData {
+    fn from(paths: &Vec<String>) -> Self {
+        Self::from_paths(paths.iter().cloned())
+    }
+}
+
+impl From<&DragSourceData> for DragSourceData {
+    fn from(data: &DragSourceData) -> Self {
+        data.clone()
+    }
+}
+
+/// Encode local paths as an RFC 2483 `text/uri-list` payload.
+pub fn build_uri_list(paths: &[String]) -> String {
+    let mut payload = String::new();
+    for path in paths {
+        payload.push_str(&path_to_uri(path));
+        payload.push_str("\r\n");
+    }
+    payload
+}
+
+fn path_to_uri(path: &str) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(*byte as char)
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(uri, "%{other:02X}");
+            }
+        }
+    }
+    uri
+}
+
+/// State of a local drag source, independent of the display-server protocol.
+///
+/// The state machine is intentionally small: a source is begun with a set of
+/// targets and a serial, optionally gains an accepted target, and then either
+/// finishes (dropped) or is cancelled. Both the Wayland `wl_data_source` and
+/// the X11 XDND source paths drive the same state.
+#[derive(Clone, Debug, Default)]
+pub struct DragSourceState {
+    active: bool,
+    targets: Vec<String>,
+    chosen: Option<String>,
+    accepted: bool,
+    dropped: bool,
+    finished: bool,
+    cancelled: bool,
+    serial: u32,
+}
+
+impl DragSourceState {
+    /// Begin a source. Returns `false` if one was already active.
+    pub fn begin<I, S>(&mut self, targets: I, serial: u32) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if self.active {
+            return false;
+        }
+        self.active = true;
+        self.targets = targets.into_iter().map(Into::into).collect();
+        self.chosen = None;
+        self.accepted = false;
+        self.dropped = false;
+        self.finished = false;
+        self.cancelled = false;
+        self.serial = serial;
+        true
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active && !self.finished && !self.cancelled
+    }
+
+    pub fn targets(&self) -> &[String] {
+        &self.targets
+    }
+
+    pub fn chosen_target(&self) -> Option<&str> {
+        self.chosen.as_deref()
+    }
+
+    pub fn set_chosen_target(&mut self, target: Option<&str>) -> Option<String> {
+        self.chosen = target.and_then(|name| {
+            self.targets
+                .iter()
+                .find(|offered| offered.eq_ignore_ascii_case(name))
+                .cloned()
+        });
+        self.chosen.clone()
+    }
+
+    pub fn serial(&self) -> u32 {
+        self.serial
+    }
+
+    pub fn set_serial(&mut self, serial: u32) {
+        self.serial = serial;
+    }
+
+    pub fn is_accepted(&self) -> bool {
+        self.accepted
+    }
+
+    pub fn set_accepted(&mut self, accepted: bool) {
+        self.accepted = accepted;
+    }
+
+    pub fn has_dropped(&self) -> bool {
+        self.dropped
+    }
+
+    pub fn mark_dropped(&mut self) -> bool {
+        if !self.is_active() || self.dropped {
+            return false;
+        }
+        self.dropped = true;
+        self.accepted = true;
+        true
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Finish the drag. Returns `true` when a source was active.
+    pub fn finish(&mut self, accepted: bool) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        self.accepted = accepted;
+        self.finished = true;
+        self.active = false;
+        true
+    }
+
+    /// Cancel the drag. Returns `true` when a source was active.
+    pub fn cancel(&mut self) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        self.cancelled = true;
+        self.accepted = false;
+        self.active = false;
+        true
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 impl fmt::Display for DropTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.mime())
@@ -322,6 +613,63 @@ mod tests {
             drag.accept(Some("utf8_string")),
             Some("UTF8_STRING".to_owned())
         );
+    }
+
+    #[test]
+    fn drag_source_data_encodes_uri_lists_and_text() {
+        let data = DragSourceData::from_paths(["/tmp/a b.txt", "/tmp/café.txt"]).with_text("hello");
+        let targets = data.targets();
+        assert!(targets.contains(&"text/uri-list".to_owned()));
+        assert!(targets.contains(&"UTF8_STRING".to_owned()));
+        let uri = data.target_data("text/uri-list").expect("uri list");
+        let uri = String::from_utf8(uri).expect("utf8");
+        assert!(uri.contains("file:///tmp/a%20b.txt"));
+        assert!(uri.contains("file:///tmp/caf%C3%A9.txt"));
+        assert_eq!(
+            data.target_data("UTF8_STRING").as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert!(DragSourceData::from_text("x")
+            .target_data("text/uri-list")
+            .is_none());
+    }
+
+    #[test]
+    fn drag_source_state_machine_finishes_and_cancels() {
+        let mut source = DragSourceState::default();
+        assert!(source.begin(vec!["text/uri-list".to_owned()], 7));
+        assert!(source.is_active());
+        assert_eq!(source.serial(), 7);
+        assert!(
+            !source.begin(Vec::<String>::new(), 8),
+            "a second begin is refused"
+        );
+        assert_eq!(
+            source.set_chosen_target(Some("TEXT/URI-LIST")),
+            Some("text/uri-list".to_owned())
+        );
+        assert!(source.mark_dropped());
+        assert!(source.has_dropped());
+        assert!(source.is_accepted());
+        assert!(source.finish(true));
+        assert!(source.is_finished());
+        assert!(!source.is_active());
+        assert!(!source.finish(true));
+
+        let mut source = DragSourceState::default();
+        assert!(source.begin(vec!["UTF8_STRING".to_owned()], 1));
+        assert!(source.cancel());
+        assert!(source.is_cancelled());
+        assert!(!source.is_active());
+        assert!(!source.cancel());
+    }
+
+    #[test]
+    fn drag_source_ignores_unoffered_targets() {
+        let mut source = DragSourceState::default();
+        source.begin(vec!["UTF8_STRING".to_owned()], 1);
+        assert_eq!(source.set_chosen_target(Some("image/png")), None);
+        assert_eq!(source.chosen_target(), None);
     }
 
     #[test]

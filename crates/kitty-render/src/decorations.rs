@@ -732,6 +732,120 @@ pub fn add_borders(
     }
 }
 
+/// A visible pane rectangle used to derive split borders.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneBorderPane {
+    pub rect: Rect,
+    pub active: bool,
+    pub window_id: i64,
+}
+
+/// One split-border strip, coloured according to the pane on whose side it
+/// lies. Neighbouring panes each contribute their own half of the 2x border
+/// gap, matching `Pair.layout_pair()` in `kitty/layout/splits.py`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneBorderLine {
+    pub rect: Rect,
+    pub active: bool,
+    pub window_id: i64,
+}
+
+/// Compute minimal split borders for visible pane rectangles.
+///
+/// This mirrors kitty's `draw_minimal_borders`: a pane only gets a border on
+/// an edge that touches another pane. The strip is placed just outside the
+/// pane, so two adjacent panes produce two contiguous thickness-wide strips.
+/// When `draw_all` is set (kitty's non-minimal mode), all four edges of every
+/// pane are returned instead.
+pub fn pane_border_rects(
+    panes: &[PaneBorderPane],
+    thickness: f32,
+    draw_all: bool,
+) -> Vec<PaneBorderLine> {
+    let mut ans = Vec::new();
+    if thickness <= 0.0 || panes.is_empty() {
+        return ans;
+    }
+    let t = thickness;
+    for (i, pane) in panes.iter().enumerate() {
+        let r = pane.rect;
+        if draw_all {
+            ans.push(PaneBorderLine {
+                rect: Rect::new(r.x, r.y - t, r.width, t),
+                active: pane.active,
+                window_id: pane.window_id,
+            });
+            ans.push(PaneBorderLine {
+                rect: Rect::new(r.x, r.bottom(), r.width, t),
+                active: pane.active,
+                window_id: pane.window_id,
+            });
+            ans.push(PaneBorderLine {
+                rect: Rect::new(r.x - t, r.y, t, r.height),
+                active: pane.active,
+                window_id: pane.window_id,
+            });
+            ans.push(PaneBorderLine {
+                rect: Rect::new(r.right(), r.y, t, r.height),
+                active: pane.active,
+                window_id: pane.window_id,
+            });
+            continue;
+        }
+        for (j, other) in panes.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let o = other.rect;
+            let overlap_y = r.y.max(o.y) < r.bottom().min(o.bottom());
+            let overlap_x = r.x.max(o.x) < r.right().min(o.right());
+            // Horizontal neighbour: one pane's right edge meets the other's
+            // left edge (allow a small tolerance for rounded pixel geometry).
+            let horizontal = overlap_y && (r.right() - o.x).abs() <= t;
+            let horizontal_rev = overlap_y && (o.right() - r.x).abs() <= t;
+            if horizontal {
+                let top = r.y.max(o.y);
+                let bottom = r.bottom().min(o.bottom());
+                ans.push(PaneBorderLine {
+                    rect: Rect::new(r.right(), top, t, bottom - top),
+                    active: pane.active,
+                    window_id: pane.window_id,
+                });
+            }
+            if horizontal_rev {
+                let top = r.y.max(o.y);
+                let bottom = r.bottom().min(o.bottom());
+                ans.push(PaneBorderLine {
+                    rect: Rect::new(r.x - t, top, t, bottom - top),
+                    active: pane.active,
+                    window_id: pane.window_id,
+                });
+            }
+            let vertical = overlap_x && (r.bottom() - o.y).abs() <= t;
+            let vertical_rev = overlap_x && (o.bottom() - r.y).abs() <= t;
+            if vertical {
+                let left = r.x.max(o.x);
+                let right = r.right().min(o.right());
+                ans.push(PaneBorderLine {
+                    rect: Rect::new(left, r.bottom(), right - left, t),
+                    active: pane.active,
+                    window_id: pane.window_id,
+                });
+            }
+            if vertical_rev {
+                let left = r.x.max(o.x);
+                let right = r.right().min(o.right());
+                ans.push(PaneBorderLine {
+                    rect: Rect::new(left, r.y - t, right - left, t),
+                    active: pane.active,
+                    window_id: pane.window_id,
+                });
+            }
+        }
+    }
+    ans
+}
+
 /// The edge a tab bar is attached to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Edge {
@@ -1339,6 +1453,58 @@ mod tests {
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[0].rect(), Rect::new(0.0, 0.0, 5.0, 600.0));
         assert_eq!(rects[1].rect(), Rect::new(35.0, 0.0, 5.0, 600.0));
+    }
+
+    #[test]
+    fn minimal_pane_borders_only_touch_neighbours() {
+        let panes = [
+            PaneBorderPane {
+                rect: Rect::new(0.0, 0.0, 400.0, 300.0),
+                active: true,
+                window_id: 1,
+            },
+            PaneBorderPane {
+                rect: Rect::new(400.0, 0.0, 400.0, 300.0),
+                active: false,
+                window_id: 2,
+            },
+        ];
+        let lines = pane_border_rects(&panes, 2.0, false);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].rect, Rect::new(400.0, 0.0, 2.0, 300.0));
+        assert!(lines[0].active);
+        assert_eq!(lines[1].rect, Rect::new(398.0, 0.0, 2.0, 300.0));
+        assert!(!lines[1].active);
+
+        let single = [panes[0]];
+        assert!(pane_border_rects(&single, 2.0, false).is_empty());
+        let full = pane_border_rects(&single, 2.0, true);
+        assert_eq!(full.len(), 4);
+        assert_eq!(full[0].rect, Rect::new(0.0, -2.0, 400.0, 2.0));
+        assert_eq!(full[1].rect, Rect::new(0.0, 300.0, 400.0, 2.0));
+        assert_eq!(full[2].rect, Rect::new(-2.0, 0.0, 2.0, 300.0));
+        assert_eq!(full[3].rect, Rect::new(400.0, 0.0, 2.0, 300.0));
+        assert!(pane_border_rects(&panes, 0.0, true).is_empty());
+    }
+
+    #[test]
+    fn pane_borders_support_vertical_splits() {
+        let panes = [
+            PaneBorderPane {
+                rect: Rect::new(0.0, 0.0, 300.0, 200.0),
+                active: false,
+                window_id: 1,
+            },
+            PaneBorderPane {
+                rect: Rect::new(0.0, 200.0, 300.0, 100.0),
+                active: true,
+                window_id: 2,
+            },
+        ];
+        let lines = pane_border_rects(&panes, 1.0, false);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].rect, Rect::new(0.0, 200.0, 300.0, 1.0));
+        assert_eq!(lines[1].rect, Rect::new(0.0, 199.0, 300.0, 1.0));
     }
 
     #[test]

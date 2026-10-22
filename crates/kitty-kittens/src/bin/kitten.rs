@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The `kitten` binary: native launcher, `icat`, remote control and shell
-//! integration snippets.
+//! The `kitten` binary: native launcher, native kittens, remote control and
+//! shell integration snippets.
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use kitty_kittens::cli::{execute_command, parse_kitten_command, CommandAction};
+use kitty_kittens::clipboard::{parse_clipboard_args, run_clipboard, ClipboardAction};
 use kitty_kittens::env::KittenEnvironment;
+use kitty_kittens::hints::run_hints_cli;
 use kitty_kittens::icat::{parse_icat_args, run_icat, IcatArgs, ICAT_USAGE};
 use kitty_kittens::launch::{BootstrapEnv, LaunchOptions};
+use kitty_kittens::native::native_kitten;
+use kitty_kittens::notify::run_notify_cli;
 use kitty_kittens::remote::{parse_remote_args, run_remote_options};
 use kitty_kittens::shell_integration::{discover_shell_integration_dir, install_snippets, Shell};
+use kitty_kittens::terminal::StdioTransport;
+use kitty_kittens::unicode_input::run_unicode_input_cli;
 use kitty_kittens::{DiscoveryConfig, KittenRegistry};
 
 fn io_error(error: impl std::fmt::Display) -> String {
@@ -88,21 +94,91 @@ fn run_remote_command(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn is_icat_invocation(args: &[String]) -> Option<&[String]> {
-    match args.first().map(String::as_str) {
-        Some("icat") | Some("+icat") => Some(&args[1..]),
+fn run_native_clipboard(args: &[String]) -> Result<ExitCode, String> {
+    let opts = parse_clipboard_args(args).map_err(io_error)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdin = stdin.lock();
+    let mut stdout = stdout.lock();
+    // Only the get path needs to read terminal replies. Using a reader thread
+    // for filter mode would race with reading the copied text from stdin.
+    let mut transport = if opts.action == ClipboardAction::Get {
+        StdioTransport::new()
+    } else {
+        StdioTransport::with_io(io::empty(), io::stdout())
+    };
+    if opts.help {
+        use kitty_kittens::clipboard::CLIPBOARD_USAGE;
+        writeln!(stdout, "{CLIPBOARD_USAGE}").map_err(io_error)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    run_clipboard(&opts, &mut transport, &mut stdin, &mut stdout).map_err(io_error)?;
+    stdout.flush().map_err(io_error)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_native_notify(args: &[String]) -> Result<ExitCode, String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdin = stdin.lock();
+    let mut stdout = stdout.lock();
+    let mut transport = StdioTransport::new();
+    run_notify_cli(args, &mut transport, &mut stdout, &mut stdin).map_err(io_error)?;
+    stdout.flush().map_err(io_error)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_native_hints(args: &[String]) -> Result<ExitCode, String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdin = stdin.lock();
+    let mut stdout = stdout.lock();
+    run_hints_cli(args, &mut stdin, &mut stdout).map_err(io_error)?;
+    stdout.flush().map_err(io_error)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_native_unicode_input(args: &[String]) -> Result<ExitCode, String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdin = stdin.lock();
+    let mut stdout = stdout.lock();
+    run_unicode_input_cli(args, &mut stdin, &mut stdout).map_err(io_error)?;
+    stdout.flush().map_err(io_error)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Detect `kitten NAME`, `kitten +NAME`, `kitten run NAME` and
+/// `kitten run -- NAME` when NAME is implemented natively.
+fn native_invocation(args: &[String]) -> Option<(&'static str, &[String])> {
+    let (name, rest) = match args.first().map(String::as_str) {
         Some("run") => match args.get(1).map(String::as_str) {
-            Some("icat") => Some(&args[2..]),
-            Some("--") if args.get(2).map(String::as_str) == Some("icat") => Some(&args[3..]),
-            _ => None,
+            Some("--") => (args.get(2).map(String::as_str)?, &args[3..]),
+            Some(name) => (name, &args[2..]),
+            None => return None,
         },
-        _ => None,
+        Some(name) => (name, &args[1..]),
+        None => return None,
+    };
+    let name = name.strip_prefix('+').unwrap_or(name);
+    let native = native_kitten(name)?;
+    Some((native.name, rest))
+}
+
+fn run_native(name: &str, args: &[String]) -> Result<ExitCode, String> {
+    match name {
+        "icat" => run_native_icat(args),
+        "clipboard" => run_native_clipboard(args),
+        "notify" => run_native_notify(args),
+        "hints" => run_native_hints(args),
+        "unicode_input" => run_native_unicode_input(args),
+        other => Err(format!("missing native dispatcher for {other}")),
     }
 }
 
 fn real_main(args: Vec<String>) -> Result<ExitCode, String> {
-    if let Some(rest) = is_icat_invocation(&args) {
-        return run_native_icat(rest);
+    if let Some((name, rest)) = native_invocation(&args) {
+        return run_native(name, rest);
     }
     if args.first().map(String::as_str) == Some("@") {
         return run_remote_command(&args[1..]);

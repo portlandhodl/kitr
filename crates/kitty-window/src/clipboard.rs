@@ -479,6 +479,41 @@ mod tests {
     }
 
     #[test]
+    fn large_primary_incr_transfer_roundtrips_chunks() {
+        let payload: Vec<u8> = (0..(INCR_THRESHOLD + 17_123))
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect();
+        let mut write = IncrWriteState::new(payload.clone());
+        let mut read = IncrReadState::new(payload.len());
+        let mut chunks = 0;
+        while let Some(chunk) = write.next_chunk() {
+            let chunk = chunk.to_vec();
+            chunks += 1;
+            if read.push(&chunk) {
+                break;
+            }
+        }
+        assert_eq!(chunks, payload.len().div_ceil(INCR_CHUNK_SIZE));
+        assert!(read.is_finished());
+        assert_eq!(read.data(), payload.as_slice());
+        assert_eq!(write.next_chunk(), Some(&[][..]));
+    }
+
+    #[test]
+    fn primary_offer_carries_targets_and_utf8_string() {
+        let mut state = ClipboardState::default();
+        state.set_text(Selection::Primary, "primary payload".as_bytes());
+        assert!(state.has_offer(Selection::Primary));
+        assert_eq!(
+            state.target_data(Selection::Primary, "UTF8_STRING"),
+            Some(b"primary payload".as_slice())
+        );
+        let names = state.target_names(Selection::Primary);
+        assert_eq!(names.first().map(String::as_str), Some("TARGETS"));
+        assert!(names.iter().any(|name| name == "UTF8_STRING"));
+    }
+
+    #[test]
     fn pending_requests_can_be_found_by_property() {
         let mut state = ClipboardState::default();
         let token = state.begin(Selection::Clipboard, "UTF8_STRING", 99);

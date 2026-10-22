@@ -2,11 +2,18 @@
 //! Animation frames, composition and terminal-driven timing (`a=f`, `a=a`,
 //! `a=c`).
 //!
-//! Frames are stored fully coalesced as RGBA8, which keeps rendering simple and
-//! makes composition independent of transmission order. The timing model
+//! Frame data uses a delta chain: the root and edited frames are keyframes,
+//! while a newly transmitted frame stores only its patch and a reference to the
+//! frame it was based on (`c=`). Reconstructing a frame walks that chain, so a
+//! long animation does not keep one full RGBA canvas per frame. The timing model
 //! follows `kitty/graphics.c`: a frame's gap is the delay before advancing to
 //! the next frame, zero-gap frames are skipped, loading mode waits at the end,
 //! and loop count zero means infinite.
+//!
+//! Images and frames are subject to per-image and global byte quotas. New data
+//! is admitted after evicting the oldest non-current frames (promoting their
+//! dependents first); if no eviction can make enough room the command fails
+//! with `ENOSPC`, matching kitty's cache-full response.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,6 +23,12 @@ use crate::image::{decode_image, GraphicsError, Image, ImageFormat, ImageLimits}
 
 /// Default inter-frame gap used when a new frame omits `z=`.
 pub const DEFAULT_FRAME_GAP_MS: u32 = 40;
+/// Kitty's default global graphics storage limit (320 MiB).
+pub const DEFAULT_STORAGE_LIMIT: usize = 320 * 1024 * 1024;
+/// Default per-image storage limit (128 MiB).
+pub const DEFAULT_IMAGE_STORAGE_LIMIT: usize = 128 * 1024 * 1024;
+/// Maximum delta-reference chain walked while reconstructing a frame.
+pub const MAX_FRAME_CHAIN: usize = 32;
 
 /// Animation run state (`s=`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,7 +50,34 @@ impl AnimationState {
     }
 }
 
-/// One fully composited animation frame.
+/// Storage for one animation frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FrameStorage {
+    /// A full RGBA8 canvas.
+    Key(Arc<Vec<u8>>),
+    /// A patch composed over `base_frame_id` (zero means a transparent or
+    /// background-filled canvas).
+    Delta {
+        base_frame_id: u32,
+        patch: DeltaPatch,
+        bgcolor: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeltaPatch {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    rgba: Arc<Vec<u8>>,
+    blend: bool,
+}
+
+/// One animation frame.
+///
+/// Frame pixel data is not stored inline: use [`AnimatedImage::frame_data`] or
+/// [`AnimatedImage::current_data`] to reconstruct the coalesced RGBA canvas.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnimationFrame {
     pub id: u32,
@@ -45,7 +85,61 @@ pub struct AnimationFrame {
     pub height: u32,
     pub gap_ms: u32,
     pub transient: bool,
-    pub rgba: Arc<Vec<u8>>,
+    storage: FrameStorage,
+}
+
+impl AnimationFrame {
+    /// Bytes actually stored for this frame. Delta frames only count their
+    /// patch, which is the point of the chain representation.
+    pub fn stored_bytes(&self) -> usize {
+        match &self.storage {
+            FrameStorage::Key(data) => data.len(),
+            FrameStorage::Delta { patch, .. } => patch.rgba.len() + 32,
+        }
+    }
+
+    pub fn is_keyframe(&self) -> bool {
+        matches!(self.storage, FrameStorage::Key(_))
+    }
+
+    /// For a delta frame, the id of the frame it is based on.
+    pub fn base_frame_id(&self) -> Option<u32> {
+        match self.storage {
+            FrameStorage::Delta { base_frame_id, .. } if base_frame_id != 0 => Some(base_frame_id),
+            _ => None,
+        }
+    }
+}
+
+/// Resource limits for animation storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnimationLimits {
+    /// Maximum bytes used by one image and all of its frames.
+    pub max_image_bytes: usize,
+    /// Maximum bytes used by all images tracked by a manager.
+    pub max_total_bytes: usize,
+    /// Maximum delta-chain length before a frame is promoted to a keyframe.
+    pub max_frame_chain: usize,
+}
+
+impl Default for AnimationLimits {
+    fn default() -> Self {
+        Self {
+            max_image_bytes: DEFAULT_IMAGE_STORAGE_LIMIT,
+            max_total_bytes: DEFAULT_STORAGE_LIMIT,
+            max_frame_chain: MAX_FRAME_CHAIN,
+        }
+    }
+}
+
+impl AnimationLimits {
+    pub const fn new(max_image_bytes: usize, max_total_bytes: usize) -> Self {
+        Self {
+            max_image_bytes,
+            max_total_bytes,
+            max_frame_chain: MAX_FRAME_CHAIN,
+        }
+    }
 }
 
 /// An image with a root frame plus optional animation frames.
@@ -64,6 +158,7 @@ pub struct AnimatedImage {
     pub animation_duration_ms: u64,
     pub is_drawn: bool,
     next_frame_id: u32,
+    last_access: u64,
 }
 
 impl AnimatedImage {
@@ -71,13 +166,17 @@ impl AnimatedImage {
         &self.frames[self.current_frame_index]
     }
 
-    pub fn current_rgba(&self) -> &[u8] {
-        &self.current_frame().rgba
+    /// The current frame, reconstructed to a full RGBA8 canvas.
+    pub fn current_rgba(&self) -> Vec<u8> {
+        self.reconstruct_index(self.current_frame_index, &mut Vec::new(), 0)
+            .map(|data| data.as_ref().clone())
+            .unwrap_or_default()
     }
 
-    /// Shared handle to the current frame's RGBA pixels.
+    /// Shared handle to the current frame's reconstructed RGBA pixels.
     pub fn current_data(&self) -> Arc<Vec<u8>> {
-        self.current_frame().rgba.clone()
+        self.reconstruct_index(self.current_frame_index, &mut Vec::new(), 0)
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
     /// Frame by 1-based protocol number (`1` is the root frame).
@@ -86,6 +185,101 @@ impl AnimatedImage {
             return None;
         }
         self.frames.get(number as usize - 1)
+    }
+
+    /// Reconstructed RGBA data for a 1-based frame number.
+    pub fn frame_data(&self, number: u32) -> Option<Arc<Vec<u8>>> {
+        let index = number.checked_sub(1)? as usize;
+        if index >= self.frames.len() {
+            return None;
+        }
+        self.reconstruct_index(index, &mut Vec::new(), 0)
+    }
+
+    /// Total bytes actually stored by all frames (deltas count only patches).
+    pub fn stored_bytes(&self) -> usize {
+        self.frames.iter().map(AnimationFrame::stored_bytes).sum()
+    }
+
+    /// Full canvas size in bytes.
+    pub fn canvas_bytes(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+
+    fn frame_index_for_id(&self, id: u32) -> Option<usize> {
+        self.frames.iter().position(|frame| frame.id == id)
+    }
+
+    fn reconstruct_index(
+        &self,
+        index: usize,
+        stack: &mut Vec<u32>,
+        depth: usize,
+    ) -> Option<Arc<Vec<u8>>> {
+        if depth > MAX_FRAME_CHAIN {
+            return None;
+        }
+        let frame = self.frames.get(index)?;
+        match &frame.storage {
+            FrameStorage::Key(data) => Some(data.clone()),
+            FrameStorage::Delta {
+                base_frame_id,
+                patch,
+                bgcolor,
+            } => {
+                let mut canvas = if *base_frame_id != 0 {
+                    if stack.contains(base_frame_id) {
+                        return None;
+                    }
+                    let base_index = self.frame_index_for_id(*base_frame_id)?;
+                    stack.push(*base_frame_id);
+                    let base = self.reconstruct_index(base_index, stack, depth + 1)?;
+                    stack.pop();
+                    base.as_ref().clone()
+                } else if *bgcolor != 0 {
+                    fill_bgcolor(self.width, self.height, *bgcolor)
+                } else {
+                    vec![0u8; self.canvas_bytes()]
+                };
+                compose_patch(
+                    &mut canvas,
+                    self.width,
+                    self.height,
+                    &patch.rgba,
+                    patch.width,
+                    patch.height,
+                    patch.x,
+                    patch.y,
+                    patch.blend,
+                );
+                Some(Arc::new(canvas))
+            }
+        }
+    }
+
+    /// Convert a frame into a keyframe, preserving its visible pixels.
+    fn promote_to_keyframe(&mut self, index: usize) -> bool {
+        let Some(data) = self.reconstruct_index(index, &mut Vec::new(), 0) else {
+            return false;
+        };
+        self.frames[index].storage = FrameStorage::Key(data);
+        true
+    }
+
+    /// Number of delta links needed to reconstruct a frame by id.
+    fn chain_length_from_id(&self, id: u32) -> usize {
+        let mut length = 1usize;
+        let mut frame = self.frames.iter().find(|frame| frame.id == id);
+        while let Some(current) = frame {
+            match current.base_frame_id() {
+                Some(base) if length <= MAX_FRAME_CHAIN => {
+                    length += 1;
+                    frame = self.frames.iter().find(|frame| frame.id == base);
+                }
+                _ => break,
+            }
+        }
+        length
     }
 
     fn frame_mut(&mut self, number: u32) -> Option<&mut AnimationFrame> {
@@ -143,15 +337,67 @@ struct PendingFrame {
 }
 
 /// Stores images and their animation frames.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AnimationManager {
     images: BTreeMap<u32, AnimatedImage>,
     pending: Option<PendingFrame>,
+    limits: AnimationLimits,
+    total_bytes: usize,
+    access_clock: u64,
+    evicted_frames: u64,
+    evicted_images: u64,
+}
+
+impl Default for AnimationManager {
+    fn default() -> Self {
+        Self::new_with_limits(AnimationLimits::default())
+    }
 }
 
 impl AnimationManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a manager with explicit storage limits.
+    pub fn new_with_limits(limits: AnimationLimits) -> Self {
+        Self {
+            images: BTreeMap::new(),
+            pending: None,
+            limits,
+            total_bytes: 0,
+            access_clock: 0,
+            evicted_frames: 0,
+            evicted_images: 0,
+        }
+    }
+
+    pub fn limits(&self) -> AnimationLimits {
+        self.limits
+    }
+
+    pub fn set_limits(&mut self, limits: AnimationLimits) {
+        self.limits = limits;
+    }
+
+    /// Bytes currently stored by all images (deltas count only their patches).
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Bytes currently stored by one image.
+    pub fn image_bytes(&self, id: u32) -> usize {
+        self.images.get(&id).map_or(0, AnimatedImage::stored_bytes)
+    }
+
+    /// Number of frames evicted to satisfy a quota.
+    pub fn evicted_frames(&self) -> u64 {
+        self.evicted_frames
+    }
+
+    /// Number of whole images evicted to satisfy a quota.
+    pub fn evicted_images(&self) -> u64 {
+        self.evicted_images
     }
 
     pub fn len(&self) -> usize {
@@ -174,13 +420,109 @@ impl AnimationManager {
         self.images.values()
     }
 
+    /// Drop all images and frames. No resources are kept on disk, so this is
+    /// also the exit/delete cleanup path.
     pub fn clear(&mut self) {
         self.images.clear();
         self.pending = None;
+        self.total_bytes = 0;
     }
 
     pub fn has_pending_frame(&self) -> bool {
         self.pending.is_some()
+    }
+
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.wrapping_add(1);
+        self.access_clock
+    }
+
+    fn recompute_total(&mut self) {
+        self.total_bytes = self.images.values().map(AnimatedImage::stored_bytes).sum();
+    }
+
+    fn make_room(&mut self, required: usize, owner: u32, protected_frame_id: Option<u32>) -> bool {
+        if required > self.limits.max_image_bytes || required > self.limits.max_total_bytes {
+            return false;
+        }
+        while self.image_bytes(owner).saturating_add(required) > self.limits.max_image_bytes {
+            if !self.evict_one(Some(owner), protected_frame_id) {
+                return false;
+            }
+        }
+        while self.total_bytes.saturating_add(required) > self.limits.max_total_bytes {
+            if !self.evict_one(None, protected_frame_id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Evict one frame, preferring `preferred_image`, transient frames and then
+    /// the least recently used image. Returns false when nothing can be
+    /// evicted without touching the protected frame.
+    fn evict_one(&mut self, preferred_image: Option<u32>, protected_frame_id: Option<u32>) -> bool {
+        let mut candidates: Vec<(u32, usize, bool, u64)> = Vec::new();
+        for (id, image) in &self.images {
+            for (index, frame) in image.frames.iter().enumerate() {
+                if Some(frame.id) == protected_frame_id {
+                    continue;
+                }
+                candidates.push((*id, index, frame.transient, image.last_access));
+            }
+        }
+        candidates.sort_by_key(|(id, index, transient, access)| {
+            (Some(*id) != preferred_image, !*transient, *access, *index)
+        });
+        for (id, index, _, _) in candidates {
+            let remove_image = {
+                let image = self.images.get(&id).expect("candidate image");
+                image.frames.len() == 1
+            };
+            if remove_image && Some(id) == preferred_image {
+                continue;
+            }
+            if remove_image {
+                self.images.remove(&id);
+                self.evicted_images += 1;
+                self.recompute_total();
+                return true;
+            }
+            let Some(image) = self.images.get_mut(&id) else {
+                continue;
+            };
+            let victim_id = image.frames[index].id;
+            let mut promoted = Vec::new();
+            let mut ok = true;
+            for (frame_index, frame) in image.frames.iter().enumerate() {
+                if frame.base_frame_id() == Some(victim_id) {
+                    promoted.push(frame_index);
+                }
+            }
+            for frame_index in promoted {
+                if !image.promote_to_keyframe(frame_index) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let removed_gap = image.frames[index].gap_ms;
+            image.frames.remove(index);
+            image.animation_duration_ms = image
+                .animation_duration_ms
+                .saturating_sub(u64::from(removed_gap));
+            if image.current_frame_index > index {
+                image.current_frame_index -= 1;
+            } else if image.current_frame_index == index {
+                image.current_frame_index = image.current_frame_index.min(image.frames.len() - 1);
+            }
+            self.evicted_frames += 1;
+            self.recompute_total();
+            return true;
+        }
+        false
     }
 
     fn key_for(&self, id: u32, number: u32) -> Option<u32> {
@@ -226,6 +568,15 @@ impl AnimationManager {
                 "Animation image has inconsistent RGBA data",
             ));
         }
+        let required = rgba.len();
+        self.images.remove(&id);
+        self.recompute_total();
+        if !self.make_room(required, id, None) {
+            return Err(animation_error(
+                "ENOSPC",
+                "Failed to store image data in cache",
+            ));
+        }
         self.images.insert(
             id,
             AnimatedImage {
@@ -239,7 +590,7 @@ impl AnimationManager {
                     height: image.height,
                     gap_ms: 0,
                     transient: image.transient,
-                    rgba: Arc::new(rgba),
+                    storage: FrameStorage::Key(Arc::new(rgba)),
                 }],
                 current_frame_index: 0,
                 animation_state: AnimationState::Stopped,
@@ -249,8 +600,14 @@ impl AnimationManager {
                 animation_duration_ms: 0,
                 is_drawn: true,
                 next_frame_id: 2,
+                last_access: 0,
             },
         );
+        let access = self.next_access();
+        if let Some(image) = self.images.get_mut(&id) {
+            image.last_access = access;
+        }
+        self.recompute_total();
         self.pending = None;
         Ok(id)
     }
@@ -268,7 +625,11 @@ impl AnimationManager {
     }
 
     pub fn remove_image(&mut self, id: u32) -> bool {
-        self.images.remove(&id).is_some()
+        let removed = self.images.remove(&id).is_some();
+        if removed {
+            self.recompute_total();
+        }
+        removed
     }
 
     /// Resolve an image by client id or image number.
@@ -293,6 +654,19 @@ impl AnimationManager {
         if index >= image.frames.len() {
             return false;
         }
+        let victim_id = image.frames[index].id;
+        let dependents: Vec<usize> = image
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.base_frame_id() == Some(victim_id))
+            .map(|(index, _)| index)
+            .collect();
+        for dependent in dependents {
+            if !image.promote_to_keyframe(dependent) {
+                return false;
+            }
+        }
         let removed_gap = image.frames[index].gap_ms;
         image.frames.remove(index);
         image.animation_duration_ms = image
@@ -303,6 +677,7 @@ impl AnimationManager {
         } else if image.current_frame_index == index {
             image.current_frame_index = image.current_frame_index.min(image.frames.len() - 1);
         }
+        self.recompute_total();
         true
     }
 
@@ -469,26 +844,6 @@ impl AnimationManager {
         let patch = decoded
             .rgba
             .ok_or_else(|| animation_error("EINVAL", "Frame has no RGBA data"))?;
-        let image = self.images.get_mut(&image_id).expect("resolved image");
-        if image.animation_state == AnimationState::Loading {
-            image.is_drawn = true;
-        }
-        if decoded.width > image.width || decoded.height > image.height {
-            return Err(animation_error(
-                "EINVAL",
-                "Frame is larger than the animation image",
-            ));
-        }
-        let frame_number = {
-            let requested = command.frame_number();
-            let last = image.frames.len() as u32;
-            if requested == 0 || requested > last + 1 {
-                last + 1
-            } else {
-                requested
-            }
-        };
-        let is_new = frame_number == image.frames.len() as u32 + 1;
         let gap_ms = match command.gap() {
             gap if gap > 0 => gap as u32,
             gap if gap < 0 => 0,
@@ -497,63 +852,52 @@ impl AnimationManager {
         let blend = command.blend_mode() != 1 && !decoded.is_opaque;
         let x = command.x_offset;
         let y = command.y_offset;
+        let requested = command.frame_number();
+        let source_number = command.other_frame_number();
 
-        let redraw;
-        if is_new {
-            let mut canvas = if command.other_frame_number() != 0 {
-                let other = image
-                    .frame(command.other_frame_number())
-                    .ok_or_else(|| animation_error("EINVAL", "No source frame found"))?;
-                other.rgba.as_ref().clone()
-            } else if command.bgcolor() != 0 {
-                fill_bgcolor(image.width, image.height, command.bgcolor())
-            } else {
-                vec![0u8; image.width as usize * image.height as usize * 4]
-            };
-            compose_patch(
-                &mut canvas,
-                image.width,
-                image.height,
-                &patch,
-                decoded.width,
-                decoded.height,
-                x,
-                y,
-                blend,
-            );
-            let id = image.next_frame_id;
-            image.next_frame_id = image.next_frame_id.wrapping_add(1);
-            let transient = command.is_transient();
-            image.frames.push(AnimationFrame {
-                id,
-                width: image.width,
-                height: image.height,
-                gap_ms,
-                transient,
-                rgba: Arc::new(canvas),
-            });
-            image.animation_duration_ms = image
-                .animation_duration_ms
-                .saturating_add(u64::from(gap_ms));
-            redraw = image.animation_state == AnimationState::Loading;
-            if redraw {
-                image.current_frame_shown_at_ms = now_ms;
-                image.is_drawn = true;
+        let (initial_len, source_id, edit_id) = {
+            let image = self.images.get(&image_id).expect("resolved image");
+            if decoded.width > image.width || decoded.height > image.height {
+                return Err(animation_error(
+                    "EINVAL",
+                    "Frame is larger than the animation image",
+                ));
             }
-        } else {
-            let gap = if command.gap() != 0 {
-                Some(gap_ms)
+            let last = image.frames.len() as u32;
+            let is_new = requested == 0 || requested > last;
+            let source_id = if source_number != 0 {
+                Some(
+                    image
+                        .frame(source_number)
+                        .ok_or_else(|| animation_error("EINVAL", "No source frame found"))?
+                        .id,
+                )
             } else {
                 None
             };
-            let is_current = image.current_frame_index == frame_number as usize - 1;
-            let transient = command.is_transient();
-            let image_width = image.width;
-            let image_height = image.height;
-            let frame = image
-                .frame_mut(frame_number)
-                .expect("frame number validated");
-            let mut canvas = frame.rgba.as_ref().clone();
+            let edit_id = if is_new {
+                None
+            } else {
+                Some(image.frames[requested as usize - 1].id)
+            };
+            (last, source_id, edit_id)
+        };
+
+        let access = self.next_access();
+        let (frame_number, is_new, redraw, transient) = if let Some(edit_id) = edit_id {
+            // Editing an existing frame promotes it to a keyframe, exactly like
+            // kitty coalesces an edited frame.
+            let mut canvas = self
+                .images
+                .get(&image_id)
+                .and_then(|image| image.frame_data(edit_id))
+                .ok_or_else(|| animation_error("EINVAL", "No data associated with frame"))?
+                .as_ref()
+                .clone();
+            let (image_width, image_height) = {
+                let image = self.images.get(&image_id).expect("resolved image");
+                (image.width, image.height)
+            };
             compose_patch(
                 &mut canvas,
                 image_width,
@@ -565,7 +909,31 @@ impl AnimationManager {
                 y,
                 blend,
             );
-            frame.rgba = Arc::new(canvas);
+            let old_bytes = self
+                .images
+                .get(&image_id)
+                .and_then(|image| image.frames.iter().find(|frame| frame.id == edit_id))
+                .map_or(0, AnimationFrame::stored_bytes);
+            let required = canvas.len().saturating_sub(old_bytes);
+            if !self.make_room(required, image_id, Some(edit_id)) {
+                return Err(animation_error(
+                    "ENOSPC",
+                    "Failed to cache data for image frame",
+                ));
+            }
+            let transient = command.is_transient();
+            let image = self.images.get_mut(&image_id).expect("resolved image");
+            let index = image
+                .frame_index_for_id(edit_id)
+                .ok_or_else(|| animation_error("ENOENT", "Frame was evicted"))?;
+            let is_current = image.current_frame_index == index;
+            let gap = if command.gap() != 0 {
+                Some(gap_ms)
+            } else {
+                None
+            };
+            let frame = &mut image.frames[index];
+            frame.storage = FrameStorage::Key(Arc::new(canvas));
             frame.transient |= transient;
             if let Some(gap) = gap {
                 let old_gap = frame.gap_ms;
@@ -575,11 +943,103 @@ impl AnimationManager {
                     .saturating_sub(u64::from(old_gap))
                     .saturating_add(u64::from(gap));
             }
-            redraw = is_current;
+            image.last_access = access;
+            (index as u32 + 1, false, is_current, transient)
+        } else {
+            let (storage, coalesced) = {
+                let image = self.images.get(&image_id).expect("resolved image");
+                let coalesce = source_id.is_some_and(|source| {
+                    image.chain_length_from_id(source) >= self.limits.max_frame_chain
+                });
+                if coalesce {
+                    let _source = source_id.expect("coalescing requires a source");
+                    let mut canvas = if command.bgcolor() != 0 {
+                        fill_bgcolor(image.width, image.height, command.bgcolor())
+                    } else {
+                        vec![0u8; image.canvas_bytes()]
+                    };
+                    if let Some(data) = image.frame_data(source_number) {
+                        canvas = data.as_ref().clone();
+                    }
+                    compose_patch(
+                        &mut canvas,
+                        image.width,
+                        image.height,
+                        &patch,
+                        decoded.width,
+                        decoded.height,
+                        x,
+                        y,
+                        blend,
+                    );
+                    (FrameStorage::Key(Arc::new(canvas)), true)
+                } else {
+                    (
+                        FrameStorage::Delta {
+                            base_frame_id: source_id.unwrap_or(0),
+                            patch: DeltaPatch {
+                                x,
+                                y,
+                                width: decoded.width,
+                                height: decoded.height,
+                                rgba: Arc::new(patch),
+                                blend,
+                            },
+                            bgcolor: if source_id.is_none() {
+                                command.bgcolor()
+                            } else {
+                                0
+                            },
+                        },
+                        false,
+                    )
+                }
+            };
+            let mut frame = AnimationFrame {
+                id: 0,
+                width: 0,
+                height: 0,
+                gap_ms,
+                transient: command.is_transient(),
+                storage,
+            };
+            let required = frame.stored_bytes();
+            if !self.make_room(required, image_id, source_id) {
+                return Err(animation_error(
+                    "ENOSPC",
+                    "Cache size exceeded cannot add new frames",
+                ));
+            }
+            let image = self.images.get_mut(&image_id).expect("resolved image");
+            let id = image.next_frame_id;
+            image.next_frame_id = image.next_frame_id.wrapping_add(1);
+            frame.id = id;
+            frame.width = image.width;
+            frame.height = image.height;
+            let frame_number = image.frames.len() as u32 + 1;
+            image.frames.push(frame);
+            image.animation_duration_ms = image
+                .animation_duration_ms
+                .saturating_add(u64::from(gap_ms));
+            image.last_access = access;
+            let redraw = image.animation_state == AnimationState::Loading;
+            if redraw {
+                image.current_frame_shown_at_ms = now_ms;
+                image.is_drawn = true;
+            }
+            let transient = command.is_transient();
+            let _ = coalesced;
+            (frame_number, true, redraw, transient)
+        };
+        self.recompute_total();
+        if let Some(image) = self.images.get_mut(&image_id) {
+            if redraw {
+                image.current_frame_shown_at_ms = now_ms;
+            }
+            image.last_access = access;
         }
-        if redraw {
-            image.current_frame_shown_at_ms = now_ms;
-        }
+        let _ = initial_len;
+        let _ = transient;
         Ok(AnimationOutcome::FrameAdded {
             image_id,
             frame_number,
@@ -648,67 +1108,111 @@ impl AnimationManager {
         let image_id = self
             .key_for(command.id, command.image_number)
             .ok_or_else(|| animation_error("ENOENT", "Compose command refers to missing image"))?;
-        let image = self.images.get_mut(&image_id).expect("resolved image");
         let source_number = command.frame_number();
         let destination_number = command.other_frame_number();
-        let source_index = source_number
-            .checked_sub(1)
-            .map(|index| index as usize)
-            .filter(|index| *index < image.frames.len())
-            .ok_or_else(|| animation_error("ENOENT", "No source frame found"))?;
-        let destination_index = destination_number
-            .checked_sub(1)
-            .map(|index| index as usize)
-            .filter(|index| *index < image.frames.len())
-            .ok_or_else(|| animation_error("ENOENT", "No destination frame found"))?;
-        let width = if command.width != 0 {
-            command.width
-        } else {
-            image.width
-        };
-        let height = if command.height != 0 {
-            command.height
-        } else {
-            image.height
-        };
-        let source_x = command.cell_x_offset;
-        let source_y = command.cell_y_offset;
-        let dest_x = command.x_offset;
-        let dest_y = command.y_offset;
-        let fits = |value: u32, offset: u32, limit: u32| {
-            u64::from(offset) + u64::from(value) <= u64::from(limit)
-        };
-        if !fits(width, dest_x, image.width) || !fits(height, dest_y, image.height) {
-            return Err(animation_error(
-                "EINVAL",
-                "The destination rectangle is out of bounds",
-            ));
-        }
-        if !fits(width, source_x, image.width) || !fits(height, source_y, image.height) {
-            return Err(animation_error(
-                "EINVAL",
-                "The source rectangle is out of bounds",
-            ));
-        }
-        if source_index == destination_index {
-            let x_overlaps = source_x.max(dest_x) < source_x.min(dest_x) + width;
-            let y_overlaps = source_y.max(dest_y) < source_y.min(dest_y) + height;
-            if x_overlaps && y_overlaps {
+        let (
+            source,
+            mut destination,
+            destination_id,
+            old_bytes,
+            transient,
+            image_width,
+            image_height,
+        ) = {
+            let image = self.images.get(&image_id).expect("resolved image");
+            let source_index = source_number
+                .checked_sub(1)
+                .map(|index| index as usize)
+                .filter(|index| *index < image.frames.len())
+                .ok_or_else(|| animation_error("ENOENT", "No source frame found"))?;
+            let destination_index = destination_number
+                .checked_sub(1)
+                .map(|index| index as usize)
+                .filter(|index| *index < image.frames.len())
+                .ok_or_else(|| animation_error("ENOENT", "No destination frame found"))?;
+            let width = if command.width != 0 {
+                command.width
+            } else {
+                image.width
+            };
+            let height = if command.height != 0 {
+                command.height
+            } else {
+                image.height
+            };
+            let source_x = command.cell_x_offset;
+            let source_y = command.cell_y_offset;
+            let dest_x = command.x_offset;
+            let dest_y = command.y_offset;
+            let fits = |value: u32, offset: u32, limit: u32| {
+                u64::from(offset) + u64::from(value) <= u64::from(limit)
+            };
+            if !fits(width, dest_x, image.width) || !fits(height, dest_y, image.height) {
                 return Err(animation_error(
                     "EINVAL",
-                    "The source and destination rectangles overlap in the same frame",
+                    "The destination rectangle is out of bounds",
                 ));
             }
-        }
-        let source = image.frames[source_index].rgba.as_ref().clone();
-        let mut destination = image.frames[destination_index].rgba.as_ref().clone();
+            if !fits(width, source_x, image.width) || !fits(height, source_y, image.height) {
+                return Err(animation_error(
+                    "EINVAL",
+                    "The source rectangle is out of bounds",
+                ));
+            }
+            if source_index == destination_index {
+                let x_overlaps = source_x.max(dest_x) < source_x.min(dest_x) + width;
+                let y_overlaps = source_y.max(dest_y) < source_y.min(dest_y) + height;
+                if x_overlaps && y_overlaps {
+                    return Err(animation_error(
+                        "EINVAL",
+                        "The source and destination rectangles overlap in the same frame",
+                    ));
+                }
+            }
+            let source = image
+                .frame_data(source_number)
+                .ok_or_else(|| animation_error("ENOENT", "No source frame data found"))?
+                .as_ref()
+                .clone();
+            let destination = image
+                .frame_data(destination_number)
+                .ok_or_else(|| animation_error("ENOENT", "No destination frame data found"))?
+                .as_ref()
+                .clone();
+            let destination_frame = &image.frames[destination_index];
+            (
+                source,
+                destination,
+                destination_frame.id,
+                destination_frame.stored_bytes(),
+                image.frames[source_index].transient,
+                image.width,
+                image.height,
+            )
+        };
+        let (width, height, source_x, source_y, dest_x, dest_y) = (
+            if command.width != 0 {
+                command.width
+            } else {
+                image_width
+            },
+            if command.height != 0 {
+                command.height
+            } else {
+                image_height
+            },
+            command.cell_x_offset,
+            command.cell_y_offset,
+            command.x_offset,
+            command.y_offset,
+        );
         compose_rect(
             &mut destination,
-            image.width,
-            image.height,
+            image_width,
+            image_height,
             &source,
-            image.width,
-            image.height,
+            image_width,
+            image_height,
             width,
             height,
             source_x,
@@ -717,11 +1221,22 @@ impl AnimationManager {
             dest_y,
             command.compose_mode() == 1,
         );
-        let transient = image.frames[source_index].transient;
-        let frame = &mut image.frames[destination_index];
-        frame.rgba = Arc::new(destination);
+        let required = destination.len().saturating_sub(old_bytes);
+        if !self.make_room(required, image_id, Some(destination_id)) {
+            return Err(animation_error(
+                "ENOSPC",
+                "Failed to store image data in cache",
+            ));
+        }
+        let image = self.images.get_mut(&image_id).expect("resolved image");
+        let index = image
+            .frame_index_for_id(destination_id)
+            .ok_or_else(|| animation_error("ENOENT", "Destination frame was evicted"))?;
+        let frame = &mut image.frames[index];
+        frame.storage = FrameStorage::Key(Arc::new(destination));
         frame.transient |= transient;
-        let redraw = destination_index == image.current_frame_index;
+        let redraw = index == image.current_frame_index;
+        self.recompute_total();
         Ok(AnimationOutcome::Composed {
             image_id,
             source_frame: source_number,
@@ -1076,10 +1591,10 @@ mod tests {
         let mut command = parse_raw(b"a=f,i=1,r=2,x=1,y=1,s=1,v=1,Y=4278190335").unwrap();
         command.payload = vec![9, 8, 7, 255];
         manager.feed(&command, &ImageLimits::default(), 0).unwrap();
-        let frame = &manager.image(1).unwrap().frames[1];
-        assert_eq!(&frame.rgba[0..4], &[255, 0, 0, 255]);
+        let frame = manager.image(1).unwrap().frame_data(2).unwrap();
+        assert_eq!(&frame[0..4], &[255, 0, 0, 255]);
         let index = 3 * 4;
-        assert_eq!(&frame.rgba[index..index + 4], &[9, 8, 7, 255]);
+        assert_eq!(&frame[index..index + 4], &[9, 8, 7, 255]);
     }
 
     #[test]
@@ -1096,9 +1611,9 @@ mod tests {
         let mut command = parse_raw(b"a=f,i=1,r=2,x=1,y=0,s=1,v=1").unwrap();
         command.payload = vec![7, 7, 7, 255];
         manager.feed(&command, &ImageLimits::default(), 0).unwrap();
-        let frame = &manager.image(1).unwrap().frames[1];
-        assert_eq!(&frame.rgba[0..4], &[2, 2, 2, 255]);
-        assert_eq!(&frame.rgba[4..8], &[7, 7, 7, 255]);
+        let frame = manager.image(1).unwrap().frame_data(2).unwrap();
+        assert_eq!(&frame[0..4], &[2, 2, 2, 255]);
+        assert_eq!(&frame[4..8], &[7, 7, 7, 255]);
     }
 
     #[test]
@@ -1112,13 +1627,13 @@ mod tests {
         let mut compose = parse_raw(b"a=c,i=1,r=1,c=2,w=1,h=1,x=1,y=0,X=0,Y=0,C=1").unwrap();
         compose.payload.clear();
         manager.feed(&compose, &ImageLimits::default(), 0).unwrap();
-        let rgba = manager.image(1).unwrap().frames[1].rgba.clone();
+        let rgba = manager.image(1).unwrap().frame_data(2).unwrap();
         assert_eq!(&rgba[4..8], &[0, 0, 0, 128]);
 
         let mut blend = parse_raw(b"a=c,i=1,r=1,c=2,w=1,h=1,x=0,y=0,X=0,Y=0").unwrap();
         blend.payload.clear();
         manager.feed(&blend, &ImageLimits::default(), 0).unwrap();
-        let rgba = manager.image(1).unwrap().frames[1].rgba.clone();
+        let rgba = manager.image(1).unwrap().frame_data(2).unwrap();
         assert_eq!(&rgba[0..4], &[5, 10, 15, 255]);
     }
 
@@ -1203,8 +1718,8 @@ mod tests {
         let mut last = parse_raw(b"a=f,m=0").unwrap();
         last.payload = vec![3, 255, 4, 255, 5, 255];
         manager.feed(&last, &ImageLimits::default(), 0).unwrap();
-        let frame = &manager.image(1).unwrap().frames[1];
-        assert_eq!(frame.rgba.as_slice(), &[1, 2, 3, 255, 4, 255, 5, 255]);
+        let frame = manager.image(1).unwrap().frame_data(2).unwrap();
+        assert_eq!(frame.as_slice(), &[1, 2, 3, 255, 4, 255, 5, 255]);
     }
 
     #[test]
@@ -1234,7 +1749,7 @@ mod tests {
         ));
         assert_eq!(manager.image(1).unwrap().frames.len(), 2);
         assert_eq!(
-            manager.image(1).unwrap().frames[1].rgba.as_slice(),
+            manager.image(1).unwrap().frame_data(2).unwrap().as_slice(),
             &[2, 0, 0, 255]
         );
     }

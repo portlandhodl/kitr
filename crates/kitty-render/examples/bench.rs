@@ -12,11 +12,15 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use kitty_graphics::{decode_image, parse_raw, AnimationManager, AnimationState, ImageLimits};
+use kitty_graphics::{
+    decode_image, parse_raw, AnimationManager, AnimationState, ImageFormat, ImageLimits,
+    IndexedPalette,
+};
 use kitty_render::{
     collect_protocol_images_with_animations, expand_unicode_placeholders, BasicColorResolver,
-    CellMetrics, GlyphBitmap, GlyphKey, GlyphRasterizer, GridGeometry, OverlayStats, RenderConfig,
-    RendererCore, SelectionRange, ShapedRunCluster, ShapedRunOutput, ShapedRunRequest, TabBarSpec,
+    CellMetrics, GlyphBitmap, GlyphKey, GlyphRasterizer, GridGeometry, ImageFilter, ImageKey,
+    ImageUpload, ImageWrap, OverlayStats, RenderConfig, RendererCore, SelectionRange,
+    ShapedRunCluster, ShapedRunOutput, ShapedRunRequest, TabBarSpec,
 };
 use kitty_screen::Screen;
 
@@ -139,13 +143,34 @@ fn bench_animation_frame_swap(iters: usize) {
     let mut manager = AnimationManager::new();
     manager.insert_root(&root).unwrap();
     for number in 2..=16u32 {
-        let mut command = parse_raw(format!("a=f,i=1,r={number},s=32,v=32").as_bytes()).unwrap();
-        command.payload = vec![number as u8; 32 * 32 * 4];
+        let x = (number * 3) % 24;
+        let y = (number * 5) % 24;
+        let mut command = parse_raw(
+            format!("a=f,i=1,r={number},c={},x={x},y={y},s=8,v=8", number - 1).as_bytes(),
+        )
+        .unwrap();
+        command.payload = vec![number as u8; 8 * 8 * 4];
         manager.feed(&command, &ImageLimits::default(), 0).unwrap();
         manager.set_gap(1, number, 5);
     }
     manager.set_gap(1, 1, 5);
     manager.set_state(1, AnimationState::Running, 0);
+    let image = manager.image(1).unwrap();
+    let stored = image.stored_bytes();
+    let full = image.canvas_bytes() * image.frames.len();
+    let deltas = image
+        .frames
+        .iter()
+        .filter(|frame| !frame.is_keyframe())
+        .count();
+    println!(
+        "animation storage: {} frames ({} deltas), {:.1} KiB stored vs {:.1} KiB fully coalesced ({:.1}% saved)",
+        image.frames.len(),
+        deltas,
+        stored as f64 / 1024.0,
+        full as f64 / 1024.0,
+        (1.0 - stored as f64 / full.max(1) as f64) * 100.0,
+    );
 
     let start = Instant::now();
     let mut swaps = 0usize;
@@ -162,6 +187,39 @@ fn bench_animation_frame_swap(iters: usize) {
         per_swap * 1e6,
         1.0 / per_swap,
         swaps
+    );
+}
+
+fn bench_indexed_upload(iters: usize) {
+    let width = 256u32;
+    let height = 256u32;
+    let raw: Vec<u8> = (0..width * height)
+        .map(|index| (index % 256) as u8)
+        .collect();
+    let palette = IndexedPalette::default();
+    let start = Instant::now();
+    let mut bytes = 0usize;
+    for _ in 0..iters {
+        let upload = ImageUpload::from_indexed(
+            ImageKey::Protocol(1),
+            width,
+            height,
+            black_box(&raw),
+            ImageFormat::Indexed,
+            &palette,
+            ImageFilter::Nearest,
+            ImageWrap::Clamp,
+        )
+        .expect("indexed upload");
+        bytes = bytes.wrapping_add(black_box(upload.data.len()));
+    }
+    let elapsed = start.elapsed();
+    let per = elapsed.as_secs_f64() / iters.max(1) as f64;
+    println!(
+        "indexed upload: {iters} frames in {elapsed:?}  {:.3} ms/frame  {:.1} MiB/s  ({} pixel bytes, RGBA expansion)",
+        per * 1e3,
+        (bytes as f64 / (1024.0 * 1024.0)) / per.max(1e-9),
+        bytes / iters.max(1),
     );
 }
 
@@ -413,5 +471,6 @@ fn main() {
         );
     }
     bench_animation_frame_swap(iters);
+    bench_indexed_upload(iters);
     bench_placeholder_expansion(iters, columns, rows);
 }

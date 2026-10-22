@@ -1053,3 +1053,142 @@ fn animated_image_swap_renders_new_frame_pixels() {
     let pixels = backend.read_pixels().expect("readback frame");
     assert_pixel(pixel(&pixels, 32, 8, 8), [0, 255, 0, 255], 1, "frame green");
 }
+
+#[test]
+fn indexed_image_upload_pixels() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let key = ImageKey::Protocol(20);
+    let mut palette = kitty_graphics::IndexedPalette::default();
+    let mut entries = *palette.entries();
+    entries[1] = [255, 0, 0, 255];
+    entries[2] = [0, 255, 0, 255];
+    entries[3] = [0, 0, 255, 255];
+    entries[4] = [255, 255, 255, 255];
+    palette = kitty_graphics::IndexedPalette::from_rgba(entries);
+    let upload = ImageUpload::from_indexed(
+        key,
+        2,
+        2,
+        &[1, 2, 3, 4],
+        kitty_graphics::ImageFormat::Indexed,
+        &palette,
+        ImageFilter::Nearest,
+        ImageWrap::Clamp,
+    )
+    .expect("indexed upload");
+    let frame = image_frame_with(
+        ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)),
+        upload,
+    );
+    backend.sync_images(&frame).expect("indexed upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render indexed");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 8, 8), [255, 0, 0, 255], 1, "index 1");
+    assert_pixel(pixel(&pixels, 32, 24, 8), [0, 255, 0, 255], 1, "index 2");
+    assert_pixel(pixel(&pixels, 32, 8, 24), [0, 0, 255, 255], 1, "index 3");
+    assert_pixel(
+        pixel(&pixels, 32, 24, 24),
+        [255, 255, 255, 255],
+        1,
+        "index 4",
+    );
+}
+
+#[test]
+fn indexed_alpha_upload_blends() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let key = ImageKey::Protocol(21);
+    let mut palette = kitty_graphics::IndexedPalette::default();
+    let mut entries = *palette.entries();
+    entries[1] = [255, 0, 0, 255];
+    palette = kitty_graphics::IndexedPalette::from_rgba(entries);
+    let upload = ImageUpload::from_indexed(
+        key,
+        1,
+        1,
+        &[1, 128],
+        kitty_graphics::ImageFormat::IndexedAlpha,
+        &palette,
+        ImageFilter::Nearest,
+        ImageWrap::Clamp,
+    )
+    .expect("indexed alpha upload");
+    let frame = image_frame_with(
+        ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)),
+        upload,
+    );
+    backend.sync_images(&frame).expect("upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 16, 16), [128, 0, 0, 255], 1, "50% red");
+}
+
+#[test]
+fn relative_placement_renders_at_parent_offset() {
+    let _guard = lock();
+    let mut screen = Screen::builder(4, 4).scrollback(8).build().expect("screen");
+    let mut parent = kitty_graphics::parse_raw(b"a=t,f=32,s=1,v=1,i=30").unwrap();
+    parent.payload = vec![255, 0, 0, 255];
+    screen.handle_graphics_command(parent).unwrap();
+    let mut child = kitty_graphics::parse_raw(b"a=t,f=32,s=1,v=1,i=31").unwrap();
+    child.payload = vec![0, 255, 0, 255];
+    screen.handle_graphics_command(child).unwrap();
+    let mut parent_put = kitty_graphics::parse_raw(b"a=p,i=30,p=1,c=1,r=1,z=-1,C=1").unwrap();
+    parent_put.payload.clear();
+    screen.handle_graphics_command(parent_put).unwrap();
+    let mut child_put =
+        kitty_graphics::parse_raw(b"a=p,i=31,p=1,P=30,Q=1,H=1,V=1,c=1,r=1,C=1").unwrap();
+    child_put.payload.clear();
+    screen.handle_graphics_command(child_put).unwrap();
+
+    let palette = kitty_graphics::IndexedPalette::default();
+    let mut instances = Vec::new();
+    let mut uploads = Vec::new();
+    kitty_render::collect_protocol_images_with_palette(
+        &screen,
+        None,
+        &palette,
+        &GridGeometry::new(
+            2,
+            2,
+            CellMetrics {
+                cell_width: 16.0,
+                cell_height: 16.0,
+                ..CellMetrics::default()
+            },
+        ),
+        32.0,
+        32.0,
+        ImageFilter::Nearest,
+        &mut instances,
+        &mut uploads,
+    );
+    assert_eq!(instances.len(), 2);
+    let key = ImageKey::Protocol(31);
+    let instance = instances
+        .iter()
+        .find(|instance| instance.key == key)
+        .copied()
+        .expect("child instance");
+    assert_eq!((instance.rect.x, instance.rect.y), (16.0, 16.0));
+    assert_eq!(instance.z_index, -1, "child inherits parent z-index");
+    let mut frame = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    frame.images = instances;
+    frame.image_uploads = uploads;
+    frame.damage.full_redraw = true;
+
+    let mut backend = try_backend!(32, 32);
+    backend.sync_images(&frame).expect("relative upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("relative render");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 8, 8), [255, 0, 0, 255], 1, "parent");
+    assert_pixel(pixel(&pixels, 32, 24, 24), [0, 255, 0, 255], 1, "child");
+}

@@ -12,8 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use kitty_window::{
-    keysym, probe_display, ClipboardReply, EglWindowSurface, KeyAction, KeyInput, Modifiers,
-    MouseButton, PointerShape, Selection, WindowConfig, WindowEvent, X11Window,
+    keysym, probe_display, ClipboardReply, DragSourceData, EglWindowSurface, KeyAction, KeyInput,
+    Modifiers, MouseButton, PointerShape, Selection, TouchPhase, WindowConfig, WindowEvent,
+    X11Window,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -584,6 +585,141 @@ fn clipboard_incr_roundtrip_for_large_payload() {
     let text = roundtrip_text(&mut owner, &mut reader, Selection::Clipboard);
     assert_eq!(text.len(), payload.len());
     assert_eq!(text, payload);
+}
+
+#[test]
+fn clipboard_incr_roundtrip_for_large_primary_payload() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let mut owner = display.open(&WindowConfig::new("primary-incr-owner", 100, 100));
+    let mut reader = display.open(&WindowConfig::new("primary-incr-reader", 100, 100));
+    drain(&mut owner);
+    drain(&mut reader);
+
+    let payload = "primary-0123456789".repeat(20_000);
+    assert!(payload.len() > 256 * 1024);
+    owner
+        .set_primary_text(&payload)
+        .expect("offer large primary payload");
+    let text = roundtrip_text(&mut owner, &mut reader, Selection::Primary);
+    assert_eq!(text.len(), payload.len());
+    assert_eq!(text, payload);
+}
+
+#[test]
+fn cursor_scale_theme_and_hot_reload_state() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let mut window = display.open(&WindowConfig::new("cursor-theme", 120, 80));
+    drain(&mut window);
+    let base = window.cursor_size();
+    window.set_cursor_scale(2.0);
+    assert_eq!(window.cursor_scale(), 2.0);
+    assert!(window.cursor_size() >= base);
+    window.set_cursor_size(Some(48));
+    assert_eq!(window.cursor_size(), 48);
+    window.set_cursor_theme(Some("Adwaita"));
+    assert_eq!(window.cursor_theme_name(), "Adwaita");
+    window.set_cursor_theme(None);
+    assert!(window.reload_cursor_theme());
+    // Calling refresh repeatedly must be cheap and stable.
+    assert!(!window.refresh_cursor_theme() || window.cursor_size() > 0);
+}
+
+#[test]
+fn xinput2_touch_mapping_is_safe_and_injectable() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let mut window = display.open(&WindowConfig::new("touch", 160, 120));
+    drain(&mut window);
+    // Xvfb usually has no touch device. The XI2 map logic is covered by unit
+    // tests; this asserts the public path is safe with or without a device.
+    let _ = window.has_touch_input();
+    window
+        .inject_event(&WindowEvent::Touch {
+            id: 9,
+            x: 10.0,
+            y: 20.0,
+            pressure: 0.5,
+            phase: TouchPhase::Began,
+        })
+        .unwrap();
+    let touch = wait_for(&mut window, Duration::from_secs(2), |event| {
+        matches!(
+            event,
+            WindowEvent::Touch {
+                id: 9,
+                phase: TouchPhase::Began,
+                ..
+            }
+        )
+    });
+    assert!(touch.is_some(), "injected touch event was not delivered");
+}
+
+#[test]
+fn xdnd_drag_source_and_target_roundtrip() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let mut source = display.open(&WindowConfig::new("xdnd-source", 100, 100));
+    let mut target = display.open(&WindowConfig::new("xdnd-target", 100, 100));
+    drain(&mut source);
+    drain(&mut target);
+
+    source
+        .start_drag_to_at(
+            DragSourceData::from_text("dragged text"),
+            target.window_id(),
+            20,
+            20,
+        )
+        .expect("start drag source");
+    assert!(source.is_drag_source_active());
+    assert!(source
+        .drag_source_targets()
+        .iter()
+        .any(|m| m == "UTF8_STRING"));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut entered = false;
+    while Instant::now() < deadline && !entered {
+        source.poll_events(10);
+        for event in target.poll_events(10) {
+            if matches!(event, WindowEvent::DragEnter { .. }) {
+                entered = true;
+            }
+        }
+    }
+    assert!(entered, "XDND target did not see DragEnter");
+    target.drag_accept(None).expect("accept drag");
+    source.drag_drop().expect("drop drag source");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut dropped = None;
+    let mut finished = false;
+    while Instant::now() < deadline && (dropped.is_none() || !finished) {
+        for event in source.poll_events(10) {
+            if matches!(event, WindowEvent::DragFinished { .. }) {
+                finished = true;
+            }
+        }
+        for event in target.poll_events(10) {
+            if let WindowEvent::DragDrop { text, .. } = event {
+                dropped = text;
+            }
+        }
+    }
+    assert_eq!(dropped.as_deref(), Some("dragged text"));
+    assert!(finished, "drag source did not receive XdndFinished");
+    assert!(!source.is_drag_source_active());
 }
 
 #[test]

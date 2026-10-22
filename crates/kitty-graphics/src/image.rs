@@ -23,6 +23,7 @@ use std::path::Path;
 
 use crate::command::{GraphicsCommand, ParseError, TransmissionType};
 use crate::png::{decode_png, PngError};
+use crate::tempfile::{read_temp_image_file, TempFilePolicy};
 
 /// Kitty's `MAX_IMAGE_DIMENSION`.
 pub const MAX_IMAGE_DIMENSION: u32 = 10000;
@@ -173,8 +174,8 @@ pub struct Image {
     /// Decoded pixels in the transmitted representation: RGB for `f=24`, RGBA
     /// for `f=32`, indexed samples for `f=8/16`, and RGBA for PNG.
     pub raw: Vec<u8>,
-    /// Always RGBA8 for RGB/RGBA/PNG; `None` for indexed images (their palette
-    /// lives in the image manager, which is out of scope here).
+    /// Always RGBA8 for RGB/RGBA/PNG; `None` for indexed images. Expand those
+    /// with [`IndexedPalette::expand_image`](crate::palette::IndexedPalette::expand_image).
     pub rgba: Option<Vec<u8>>,
     pub is_opaque: bool,
     pub is_4byte_aligned: bool,
@@ -402,6 +403,7 @@ struct PendingTransfer {
 #[derive(Debug)]
 pub struct ImageAssembler {
     limits: ImageLimits,
+    temp_policy: TempFilePolicy,
     pending: Option<PendingTransfer>,
 }
 
@@ -415,6 +417,7 @@ impl ImageAssembler {
     pub fn new(limits: ImageLimits) -> Self {
         Self {
             limits,
+            temp_policy: TempFilePolicy::default(),
             pending: None,
         }
     }
@@ -425,6 +428,15 @@ impl ImageAssembler {
 
     pub fn set_limits(&mut self, limits: ImageLimits) {
         self.limits = limits;
+    }
+
+    /// Policy used for temporary-file (`t=t`) transmissions.
+    pub fn temp_policy(&self) -> &TempFilePolicy {
+        &self.temp_policy
+    }
+
+    pub fn set_temp_policy(&mut self, policy: TempFilePolicy) {
+        self.temp_policy = policy;
     }
 
     pub fn has_pending_transfer(&self) -> bool {
@@ -481,7 +493,12 @@ impl ImageAssembler {
             return Ok(LoadOutcome::ChunkAccepted);
         }
 
-        let image = decode_image(command, &command.payload, &self.limits)?;
+        let image = decode_image_with_temp_policy(
+            command,
+            &command.payload,
+            &self.limits,
+            &self.temp_policy,
+        )?;
         let query = action == Some(crate::command::Action::Query);
         if query && command.id == 0 {
             return Err(GraphicsError::QueryWithoutImageId);
@@ -495,7 +512,12 @@ impl ImageAssembler {
 
     fn finish_pending(&self, pending: PendingTransfer) -> Result<LoadOutcome, GraphicsError> {
         let mut start = pending.start;
-        let image = decode_image(&start, &pending.payload, &self.limits)?;
+        let image = decode_image_with_temp_policy(
+            &start,
+            &pending.payload,
+            &self.limits,
+            &self.temp_policy,
+        )?;
         let query = start.action == Some(crate::command::Action::Query);
         if query && start.id == 0 {
             return Err(GraphicsError::QueryWithoutImageId);
@@ -520,6 +542,17 @@ pub fn decode_image(
     payload: &[u8],
     limits: &ImageLimits,
 ) -> Result<Image, GraphicsError> {
+    decode_image_with_temp_policy(command, payload, limits, &TempFilePolicy::default())
+}
+
+/// Like [`decode_image`] but with an explicit temporary-file policy for
+/// `t=t` transmissions.
+pub fn decode_image_with_temp_policy(
+    command: &GraphicsCommand,
+    payload: &[u8],
+    limits: &ImageLimits,
+    temp_policy: &TempFilePolicy,
+) -> Result<Image, GraphicsError> {
     let format_value = if command.format == 0 {
         32
     } else {
@@ -540,7 +573,7 @@ pub fn decode_image(
             }
             payload.to_vec()
         }
-        TransmissionType::File | TransmissionType::TempFile => {
+        TransmissionType::File => {
             let max_to_read = if command.compressed.is_some() || format.is_png() {
                 limits.max_data_size
             } else {
@@ -551,6 +584,20 @@ pub fn decode_image(
                 command.data_offset,
                 command.data_sz,
                 max_to_read,
+            )?
+        }
+        TransmissionType::TempFile => {
+            let max_to_read = if command.compressed.is_some() || format.is_png() {
+                limits.max_data_size
+            } else {
+                expected_pixels.unwrap_or(limits.max_data_size)
+            };
+            read_temp_image_file(
+                path_from_payload(payload)?,
+                command.data_offset,
+                command.data_sz,
+                max_to_read,
+                temp_policy,
             )?
         }
         TransmissionType::SharedMemory => {
@@ -733,7 +780,9 @@ fn path_from_payload(payload: &[u8]) -> Result<&Path, GraphicsError> {
 /// is capped at `max_to_read`. Short reads are reported as `EBADF`.
 ///
 /// Unlike kitty, this helper does **not** ask a boss/window-manager about path
-/// access and does not delete temporary files. Those are integration concerns.
+/// access. Temporary-file (`t=t`) transmissions go through
+/// [`read_temp_image_file`](crate::tempfile::read_temp_image_file), which adds
+/// the temp-directory/symlink policy and immediate cleanup.
 pub fn read_image_file(
     path: &Path,
     offset: u32,

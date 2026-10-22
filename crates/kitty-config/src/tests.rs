@@ -10,7 +10,7 @@ use crate::color::Color;
 use crate::config::{BadLine, Config};
 use crate::options::{
     clamp_font_size, CursorShape, EasingFunction, FontSpec, JumpType, Modifiers, TabBarStyle,
-    DELETE_ENV_VAR, MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE,
+    TabPowerlineStyle, DELETE_ENV_VAR, MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE,
 };
 use crate::shlex::Shlex;
 
@@ -570,6 +570,98 @@ fn tab_bar_style_choices_and_errors() {
     assert!(errors[0]
         .error
         .contains("not a valid choice for tab_bar_style"));
+}
+
+#[test]
+fn tab_bar_visibility_and_geometry_follow_kitty() {
+    let mut options = cfg(&[]).options;
+    // Default: fade style, minimum of two tabs.
+    assert!(options.tab_bar_should_be_visible(2));
+    assert!(options.tab_bar_should_be_visible(3));
+    assert!(!options.tab_bar_should_be_visible(1));
+    assert!(!options.tab_bar_should_be_visible(0));
+    assert_eq!(options.tab_bar_height(1, 19.0), 0.0);
+    assert_eq!(options.tab_bar_height(2, 19.0), 19.0);
+
+    options = cfg(&["tab_bar_style hidden"]).options;
+    assert!(!options.tab_bar_should_be_visible(1));
+    assert!(!options.tab_bar_should_be_visible(8));
+    assert_eq!(options.tab_bar_height(8, 19.0), 0.0);
+
+    options = cfg(&["tab_bar_min_tabs 1"]).options;
+    assert!(options.tab_bar_should_be_visible(1));
+    assert_eq!(options.tab_bar_height(1, 15.0), 15.0);
+
+    options = cfg(&["tab_bar_min_tabs 0"]).options;
+    assert!(options.tab_bar_should_be_visible(1));
+}
+
+#[test]
+fn tab_bar_defaults_match_kitty() {
+    let options = cfg(&[]).options;
+    assert_eq!(options.tab_bar_style, TabBarStyle::Fade);
+    assert_eq!(options.tab_bar_min_tabs, 2);
+    assert_eq!(options.tab_separator, " ┇");
+    assert_eq!(options.tab_powerline_style, TabPowerlineStyle::Angled);
+    assert_eq!(options.tab_fade, vec![0.25, 0.5, 0.75, 1.0]);
+    assert_eq!(options.active_tab_foreground, Color::new(0, 0, 0));
+    assert_eq!(options.active_tab_background, Color::new(0xee, 0xee, 0xee));
+    assert_eq!(
+        options.inactive_tab_foreground,
+        Color::new(0x44, 0x44, 0x44)
+    );
+    assert_eq!(
+        options.inactive_tab_background,
+        Color::new(0x99, 0x99, 0x99)
+    );
+    assert!(options.active_tab_font_style.bold && options.active_tab_font_style.italic);
+    assert!(!options.inactive_tab_font_style.bold && !options.inactive_tab_font_style.italic);
+    assert_eq!(options.tab_bar_background, None);
+
+    let options = cfg(&[
+        "tab_bar_style powerline",
+        "tab_powerline_style round",
+        "tab_separator \" | \"",
+        "active_tab_background #112233",
+        "tab_bar_min_tabs 3",
+    ])
+    .options;
+    assert_eq!(options.tab_powerline_style, TabPowerlineStyle::Round);
+    assert_eq!(options.tab_separator, " | ");
+    assert_eq!(options.active_tab_background, Color::new(0x11, 0x22, 0x33));
+    assert_eq!(options.tab_bar_min_tabs, 3);
+}
+
+#[test]
+fn window_border_defaults_and_parsing() {
+    let options = cfg(&[]).options;
+    assert_eq!(options.window_border_width, 0.5);
+    assert_eq!(options.window_border_radius, 0.0);
+    assert!(options.draw_minimal_borders);
+    assert!(!options.draw_window_borders_for_single_window);
+    assert_eq!(options.active_border_color, Some(Color::new(0, 255, 0)));
+    assert_eq!(options.inactive_border_color, Color::new(204, 204, 204));
+    assert_eq!(options.bell_border_color, Color::new(255, 90, 0));
+    assert_eq!(options.window_margin_width.left, 0.0);
+
+    let options = cfg(&[
+        "window_border_width 2px",
+        "window_border_radius 4pt",
+        "draw_minimal_borders no",
+        "draw_window_borders_for_single_window yes",
+        "active_border_color none",
+        "window_margin_width 1 2 3 4",
+    ])
+    .options;
+    assert_eq!(options.window_border_width, 2.0);
+    assert_eq!(options.window_border_radius, 4.0);
+    assert!(!options.draw_minimal_borders);
+    assert!(options.draw_window_borders_for_single_window);
+    assert_eq!(options.active_border_color, None);
+    assert_eq!(options.window_margin_width.left, 4.0);
+    assert_eq!(options.window_margin_width.top, 1.0);
+    assert_eq!(options.window_margin_width.right, 2.0);
+    assert_eq!(options.window_margin_width.bottom, 3.0);
 }
 
 #[test]

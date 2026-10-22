@@ -13,6 +13,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use kitty_graphics::{ImageFormat, IndexedPalette};
 use kitty_render::gl_backend::{FilterMode, GlBackend, GlBackendConfig};
 use kitty_render::{
     background_image, BackgroundImageConfig, BackgroundLayout, BasicColorResolver, CellMetrics,
@@ -198,6 +199,59 @@ fn main() {
 
     bench_image_placements(&mut backend, iters, width.max(1), height.max(1));
     bench_background_image(&mut backend, iters, width.max(1), height.max(1));
+    bench_indexed_upload(&mut backend, iters);
+}
+
+fn bench_indexed_upload(backend: &mut GlBackend, iters: usize) {
+    let image_width = 256u32;
+    let image_height = 256u32;
+    let mut raw: Vec<u8> = (0..image_width * image_height)
+        .map(|index| (index % 256) as u8)
+        .collect();
+    let palette = IndexedPalette::default();
+    let key = ImageKey::Protocol(0x7000);
+    let mut frame = full_frame(32, 32);
+    let mut expanded_bytes = 0usize;
+    let start = Instant::now();
+    for iteration in 0..iters {
+        let index = iteration % raw.len();
+        raw[index] = (iteration % 256) as u8;
+        let Some(upload) = ImageUpload::from_indexed(
+            key,
+            image_width,
+            image_height,
+            &raw,
+            ImageFormat::Indexed,
+            &palette,
+            ImageFilter::Nearest,
+            ImageWrap::Clamp,
+        ) else {
+            eprintln!("skipping indexed upload bench: expansion failed");
+            return;
+        };
+        expanded_bytes = expanded_bytes.wrapping_add(upload.data.len());
+        frame.image_uploads.clear();
+        frame.image_uploads.push(upload);
+        frame.images.clear();
+        frame
+            .images
+            .push(ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)));
+        if backend.sync_images(&frame).is_err() {
+            eprintln!("skipping indexed upload bench: upload failed");
+            return;
+        }
+    }
+    let elapsed = start.elapsed();
+    let seconds = elapsed.as_secs_f64().max(1e-9);
+    println!(
+        "indexed upload:   {} frames in {:?}  {:.3} ms/frame  {:.1} MiB/s  ({}x{} f=8 palette expansion + GL upload)",
+        iters,
+        elapsed,
+        seconds / iters as f64 * 1e3,
+        expanded_bytes as f64 / seconds / (1024.0 * 1024.0),
+        image_width,
+        image_height,
+    );
 }
 
 fn full_frame(_width: u32, _height: u32) -> Frame {

@@ -1678,8 +1678,15 @@ impl GlBackend {
             for scissor in scissors {
                 let y = self.height as i32 - (scissor.y + scissor.height);
                 (self.gl.glScissor)(scissor.x, y, scissor.width, scissor.height);
-                (self.gl.glClearColor)(background[0], background[1], background[2], background[3]);
-                (self.gl.glClear)(GL_COLOR_BUFFER_BIT);
+                if !frame.skip_clear {
+                    (self.gl.glClearColor)(
+                        background[0],
+                        background[1],
+                        background[2],
+                        background[3],
+                    );
+                    (self.gl.glClear)(GL_COLOR_BUFFER_BIT);
+                }
 
                 for call in &self.draw_calls {
                     // glDrawArraysInstanced has no base-instance parameter in

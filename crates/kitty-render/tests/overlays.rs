@@ -288,7 +288,16 @@ fn tab_bar_active_inactive_and_overflow_pixels() {
     assert_eq!(bar.tabs.len(), 3, "only tabs intersecting the viewport");
     assert!(bar.tabs.iter().all(|t| t.rect.right() <= 100.0));
     assert_eq!(canvas.pixel(95, 2), [20, 30, 40, 255], "clipped tab");
-    assert_eq!(canvas.pixel(115, 2), [17, 17, 17, 255], "outside viewport");
+    assert_eq!(
+        canvas.pixel(115, 2),
+        [
+            frame.default_bg.r,
+            frame.default_bg.g,
+            frame.default_bg.b,
+            255
+        ],
+        "outside viewport"
+    );
 }
 
 #[test]

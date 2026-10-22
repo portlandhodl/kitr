@@ -24,16 +24,27 @@
 //!   payloads) and `wl_data_device` drag targets on Wayland, exposed as
 //!   [`WindowEvent::DragEnter`], [`WindowEvent::DragMotion`],
 //!   [`WindowEvent::DragDrop`] and [`WindowEvent::DragLeave`];
+//! * local drag sources on both backends: XDND enter/position/drop/leave on
+//!   X11 and `wl_data_source.start_drag` on Wayland, offering
+//!   `text/uri-list` for files and UTF-8 text for selections, with
+//!   [`WindowEvent::DragStarted`], [`WindowEvent::DragFinished`] and
+//!   [`WindowEvent::DragCancelled`] notifications;
+//! * XInput2 touch begin/update/end on X11 and `wl_touch` on Wayland, exposed
+//!   as [`WindowEvent::Touch`] with id, position, pressure and phase;
 //! * a `poll()`-based event pump with EINTR handling, configure/expose
 //!   coalescing and a pipe-based wakeup handle that another thread can use;
 //! * clipboard get/set with an async request state machine and blocking
-//!   convenience methods. Wayland uses `wl_data_device` with
+//!   convenience methods. Wayland uses `wl_data_device` for `CLIPBOARD` and
+//!   `zwp_primary_selection_device_manager_v1` for `PRIMARY`, offering
 //!   `text/plain;charset=utf-8`, `text/plain`, `UTF8_STRING`, `STRING` and
 //!   synthesised `TARGETS`; X11 uses `CLIPBOARD`/`PRIMARY` selections and X
 //!   atoms, with chunked `INCR` transfers for payloads above 256 KiB;
 //! * fullscreen, maximize, hide/show, title, size and pointer-shape state;
 //! * HiDPI scale factors: `Xft.dpi` on X11, `wl_output.scale`,
 //!   `wl_surface.preferred_buffer_scale` and `fractional-scale-v1` on Wayland;
+//! * cursor theme snapshots with hot reload and a per-window cursor scale.
+//!   X11 loads size-specific images through `libXcursor`; Wayland tracks the
+//!   same theme/scale state so a compositor cursor layer can reload it;
 //! * independent EGL window surfaces with an RGB8 config, GL 3.3 core (falling
 //!   back to GLES 3), clear/swap/readback and RAII teardown. The X11 path uses
 //!   `EGL_PLATFORM_X11_KHR`; the Wayland path uses
@@ -45,14 +56,16 @@
 //!
 //! # Intentional gaps
 //!
-//! macOS/Cocoa, touch gestures and tablet input are not implemented. X11 cursor
-//! themes use `XcursorLibraryLoadCursor` when libXcursor is present and fall
-//! back to the cursor font otherwise. Wayland implements the `CLIPBOARD`
-//! selection and a drag target through `wl_data_device`, but not the `PRIMARY`
-//! selection or drag sources. Wayland window position is compositor-owned, so
-//! `position` is only bookkeeping. Fractional scaling falls back to the integer
-//! output scale when `viewporter` is unavailable. The X11 input-method tests
-//! exercise callback state directly because `Xvfb` usually has no XIM server.
+//! macOS/Cocoa is not implemented. Tablet-tool proximity, pressure curves and
+//! tilt from `zwp_tablet_v2` are not modelled; `wl_touch` uses unit pressure
+//! because the core protocol carries no pressure axis. X11 cursor themes load
+//! size-specific images through `libXcursor` when present and fall back to the
+//! cursor font otherwise; Wayland tracks theme hot-reload state but expects the
+//! caller's compositor cursor layer to paint it. Wayland window position is
+//! compositor-owned, so `position` is only bookkeeping. Fractional scaling
+//! falls back to the integer output scale when `viewporter` is unavailable. The
+//! X11 input-method tests exercise callback state directly because `Xvfb`
+//! usually has no XIM server.
 //!
 //! # Example
 //!
@@ -81,6 +94,7 @@
 
 mod backend;
 pub mod clipboard;
+pub mod cursor;
 pub mod dnd;
 pub mod egl;
 pub mod types;
@@ -94,12 +108,14 @@ pub use backend::WindowBackend;
 pub use clipboard::{
     ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken,
 };
+pub use cursor::{CursorTheme, CursorThemeEvent};
+pub use dnd::{DragSourceData, DragSourceState, DropTarget};
 #[cfg(feature = "wayland")]
 pub use egl::EglWaylandSurface;
 pub use egl::{EglError, EglWindowSurface, GlApi, GlFns};
 pub use types::{
     keysym, KeyAction, KeyInput, ModifierMasks, Modifiers, MouseButton, PointerShape, Selection,
-    WindowConfig, WindowError, WindowEvent,
+    TouchPhase, WindowConfig, WindowError, WindowEvent,
 };
 pub use wakeup::WakeupHandle;
 pub use x11::{probe_display, x_error_count, X11Window};

@@ -475,6 +475,88 @@ impl TabBarStyle {
             Self::Custom => "custom",
         }
     }
+
+    /// Whether the style ever draws a tab bar. Visibility also depends on
+    /// [`Options::tab_bar_should_be_visible`].
+    pub const fn is_hidden(self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabPowerlineStyle {
+    #[default]
+    Angled,
+    Round,
+    Slanted,
+}
+
+impl TabPowerlineStyle {
+    pub fn from_setting(value: &str) -> Result<Self, String> {
+        match value.to_lowercase().as_str() {
+            "angled" => Ok(Self::Angled),
+            "round" => Ok(Self::Round),
+            "slanted" => Ok(Self::Slanted),
+            other => Err(format!(
+                "The value {other} is not a valid choice for tab_powerline_style"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Angled => "angled",
+            Self::Round => "round",
+            Self::Slanted => "slanted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabBarAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl TabBarAlign {
+    pub fn from_setting(value: &str) -> Result<Self, String> {
+        match value.to_lowercase().as_str() {
+            "start" => Ok(Self::Start),
+            "center" => Ok(Self::Center),
+            "end" => Ok(Self::End),
+            other => Err(format!(
+                "The value {other} is not a valid choice for tab_bar_align"
+            )),
+        }
+    }
+}
+
+/// Bold/italic flags used by `active_tab_font_style` and
+/// `inactive_tab_font_style`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabFontStyle {
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl TabFontStyle {
+    pub fn from_setting(value: &str) -> Result<Self, String> {
+        let lowered = value.to_lowercase();
+        let (bold, italic) = match lowered.as_str() {
+            "normal" | "none" => (false, false),
+            "bold" => (true, false),
+            "italic" => (false, true),
+            "bold-italic" | "italic-bold" => (true, true),
+            other => {
+                return Err(format!(
+                    "The value {other} is not a valid choice for tab font style"
+                ))
+            }
+        };
+        Ok(Self { bold, italic })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -597,7 +679,27 @@ pub struct Options {
     pub scrollback_lines: u64,
 
     pub tab_bar_style: TabBarStyle,
+    pub tab_bar_min_tabs: u32,
+    pub tab_bar_align: TabBarAlign,
+    pub tab_bar_background: Option<Color>,
+    pub active_tab_foreground: Color,
+    pub active_tab_background: Color,
+    pub inactive_tab_foreground: Color,
+    pub inactive_tab_background: Color,
+    pub active_tab_font_style: TabFontStyle,
+    pub inactive_tab_font_style: TabFontStyle,
+    pub tab_separator: String,
+    pub tab_fade: Vec<f64>,
+    pub tab_powerline_style: TabPowerlineStyle,
     pub window_padding_width: Edges<f64>,
+    pub window_margin_width: Edges<f64>,
+    pub window_border_width: f64,
+    pub window_border_radius: f64,
+    pub draw_minimal_borders: bool,
+    pub draw_window_borders_for_single_window: bool,
+    pub active_border_color: Option<Color>,
+    pub inactive_border_color: Color,
+    pub bell_border_color: Color,
     pub background_opacity: f64,
 
     pub shell: String,
@@ -645,7 +747,30 @@ impl Default for Options {
             cursor_blink_interval: CursorBlinkInterval::default(),
             scrollback_lines: 2000,
             tab_bar_style: TabBarStyle::Fade,
+            tab_bar_min_tabs: 2,
+            tab_bar_align: TabBarAlign::Start,
+            tab_bar_background: None,
+            active_tab_foreground: Color::new(0x00, 0x00, 0x00),
+            active_tab_background: Color::new(0xee, 0xee, 0xee),
+            inactive_tab_foreground: Color::new(0x44, 0x44, 0x44),
+            inactive_tab_background: Color::new(0x99, 0x99, 0x99),
+            active_tab_font_style: TabFontStyle {
+                bold: true,
+                italic: true,
+            },
+            inactive_tab_font_style: TabFontStyle::default(),
+            tab_separator: " ┇".into(),
+            tab_fade: vec![0.25, 0.5, 0.75, 1.0],
+            tab_powerline_style: TabPowerlineStyle::Angled,
             window_padding_width: Edges::all(0.0),
+            window_margin_width: Edges::all(0.0),
+            window_border_width: 0.5,
+            window_border_radius: 0.0,
+            draw_minimal_borders: true,
+            draw_window_borders_for_single_window: false,
+            active_border_color: Some(Color::new(0x00, 0xff, 0x00)),
+            inactive_border_color: Color::new(0xcc, 0xcc, 0xcc),
+            bell_border_color: Color::new(0xff, 0x5a, 0x00),
             background_opacity: 1.0,
             shell: ".".into(),
             editor: ".".into(),
@@ -669,6 +794,29 @@ impl Default for Options {
 impl Options {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// kitty's tab-bar visibility rules: `tab_bar_style hidden` always hides
+    /// it, and `tab_bar_min_tabs` (default 2) hides it while there are fewer
+    /// tabs. A `tab_bar_min_tabs` of zero keeps it visible for any tab count.
+    pub fn tab_bar_should_be_visible(&self, tab_count: usize) -> bool {
+        if self.tab_bar_style.is_hidden() || tab_count == 0 {
+            return false;
+        }
+        if self.tab_bar_min_tabs == 0 {
+            return true;
+        }
+        tab_count as u64 >= self.tab_bar_min_tabs as u64
+    }
+
+    /// Height of the tab-bar strip in device pixels for the given cell height.
+    /// Hidden bars reserve zero pixels.
+    pub fn tab_bar_height(&self, tab_count: usize, cell_height: f32) -> f32 {
+        if self.tab_bar_should_be_visible(tab_count) {
+            cell_height.max(0.0)
+        } else {
+            0.0
+        }
     }
 
     /// Apply one `key value` pair. Returns `Ok(false)` for an unknown key.
@@ -725,7 +873,61 @@ impl Options {
             }
 
             "tab_bar_style" => self.tab_bar_style = TabBarStyle::from_setting(value)?,
+            "tab_bar_min_tabs" => {
+                let parsed = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid tab_bar_min_tabs value: {value}"))?;
+                self.tab_bar_min_tabs = parsed;
+            }
+            "tab_bar_align" => self.tab_bar_align = TabBarAlign::from_setting(value)?,
+            "tab_bar_background" => self.tab_bar_background = parse_color_or_none(value)?,
+            "active_tab_foreground" => self.active_tab_foreground = Color::parse_required(value)?,
+            "active_tab_background" => self.active_tab_background = Color::parse_required(value)?,
+            "inactive_tab_foreground" => {
+                self.inactive_tab_foreground = Color::parse_required(value)?
+            }
+            "inactive_tab_background" => {
+                self.inactive_tab_background = Color::parse_required(value)?
+            }
+            "active_tab_font_style" => {
+                self.active_tab_font_style = TabFontStyle::from_setting(value)?
+            }
+            "inactive_tab_font_style" => {
+                self.inactive_tab_font_style = TabFontStyle::from_setting(value)?
+            }
+            "tab_separator" => {
+                let parts = Shlex::split(value, false).map_err(|error| error.to_string())?;
+                self.tab_separator = parts.join(" ");
+            }
+            "tab_fade" => {
+                self.tab_fade = value
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|part| !part.is_empty())
+                    .map(parse_unit_float)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if self.tab_fade.is_empty() {
+                    return Err(format!("Invalid tab_fade value: {value}"));
+                }
+            }
+            "tab_powerline_style" => {
+                self.tab_powerline_style = TabPowerlineStyle::from_setting(value)?
+            }
             "window_padding_width" => self.window_padding_width = parse_edge_width(value, true)?,
+            "window_margin_width" => self.window_margin_width = parse_edge_width(value, true)?,
+            "window_border_width" => {
+                self.window_border_width = parse_dimension(value)?;
+            }
+            "window_border_radius" => {
+                self.window_border_radius = parse_dimension(value)?;
+            }
+            "draw_minimal_borders" => self.draw_minimal_borders = parse_bool(value),
+            "draw_window_borders_for_single_window" => {
+                self.draw_window_borders_for_single_window = parse_bool(value)
+            }
+            "active_border_color" => self.active_border_color = parse_color_or_none(value)?,
+            "inactive_border_color" => self.inactive_border_color = Color::parse_required(value)?,
+            "bell_border_color" => self.bell_border_color = Color::parse_required(value)?,
             "background_opacity" => self.background_opacity = parse_unit_float(value)?,
 
             "shell" => self.shell = value.to_string(),
@@ -827,6 +1029,22 @@ pub fn parse_color_or_none(value: &str) -> Result<Option<Color>, String> {
     } else {
         Ok(Some(Color::parse_required(value)?))
     }
+}
+
+/// Parse a `window_border_width`/`window_border_radius` value. Values are
+/// stored in points; a `px` suffix is accepted and treated as one point per
+/// pixel (the GUI applies the display scale when converting to device pixels).
+pub fn parse_dimension(value: &str) -> Result<f64, String> {
+    let value = value.trim();
+    let number = value
+        .strip_suffix("pt")
+        .or_else(|| value.strip_suffix("px"))
+        .unwrap_or(value);
+    let parsed = parse_f64(number)?;
+    if parsed < 0.0 {
+        return Err(format!("Invalid dimension: {value}"));
+    }
+    Ok(parsed)
 }
 
 pub fn parse_edge_width(value: &str, positive: bool) -> Result<Edges<f64>, String> {

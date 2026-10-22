@@ -453,6 +453,66 @@ fn tabs_create_switch_and_close() {
 }
 
 #[test]
+fn tab_bar_hidden_for_single_tab_and_shown_for_two() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let config = std::env::temp_dir().join(format!(
+        "kitr-tabbar-{}-{}.conf",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    std::fs::write(&config, "tab_bar_style powerline\ntab_bar_min_tabs 2\n").unwrap();
+    let opts = kitty::Options {
+        size: Some((40, 8)),
+        gui: kitty::GuiMode::Gui,
+        config: Some(config.clone().into_os_string()),
+        ..kitty::Options::default()
+    };
+    let mut session = match GuiSession::open_on_display(&opts, Input::None, Some(&display.name)) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = std::fs::remove_file(&config);
+            skip(&format!("EGL/window unavailable: {error}"));
+            return;
+        }
+    };
+    assert_eq!(session.tab_count(), 1);
+    assert!(
+        !session.tab_bar_visible(),
+        "single tab must autohide the bar"
+    );
+    assert_eq!(session.tab_bar_height(), 0.0);
+    let hidden_size = session.window_size();
+    let hidden_rows = session.screen().lines;
+
+    session
+        .new_tab_for_test(&["/bin/sh", "-c", "sleep 5"])
+        .unwrap();
+    assert!(
+        wait_until(&mut session, Duration::from_secs(3), |session| {
+            session.tab_count() == 2 && session.tab_bar_visible()
+        }),
+        "tab bar did not appear for two tabs"
+    );
+    assert!(session.tab_bar_height() > 0.0);
+    session.render_now().expect("render with tab bar");
+    let shown_size = session.window_size();
+    assert_eq!(
+        shown_size, hidden_size,
+        "kitty keeps the OS window size and gives the bar a central row"
+    );
+    assert_eq!(
+        session.screen().lines + 1,
+        hidden_rows,
+        "the central grid should lose one row to the tab bar"
+    );
+    session.shutdown();
+    let _ = std::fs::remove_file(&config);
+}
+
+#[test]
 fn session_restore_opens_tabs_and_layouts() {
     let _guard = test_lock();
     let Some(display) = TestDisplay::new() else {

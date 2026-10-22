@@ -115,10 +115,12 @@
 //!
 //! # Renderer features not supported yet
 //!
-//! * Parent/child placement offsets and relative placement chains. Indexed
-//!   protocol images without RGBA data are not rendered. Animation/composition
-//!   state itself lives in `kitty-graphics`; the renderer consumes its current
-//!   frame and exposes [`RendererCore::tick_animations`].
+//! * Relative placement chains are resolved with cycle/depth checks and
+//!   descendant visibility rules; indexed protocol images are expanded through
+//!   the renderer's palette so `f=8`/`f=16` work with the same texture upload
+//!   path. Animation/composition state lives in `kitty-graphics`; the renderer
+//!   consumes its reconstructed current frame and exposes
+//!   [`RendererCore::tick_animations`].
 //! * The full cursor-trail corner animation and custom trail shaders. The
 //!   implemented trail is a simple bounded history of recent cursor cells that
 //!   fades linearly and is replaced rather than smoothly eased.
@@ -183,33 +185,36 @@ pub use atlas::{
 };
 pub use colors::{
     build_gamma_lut, contrast_ratio, decode_color, dimmed_color, encode_indexed, encode_rgb,
-    encode_special, gamma_lut, gamma_lut_lookup, linear_to_srgb, luminance, rgb_u32_to_linear,
-    srgb_to_linear, BasicColorResolver, CellColor, ColorResolver, Rgba8,
+    encode_special, gamma_lut, gamma_lut_lookup, indexed_image_palette, kitty_default_palette,
+    linear_to_srgb, luminance, rgb_u32_to_linear, srgb_to_linear, BasicColorResolver, CellColor,
+    ColorResolver, Rgba8, KITTY_DEFAULT_ANSI_COLORS,
 };
 pub use core::RendererCore;
 pub use damage::{coalesce_lines, CursorState, Damage, DamageTracker, FullRedrawReason, LineRange};
 pub use decorations::{
     add_borders, background_rect, beam_cursor_rect, curly_underline_mask, dashed_underline_mask,
     dotted_underline_mask, double_underline_geometry, double_underline_mask, hollow_cursor_rects,
-    horizontal_edge, missing_glyph_mask, padding_rects, padding_rects_between, rounded_rect_points,
-    straight_underline_geometry, straight_underline_mask, strikethrough_geometry,
-    strikethrough_mask, strikethrough_rects, tab_bar_blank_rects, tessellate_rounded_rect_border,
-    tessellate_rounded_rect_fill, underline_cursor_rect, underline_mask, underline_rects,
-    vertical_edge, BorderColor, BorderRect, DecorationGeometry, DecorationMask, Edge,
-    TabBarBlankRectConfig, Triangle, UnderlineStyle, Vertex, WindowGeometry,
+    horizontal_edge, missing_glyph_mask, padding_rects, padding_rects_between, pane_border_rects,
+    rounded_rect_points, straight_underline_geometry, straight_underline_mask,
+    strikethrough_geometry, strikethrough_mask, strikethrough_rects, tab_bar_blank_rects,
+    tessellate_rounded_rect_border, tessellate_rounded_rect_fill, underline_cursor_rect,
+    underline_mask, underline_rects, vertical_edge, BorderColor, BorderRect, DecorationGeometry,
+    DecorationMask, Edge, PaneBorderLine, PaneBorderPane, TabBarBlankRectConfig, Triangle,
+    UnderlineStyle, Vertex, WindowGeometry,
 };
 pub use font_rasterizer::FontRasterizer;
 pub use geom::{CellMetrics, EdgeWidths, GridGeometry, Rect, Region};
 pub use images::{
     background_image, background_quad, clip_rect_uv, collect_protocol_images,
-    collect_protocol_images_with_animations, color_to_image_id, diacritic_to_num,
-    expand_unicode_placeholders, fingerprint, window_logo, window_logo_quad, BackgroundImageConfig,
-    BackgroundLayout, ImageAsset, ImageData, ImageFilter, ImageInstance, ImageKey, ImageLayer,
-    ImageLoadError, ImageUpload, ImageWrap, LogoPosition, PlaceholderRun, WindowLogoConfig,
+    collect_protocol_images_with_animations, collect_protocol_images_with_palette,
+    color_to_image_id, diacritic_to_num, expand_unicode_placeholders, fingerprint, window_logo,
+    window_logo_quad, BackgroundImageConfig, BackgroundLayout, ImageAsset, ImageData, ImageFilter,
+    ImageInstance, ImageKey, ImageLayer, ImageLoadError, ImageUpload, ImageWrap, LogoPosition,
+    PlaceholderRun, WindowLogoConfig,
 };
 pub use instances::{
     BackgroundInstance, CursorGeometry, CursorInstance, DecorationInstance, DecorationKind, Frame,
-    GlyphInstance, InstanceFlags, InstanceGenerator, RenderConfig, GLYPH_FLAG_BOLD,
+    GlyphInstance, InstanceFlags, InstanceGenerator, RenderConfig, SolidRect, GLYPH_FLAG_BOLD,
     GLYPH_FLAG_COLOR, GLYPH_FLAG_ITALIC,
 };
 pub use overlays::{

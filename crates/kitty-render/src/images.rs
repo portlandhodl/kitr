@@ -17,17 +17,23 @@
 //! * window logos with the nine kitty anchor positions, opacity and optional
 //!   percentage scaling.
 //!
-//! Parent/child relative placements and indexed-colour images without RGBA
-//! data are not turned into quads. Unicode placeholder runs and animation
-//! frames are expanded here; the current animation frame takes precedence over
-//! the root image stored on the screen.
+//! Relative placements are resolved through `kitty_graphics::PlacementGraph`
+//! (cycles, depth limits, virtual-placeholder anchors, inherited z-index/source
+//! rectangles), and indexed-colour images are expanded through an
+//! [`IndexedPalette`] before texture upload. Unicode placeholder runs and
+//! animation frames are expanded here; the current animation frame takes
+//! precedence over the root image stored on the screen.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
 use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
-use kitty_graphics::{decode_png, AnimationManager, Image, MAX_IMAGE_DIMENSION};
+use kitty_graphics::{
+    decode_png, AnimationManager, Image, ImageFormat, IndexedPalette, PlacementGraph, PlacementKey,
+    PlacementRecord, ResolvedPlacement, SourceRect, MAX_IMAGE_DIMENSION,
+};
 use kitty_screen::Screen;
 
 use crate::atlas::UvRect;
@@ -200,6 +206,30 @@ impl ImageUpload {
             wrap,
             fingerprint,
         }
+    }
+
+    /// Build an RGBA upload from raw indexed samples and a palette. This is
+    /// the upload path used for `f=8`/`f=16` protocol images.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_indexed(
+        key: ImageKey,
+        width: u32,
+        height: u32,
+        raw: &[u8],
+        format: ImageFormat,
+        palette: &IndexedPalette,
+        filter: ImageFilter,
+        wrap: ImageWrap,
+    ) -> Option<Self> {
+        if width == 0 || height == 0 || !format.is_indexed() {
+            return None;
+        }
+        let expected = width as usize * height as usize * format.bytes_per_pixel()?;
+        if raw.len() < expected {
+            return None;
+        }
+        let data = palette.expand(&raw[..expected], format, width, height);
+        Some(Self::new(key, width, height, Arc::new(data), filter, wrap))
     }
 
     #[inline]
@@ -934,6 +964,7 @@ fn image_pixels(
     image: &Image,
     image_id: u32,
     animations: Option<&AnimationManager>,
+    palette: &IndexedPalette,
 ) -> Option<(ImageData, u32, u32)> {
     if let Some(animated) = animations.and_then(|manager| manager.image(image_id)) {
         return Some((animated.current_data(), animated.width, animated.height));
@@ -941,15 +972,63 @@ fn image_pixels(
     if image.width == 0 || image.height == 0 {
         return None;
     }
-    image
-        .rgba
-        .as_ref()
-        .map(|rgba| (Arc::new(rgba.clone()), image.width, image.height))
+    if let Some(rgba) = image.rgba.as_ref() {
+        return Some((Arc::new(rgba.clone()), image.width, image.height));
+    }
+    if image.format.is_indexed() {
+        let expanded = palette.expand_image(image).ok()?;
+        return Some((Arc::new(expanded), image.width, image.height));
+    }
+    None
+}
+
+/// Build the relative-placement graph for a screen, including anchors for
+/// virtual placements derived from their placeholder cells.
+fn placement_graph(screen: &Screen, runs: &[PlaceholderRun]) -> PlacementGraph {
+    let records = screen.placements().iter().map(|placement| {
+        let p = &placement.placement;
+        let record = PlacementRecord::new(
+            PlacementKey::new(placement.image_id, placement.placement_id),
+            placement.anchor_x,
+            placement.anchor_y,
+        )
+        .with_parent(p.parent_id, p.parent_placement_id)
+        .with_offset(p.offset_from_parent_x, p.offset_from_parent_y)
+        .with_source(SourceRect::new(p.x_offset, p.y_offset, p.width, p.height))
+        .with_z_index(p.z_index)
+        .inheriting(p.parent_id != 0 && p.z_index == 0, p.parent_id != 0);
+        if p.unicode_placement {
+            record.as_virtual()
+        } else {
+            record
+        }
+    });
+    let mut graph = PlacementGraph::new();
+    for record in records {
+        let virtual_placement = record.virtual_placement;
+        let key = record.key;
+        let _ = graph.insert(record);
+        if virtual_placement {
+            let anchor = runs
+                .iter()
+                .filter(|run| {
+                    run.image_id == key.image_id
+                        && (key.placement_id == 0 || run.placement_id == key.placement_id)
+                })
+                .map(|run| (run.screen_x, run.screen_y))
+                .min();
+            if let Some((x, y)) = anchor {
+                graph.set_anchor(key, x, y);
+            }
+        }
+    }
+    graph
 }
 
 #[allow(clippy::too_many_arguments)]
 fn protocol_placement(
     placement: &kitty_screen::ImagePlacement,
+    resolved: &ResolvedPlacement,
     data: ImageData,
     image_width: u32,
     image_height: u32,
@@ -961,52 +1040,50 @@ fn protocol_placement(
     let p = &placement.placement;
     let cell_w = geometry.cell_width;
     let cell_h = geometry.cell_height;
-    let iw = image_width as f32;
-    let ih = image_height as f32;
+    let source = resolved.source.clamped(image_width, image_height);
+    let source_w = if source.width == 0 {
+        image_width as f32
+    } else {
+        source.width as f32
+    };
+    let source_h = if source.height == 0 {
+        image_height as f32
+    } else {
+        source.height as f32
+    };
 
-    let explicit_width = p.width > 0;
-    let explicit_height = p.height > 0;
-    let mut width = if explicit_width {
-        p.width as f32
-    } else if p.num_cols > 0 {
+    let mut width = if p.num_cols > 0 {
         p.num_cols as f32 * cell_w
     } else {
-        iw
+        source_w
     };
-    let mut height = if explicit_height {
-        p.height as f32
-    } else if p.num_rows > 0 {
+    let mut height = if p.num_rows > 0 {
         p.num_rows as f32 * cell_h
     } else {
-        ih
+        source_h
     };
-
-    if !explicit_width && p.num_cols == 0 && (explicit_height || p.num_rows > 0) {
-        width = height * iw / ih;
-    } else if !explicit_height && p.num_rows == 0 && (explicit_width || p.num_cols > 0) {
-        height = width * ih / iw;
+    if p.num_cols == 0 && p.num_rows > 0 && source_h > 0.0 {
+        width = height * source_w / source_h;
+    } else if p.num_rows == 0 && p.num_cols > 0 && source_w > 0.0 {
+        height = width * source_h / source_w;
     }
     if width <= 0.0 || height <= 0.0 {
         return None;
     }
 
     let rect = Rect::new(
-        geometry.origin_x
-            + placement.anchor_x as f32 * cell_w
-            + p.x_offset as f32
-            + p.cell_x_offset as f32,
-        geometry.origin_y
-            + placement.anchor_y as f32 * cell_h
-            + p.y_offset as f32
-            + p.cell_y_offset as f32,
+        geometry.origin_x + resolved.anchor_x as f32 * cell_w + p.cell_x_offset as f32,
+        geometry.origin_y + resolved.anchor_y as f32 * cell_h + p.cell_y_offset as f32,
         width,
         height,
     );
+    let iw = image_width as f32;
+    let ih = image_height as f32;
     let uv = UvRect {
-        u0: 0.0,
-        v0: 0.0,
-        u1: 1.0,
-        v1: 1.0,
+        u0: (source.x as f32 / iw).clamp(0.0, 1.0),
+        v0: (source.y as f32 / ih).clamp(0.0, 1.0),
+        u1: ((source.x as f32 + source_w) / iw).clamp(0.0, 1.0),
+        v1: ((source.y as f32 + source_h) / ih).clamp(0.0, 1.0),
     };
     let (rect, uv) = clip_rect_uv(rect, uv, viewport_width, viewport_height)?;
     let key = ImageKey::Protocol(placement.image_id);
@@ -1020,7 +1097,7 @@ fn protocol_placement(
     );
     let instance = ImageInstance::new(key, rect)
         .with_uv(uv)
-        .with_z_index(p.z_index);
+        .with_z_index(resolved.z_index);
     Some((instance, upload))
 }
 
@@ -1151,6 +1228,38 @@ pub fn collect_protocol_images_with_animations(
     instances: &mut Vec<ImageInstance>,
     uploads: &mut Vec<ImageUpload>,
 ) {
+    let palette = IndexedPalette::default();
+    collect_protocol_images_with_palette(
+        screen,
+        animations,
+        &palette,
+        geometry,
+        viewport_width,
+        viewport_height,
+        filter,
+        instances,
+        uploads,
+    );
+}
+
+/// Like [`collect_protocol_images_with_animations`], but expands indexed
+/// protocol images through `palette` and resolves relative placements.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_protocol_images_with_palette(
+    screen: &Screen,
+    animations: Option<&AnimationManager>,
+    palette: &IndexedPalette,
+    geometry: &GridGeometry,
+    viewport_width: f32,
+    viewport_height: f32,
+    filter: ImageFilter,
+    instances: &mut Vec<ImageInstance>,
+    uploads: &mut Vec<ImageUpload>,
+) {
+    let runs = expand_unicode_placeholders(screen);
+    let graph = placement_graph(screen, &runs);
+    let resolved: BTreeMap<PlacementKey, ResolvedPlacement> =
+        graph.resolve_all().into_iter().collect();
     let mut seen_uploads: Vec<ImageKey> = Vec::new();
     let mut collected: Vec<(i32, u32, u32, u32, ImageInstance, Option<ImageUpload>)> = Vec::new();
     let mut order = 0u32;
@@ -1159,15 +1268,22 @@ pub fn collect_protocol_images_with_animations(
         if placement.placement.unicode_placement {
             continue;
         }
+        let key = PlacementKey::new(placement.image_id, placement.placement_id);
+        let Some(resolved) = resolved.get(&key) else {
+            // Broken, cyclic, over-deep or self-referential relative chain.
+            continue;
+        };
         let Some(image) = screen.image(placement.image_id) else {
             continue;
         };
-        let Some((data, width, height)) = image_pixels(image, placement.image_id, animations)
+        let Some((data, width, height)) =
+            image_pixels(image, placement.image_id, animations, palette)
         else {
             continue;
         };
         let Some((instance, upload)) = protocol_placement(
             placement,
+            resolved,
             data,
             width,
             height,
@@ -1195,7 +1311,7 @@ pub fn collect_protocol_images_with_animations(
         order = order.wrapping_add(1);
     }
 
-    for run in expand_unicode_placeholders(screen) {
+    for run in runs {
         let Some(image) = screen.image(run.image_id) else {
             continue;
         };
@@ -1206,7 +1322,8 @@ pub fn collect_protocol_images_with_animations(
         }) else {
             continue;
         };
-        let Some((data, width, height)) = image_pixels(image, run.image_id, animations) else {
+        let Some((data, width, height)) = image_pixels(image, run.image_id, animations, palette)
+        else {
             continue;
         };
         let Some((rect, uv)) = placeholder_quad(&run, virtual_placement, width, height, geometry)

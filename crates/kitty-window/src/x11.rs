@@ -5,7 +5,7 @@
 //! This is an equivalent backend to the GLFW/X11 path kitty normally uses. It
 //! deliberately uses raw FFI with no bindgen and no external crates.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{
     c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void, CStr, CString,
 };
@@ -18,7 +18,8 @@ use crate::clipboard::{
     ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken, IncrReadState,
     IncrWriteState, INCR_THRESHOLD,
 };
-use crate::dnd::{parse_uri_list, DragSession};
+use crate::cursor::CursorTheme;
+use crate::dnd::{parse_uri_list, DragSession, DragSourceData, DragSourceState};
 use crate::types::{
     keysym, KeyAction, KeyInput, ModifierMasks, Modifiers, MouseButton, PointerShape, Selection,
     WindowConfig, WindowError, WindowEvent,
@@ -73,6 +74,7 @@ mod ffi {
     pub const SELECTION_REQUEST: c_int = 30;
     pub const SELECTION_NOTIFY: c_int = 31;
     pub const CLIENT_MESSAGE: c_int = 33;
+    pub const GENERIC_EVENT: c_int = 35;
 
     pub const PROPERTY_NEW_VALUE: c_int = 0;
     pub const PROPERTY_DELETE: c_int = 1;
@@ -405,8 +407,143 @@ mod ffi {
         pub xselectionrequest: XSelectionRequestEvent,
         pub xselection: XSelectionEvent,
         pub xproperty: XPropertyEvent,
+        pub xgeneric: XGenericEventCookie,
         pub pad: [c_long; 24],
     }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XGenericEventCookie {
+        pub type_: c_int,
+        pub serial: c_ulong,
+        pub send_event: Bool,
+        pub display: *mut Display,
+        pub extension: c_int,
+        pub evtype: c_int,
+        pub cookie: c_uint,
+        pub data: *mut c_void,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIAnyClassInfo {
+        pub type_: c_int,
+        pub sourceid: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XITouchClassInfo {
+        pub type_: c_int,
+        pub sourceid: c_int,
+        pub mode: c_int,
+        pub num_touches: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIValuatorClassInfo {
+        pub type_: c_int,
+        pub sourceid: c_int,
+        pub number: c_int,
+        pub label: Atom,
+        pub min: f64,
+        pub max: f64,
+        pub value: f64,
+        pub resolution: c_int,
+        pub mode: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIDeviceInfo {
+        pub deviceid: c_int,
+        pub name: *mut c_char,
+        pub use_: c_int,
+        pub attachment: c_int,
+        pub enabled: Bool,
+        pub num_classes: c_int,
+        pub classes: *mut *mut XIAnyClassInfo,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIEventMask {
+        pub deviceid: c_int,
+        pub mask_len: c_int,
+        pub mask: *mut c_uchar,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIButtonState {
+        pub mask_len: c_int,
+        pub mask: *mut c_uchar,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIValuatorState {
+        pub mask_len: c_int,
+        pub mask: *mut c_uchar,
+        pub values: *mut f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIModifierState {
+        pub base: c_int,
+        pub latched: c_int,
+        pub locked: c_int,
+        pub effective: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIGroupState {
+        pub base: c_int,
+        pub latched: c_int,
+        pub locked: c_int,
+        pub effective: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIDeviceEvent {
+        pub type_: c_int,
+        pub serial: c_ulong,
+        pub send_event: Bool,
+        pub display: *mut Display,
+        pub extension: c_int,
+        pub evtype: c_int,
+        pub time: Time,
+        pub deviceid: c_int,
+        pub sourceid: c_int,
+        pub detail: c_int,
+        pub root: Window,
+        pub event: Window,
+        pub child: Window,
+        pub root_x: f64,
+        pub root_y: f64,
+        pub event_x: f64,
+        pub event_y: f64,
+        pub flags: c_int,
+        pub buttons: XIButtonState,
+        pub valuators: XIValuatorState,
+        pub mods: XIModifierState,
+        pub group: XIGroupState,
+    }
+
+    pub const XI_TOUCH_BEGIN: c_int = 18;
+    pub const XI_TOUCH_UPDATE: c_int = 19;
+    pub const XI_TOUCH_END: c_int = 20;
+    pub const XI_ALL_DEVICES: c_int = 0;
+    pub const XI_ALL_MASTER_DEVICES: c_int = 1;
+    pub const XI_TOUCH_CLASS: c_int = 8;
+    pub const XI_VALUATOR_CLASS: c_int = 2;
+    pub const XI_TOUCH_BEGIN_MASK: u32 = 1 << XI_TOUCH_BEGIN;
+    pub const XI_TOUCH_UPDATE_MASK: u32 = 1 << XI_TOUCH_UPDATE;
+    pub const XI_TOUCH_END_MASK: u32 = 1 << XI_TOUCH_END;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -599,6 +736,26 @@ mod ffi {
         pub fn XResourceManagerString(display: *mut Display) -> *mut c_char;
         pub fn XFree(data: *mut c_void) -> c_int;
         pub fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+        pub fn XQueryPointer(
+            display: *mut Display,
+            window: Window,
+            root_return: *mut Window,
+            child_return: *mut Window,
+            root_x: *mut c_int,
+            root_y: *mut c_int,
+            win_x: *mut c_int,
+            win_y: *mut c_int,
+            mask_return: *mut c_uint,
+        ) -> Bool;
+        pub fn XQueryExtension(
+            display: *mut Display,
+            name: *const c_char,
+            major_opcode: *mut c_int,
+            first_event: *mut c_int,
+            first_error: *mut c_int,
+        ) -> Bool;
+        pub fn XGetEventData(display: *mut Display, cookie: *mut XGenericEventCookie) -> Bool;
+        pub fn XFreeEventData(display: *mut Display, cookie: *mut XGenericEventCookie);
         pub fn XTranslateCoordinates(
             display: *mut Display,
             src: Window,
@@ -624,6 +781,27 @@ mod ffi {
         pub fn XGetIMValues(im: *mut XIM, ...) -> *mut c_char;
         pub fn XGetICValues(ic: *mut XIC, ...) -> *mut c_char;
         pub fn XSetICValues(ic: *mut XIC, ...) -> *mut c_char;
+    }
+
+    #[link(name = "Xi")]
+    unsafe extern "C" {
+        pub fn XISelectEvents(
+            display: *mut Display,
+            window: Window,
+            masks: *mut XIEventMask,
+            num_masks: c_int,
+        ) -> Status;
+        pub fn XIQueryVersion(
+            display: *mut Display,
+            major: *mut c_int,
+            minor: *mut c_int,
+        ) -> Status;
+        pub fn XIQueryDevice(
+            display: *mut Display,
+            deviceid: c_int,
+            ndevices_return: *mut c_int,
+        ) -> *mut XIDeviceInfo;
+        pub fn XIFreeDeviceInfo(info: *mut XIDeviceInfo);
     }
 
     #[link(name = "dl")]
@@ -1145,10 +1323,33 @@ unsafe fn open_input_context(
 }
 
 type XcursorLoadCursor = unsafe extern "C" fn(*mut Display, *const c_char) -> c_ulong;
+type XcursorLoadImage =
+    unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> *mut XcursorImage;
+type XcursorImageLoadCursor = unsafe extern "C" fn(*mut Display, *const XcursorImage) -> c_ulong;
+type XcursorImageDestroy = unsafe extern "C" fn(*mut XcursorImage);
+type XcursorGetTheme = unsafe extern "C" fn(*mut Display) -> *const c_char;
+type XcursorGetDefaultSize = unsafe extern "C" fn(*mut Display) -> c_int;
+
+#[repr(C)]
+struct XcursorImage {
+    version: c_uint,
+    size: c_uint,
+    width: c_uint,
+    height: c_uint,
+    xhot: c_uint,
+    yhot: c_uint,
+    delay: c_uint,
+    pixels: *mut c_uint,
+}
 
 struct XcursorLoader {
     handle: *mut c_void,
     load_cursor: XcursorLoadCursor,
+    load_image: Option<XcursorLoadImage>,
+    image_load_cursor: Option<XcursorImageLoadCursor>,
+    image_destroy: Option<XcursorImageDestroy>,
+    get_theme: Option<XcursorGetTheme>,
+    get_default_size: Option<XcursorGetDefaultSize>,
 }
 
 impl XcursorLoader {
@@ -1171,12 +1372,80 @@ impl XcursorLoader {
                 continue;
             }
             let load_cursor: XcursorLoadCursor = unsafe { std::mem::transmute(symbol) };
+            let optional = |name: &CStr| unsafe { dlsym(handle, name.as_ptr()) };
+            let load_image_symbol = optional(c"XcursorLibraryLoadImage");
+            let image_load_symbol = optional(c"XcursorImageLoadCursor");
+            let image_destroy_symbol = optional(c"XcursorImageDestroy");
+            let get_theme_symbol = optional(c"XcursorGetTheme");
+            let get_size_symbol = optional(c"XcursorGetDefaultSize");
             return Some(Self {
                 handle,
                 load_cursor,
+                load_image: (!load_image_symbol.is_null())
+                    .then(|| unsafe { std::mem::transmute(load_image_symbol) }),
+                image_load_cursor: (!image_load_symbol.is_null())
+                    .then(|| unsafe { std::mem::transmute(image_load_symbol) }),
+                image_destroy: (!image_destroy_symbol.is_null())
+                    .then(|| unsafe { std::mem::transmute(image_destroy_symbol) }),
+                get_theme: (!get_theme_symbol.is_null())
+                    .then(|| unsafe { std::mem::transmute(get_theme_symbol) }),
+                get_default_size: (!get_size_symbol.is_null())
+                    .then(|| unsafe { std::mem::transmute(get_size_symbol) }),
             });
         }
         None
+    }
+
+    fn display_theme(&self, display: *mut Display) -> Option<String> {
+        let get_theme = self.get_theme?;
+        let pointer = unsafe { get_theme(display) };
+        if pointer.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { CStr::from_ptr(pointer) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    fn display_size(&self, display: *mut Display) -> Option<u32> {
+        let get_size = self.get_default_size?;
+        let size = unsafe { get_size(display) };
+        (size > 0).then_some(size as u32)
+    }
+
+    fn load_sized(
+        &self,
+        display: *mut Display,
+        name: &str,
+        theme: Option<&str>,
+        size: u32,
+    ) -> c_ulong {
+        let (Some(load_image), Some(image_load_cursor), Some(image_destroy)) =
+            (self.load_image, self.image_load_cursor, self.image_destroy)
+        else {
+            return 0;
+        };
+        let Ok(name) = CString::new(name) else {
+            return 0;
+        };
+        let theme = theme.and_then(|theme| CString::new(theme).ok());
+        let image = unsafe {
+            load_image(
+                name.as_ptr(),
+                theme.as_ref().map_or(ptr::null(), |theme| theme.as_ptr()),
+                size.min(i32::MAX as u32) as c_int,
+            )
+        };
+        if image.is_null() {
+            return 0;
+        }
+        let cursor = unsafe { image_load_cursor(display, image) };
+        unsafe {
+            image_destroy(image);
+        }
+        cursor
     }
 
     fn load(&self, display: *mut Display, name: &str) -> c_ulong {
@@ -1196,6 +1465,185 @@ impl Drop for XcursorLoader {
             self.handle = ptr::null_mut();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct XiPressureAxis {
+    number: c_int,
+    min: f64,
+    max: f64,
+}
+
+/// Pressure axis lookup for an XInput2 touch device.
+fn xi_pressure_axis(display: *mut Display, deviceid: c_int) -> Option<XiPressureAxis> {
+    let mut count = 0;
+    let devices = unsafe { XIQueryDevice(display, deviceid, &mut count) };
+    if devices.is_null() {
+        return None;
+    }
+    let mut axis = None;
+    for index in 0..count.max(0) as usize {
+        let info = unsafe { &*devices.add(index) };
+        if info.deviceid != deviceid {
+            continue;
+        }
+        for class_index in 0..info.num_classes.max(0) as usize {
+            let class = unsafe { *info.classes.add(class_index) };
+            if class.is_null() {
+                continue;
+            }
+            let class = unsafe { &*class };
+            if class.type_ != XI_VALUATOR_CLASS {
+                continue;
+            }
+            let valuator =
+                unsafe { &*(class as *const XIAnyClassInfo as *const XIValuatorClassInfo) };
+            let name = unsafe { atom_name(display, valuator.label) }.unwrap_or_default();
+            if name.eq_ignore_ascii_case("Abs Pressure") || name.eq_ignore_ascii_case("Pressure") {
+                axis = Some(XiPressureAxis {
+                    number: valuator.number,
+                    min: valuator.min,
+                    max: valuator.max,
+                });
+                break;
+            }
+        }
+        if axis.is_some() {
+            break;
+        }
+    }
+    unsafe {
+        XIFreeDeviceInfo(devices);
+    }
+    axis
+}
+
+/// Whether any XInput2 device advertises a touch class.
+fn xi_has_touch_device(display: *mut Display) -> bool {
+    let mut count = 0;
+    let devices = unsafe { XIQueryDevice(display, XI_ALL_DEVICES, &mut count) };
+    if devices.is_null() {
+        return false;
+    }
+    let mut found = false;
+    for index in 0..count.max(0) as usize {
+        let info = unsafe { &*devices.add(index) };
+        for class_index in 0..info.num_classes.max(0) as usize {
+            let class = unsafe { *info.classes.add(class_index) };
+            if !class.is_null() && unsafe { (*class).type_ } == XI_TOUCH_CLASS {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            break;
+        }
+    }
+    unsafe {
+        XIFreeDeviceInfo(devices);
+    }
+    found
+}
+
+fn xi_touch_devices(display: *mut Display) -> Vec<c_int> {
+    let mut count = 0;
+    let devices = unsafe { XIQueryDevice(display, XI_ALL_DEVICES, &mut count) };
+    if devices.is_null() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for index in 0..count.max(0) as usize {
+        let info = unsafe { &*devices.add(index) };
+        let has_touch = (0..info.num_classes.max(0) as usize).any(|class_index| {
+            let class = unsafe { *info.classes.add(class_index) };
+            !class.is_null() && unsafe { (*class).type_ } == XI_TOUCH_CLASS
+        });
+        if has_touch && !found.contains(&info.deviceid) {
+            found.push(info.deviceid);
+        }
+    }
+    unsafe {
+        XIFreeDeviceInfo(devices);
+    }
+    found
+}
+
+fn xi_select_touch(display: *mut Display, window: Window) {
+    let mut mask = [0u8; 4];
+    let bits = XI_TOUCH_BEGIN_MASK | XI_TOUCH_UPDATE_MASK | XI_TOUCH_END_MASK;
+    mask[0] = bits as u8;
+    mask[1] = (bits >> 8) as u8;
+    mask[2] = (bits >> 16) as u8;
+    mask[3] = (bits >> 24) as u8;
+    for deviceid in [XI_ALL_MASTER_DEVICES, XI_ALL_DEVICES] {
+        let mut event_mask = XIEventMask {
+            deviceid,
+            mask_len: mask.len() as c_int,
+            mask: mask.as_mut_ptr(),
+        };
+        unsafe {
+            XISelectEvents(display, window, &mut event_mask, 1);
+        }
+    }
+}
+
+fn xi_value_for_axis(event: &XIDeviceEvent, axis: c_int) -> Option<f64> {
+    if axis < 0 || event.valuators.mask.is_null() || event.valuators.values.is_null() {
+        return None;
+    }
+    let bit = axis as usize;
+    if bit >= event.valuators.mask_len.max(0) as usize * 8 {
+        return None;
+    }
+    let mask = unsafe {
+        std::slice::from_raw_parts(event.valuators.mask, event.valuators.mask_len as usize)
+    };
+    let set = mask[bit / 8] & (1 << (bit % 8)) != 0;
+    if !set {
+        return None;
+    }
+    let value_index = (0..bit)
+        .filter(|index| mask[index / 8] & (1 << (index % 8)) != 0)
+        .count();
+    Some(unsafe { *event.valuators.values.add(value_index) })
+}
+
+/// Translate an XInput2 touch event into the neutral touch representation.
+fn xi_touch_event(
+    event: &XIDeviceEvent,
+    pressure_axis: Option<XiPressureAxis>,
+) -> Option<WindowEvent> {
+    let phase = match event.evtype {
+        XI_TOUCH_BEGIN => crate::types::TouchPhase::Began,
+        XI_TOUCH_UPDATE => crate::types::TouchPhase::Updated,
+        XI_TOUCH_END => crate::types::TouchPhase::Ended,
+        _ => return None,
+    };
+    let pressure = pressure_axis
+        .and_then(|axis| xi_value_for_axis(event, axis.number).map(|value| (value, axis)))
+        .map(|(value, axis)| {
+            if axis.max > axis.min {
+                (value - axis.min) / (axis.max - axis.min)
+            } else if value > 1.0 {
+                // Some devices omit the range and report raw 16-bit pressure.
+                value / 65535.0
+            } else {
+                value
+            }
+            .clamp(0.0, 1.0)
+        })
+        .unwrap_or(if matches!(phase, crate::types::TouchPhase::Ended) {
+            0.0
+        } else {
+            1.0
+        });
+    Some(WindowEvent::Touch {
+        id: event.detail.max(0) as u64,
+        x: event.event_x,
+        y: event.event_y,
+        pressure,
+        phase,
+    })
 }
 
 fn xcursor_name(shape: PointerShape) -> Option<&'static str> {
@@ -1398,6 +1846,12 @@ pub struct X11Window {
     incr_reads: Vec<IncrRead>,
     incr_writes: Vec<IncrWrite>,
     drag: DragState,
+    drag_source: DragSourceState,
+    drag_source_data: DragSourceData,
+    drag_source_target: Window,
+    xi_available: bool,
+    xi_opcode: c_int,
+    xi_pressure_axes: HashMap<c_int, XiPressureAxis>,
     ime: Option<ImeContext>,
     ime_enabled: bool,
     focused: bool,
@@ -1419,6 +1873,10 @@ pub struct X11Window {
     max_height: Option<u32>,
     cursor: c_ulong,
     cursor_shape: PointerShape,
+    cursor_theme: CursorTheme,
+    cursor_scale: f64,
+    cursor_theme_override: Option<String>,
+    cursor_size_override: Option<u32>,
     should_close: bool,
     mapped: bool,
     fullscreen: bool,
@@ -1511,6 +1969,12 @@ impl X11Window {
             incr_reads: Vec::new(),
             incr_writes: Vec::new(),
             drag: DragState::default(),
+            drag_source: DragSourceState::default(),
+            drag_source_data: DragSourceData::default(),
+            drag_source_target: NONE,
+            xi_available: false,
+            xi_opcode: 0,
+            xi_pressure_axes: HashMap::new(),
             ime: None,
             ime_enabled: true,
             focused: false,
@@ -1532,6 +1996,15 @@ impl X11Window {
             max_height,
             cursor: 0,
             cursor_shape: PointerShape::Default,
+            cursor_theme: crate::cursor::snapshot(
+                None,
+                None,
+                1.0,
+                xcursor_name(PointerShape::Default).unwrap_or("left_ptr"),
+            ),
+            cursor_scale: 1.0,
+            cursor_theme_override: None,
+            cursor_size_override: None,
             should_close: false,
             mapped: false,
             fullscreen: false,
@@ -1588,6 +2061,36 @@ impl X11Window {
                 | PROPERTY_CHANGE_MASK
                 | filter_events;
             XSelectInput(display, window, mask);
+
+            {
+                let mut opcode = 0;
+                let mut first_event = 0;
+                let mut first_error = 0;
+                if XQueryExtension(
+                    display,
+                    c"XInputExtension".as_ptr(),
+                    &mut opcode,
+                    &mut first_event,
+                    &mut first_error,
+                ) != 0
+                {
+                    let mut major = 2;
+                    let mut minor = 2;
+                    if XIQueryVersion(display, &mut major, &mut minor) == 0
+                        && minor >= 2
+                        && xi_has_touch_device(display)
+                    {
+                        xi_select_touch(display, window);
+                        for device in xi_touch_devices(display) {
+                            if let Some(axis) = xi_pressure_axis(display, device) {
+                                this.xi_pressure_axes.insert(device, axis);
+                            }
+                        }
+                        this.xi_available = true;
+                        this.xi_opcode = opcode;
+                    }
+                }
+            }
 
             if config.visible {
                 XMapWindow(display, window);
@@ -1844,10 +2347,40 @@ impl X11Window {
         self.ime.as_ref().is_some_and(|ime| ime.callbacks)
     }
 
+    /// Whether XInput2 touch events are available for this display.
+    pub fn has_touch_input(&self) -> bool {
+        self.xi_available
+    }
+
     pub fn set_pointer_shape(&mut self, shape: PointerShape) {
         if shape == self.cursor_shape && self.cursor != 0 {
             return;
         }
+        self.cursor_shape = shape;
+        self.install_cursor(shape);
+    }
+
+    fn cursor_snapshot(&self, shape: PointerShape) -> CursorTheme {
+        let name = xcursor_name(shape).unwrap_or("left_ptr");
+        let loader_theme = self
+            .cursor_loader
+            .as_ref()
+            .and_then(|loader| loader.display_theme(self.display));
+        let loader_size = self
+            .cursor_loader
+            .as_ref()
+            .and_then(|loader| loader.display_size(self.display));
+        crate::cursor::snapshot(
+            self.cursor_theme_override
+                .as_deref()
+                .or(loader_theme.as_deref()),
+            self.cursor_size_override.or(loader_size),
+            self.cursor_scale,
+            name,
+        )
+    }
+
+    fn install_cursor(&mut self, shape: PointerShape) {
         let xc = match shape {
             PointerShape::Default => 68,                          // XC_left_ptr
             PointerShape::Text => 152,                            // XC_xterm
@@ -1869,19 +2402,28 @@ impl X11Window {
             PointerShape::VerticalText => 116,                    // XC_sb_v_double_arrow
             PointerShape::ZoomIn | PointerShape::ZoomOut => 34,
         };
-        let mut cursor = xcursor_name(shape)
-            .and_then(|name| {
-                self.cursor_loader
-                    .as_ref()
-                    .map(|loader| loader.load(self.display, name))
-            })
+        let name = xcursor_name(shape).unwrap_or("left_ptr");
+        let theme = self.cursor_snapshot(shape);
+        let scaled = crate::cursor::scaled_size(theme.size, theme.scale());
+        let mut cursor = self
+            .cursor_loader
+            .as_ref()
+            .map(|loader| loader.load_sized(self.display, name, Some(&theme.name), scaled))
             .unwrap_or(0);
+        if cursor == 0 {
+            cursor = self
+                .cursor_loader
+                .as_ref()
+                .map(|loader| loader.load(self.display, name))
+                .unwrap_or(0);
+        }
         if cursor == 0 {
             cursor = unsafe { XCreateFontCursor(self.display, xc) };
         }
         if cursor == 0 {
             return;
         }
+        self.cursor_theme = theme;
         unsafe {
             XDefineCursor(self.display, self.window, cursor);
             if self.cursor != 0 {
@@ -1890,11 +2432,368 @@ impl X11Window {
             XFlush(self.display);
         }
         self.cursor = cursor;
-        self.cursor_shape = shape;
+    }
+
+    /// Reload the current cursor from the theme, discarding any cached image.
+    ///
+    /// Returns `true` when a cursor could be installed. This is also used by
+    /// [`X11Window::refresh_cursor_theme`] after a theme file changes.
+    pub fn reload_cursor_theme(&mut self) -> bool {
+        self.cursor_theme = self.cursor_snapshot(self.cursor_shape);
+        self.install_cursor(self.cursor_shape);
+        self.cursor != 0
+    }
+
+    /// Detect and apply a cursor-theme change since the previous check.
+    ///
+    /// Theme name, nominal size, per-window scale and the theme directory/file
+    /// modification times all participate in the signature, so editing a theme
+    /// in place reloads the cursor on the next event-pump iteration.
+    pub fn refresh_cursor_theme(&mut self) -> bool {
+        let theme = self.cursor_snapshot(self.cursor_shape);
+        if theme.signature() == self.cursor_theme.signature() {
+            return false;
+        }
+        self.cursor_theme = theme;
+        self.install_cursor(self.cursor_shape);
+        true
+    }
+
+    /// Set a per-window cursor scale. The scaled cursor is reloaded at once.
+    pub fn set_cursor_scale(&mut self, scale: f64) {
+        let scale = scale.clamp(0.5, 8.0);
+        if (scale - self.cursor_scale).abs() < f64::EPSILON {
+            return;
+        }
+        self.cursor_scale = scale;
+        self.reload_cursor_theme();
+    }
+
+    pub fn cursor_scale(&self) -> f64 {
+        self.cursor_scale
+    }
+
+    /// Override the theme name for this window. `None` restores the
+    /// environment / display default.
+    pub fn set_cursor_theme<'a>(&mut self, theme: impl Into<Option<&'a str>>) {
+        self.cursor_theme_override = theme.into().map(str::to_owned);
+        self.reload_cursor_theme();
+    }
+
+    /// Alias for callers that pass a theme name directly.
+    pub fn set_cursor_theme_name(&mut self, theme: &str) {
+        self.set_cursor_theme(theme);
+    }
+
+    pub fn cursor_theme_name(&self) -> &str {
+        &self.cursor_theme.name
+    }
+
+    /// Override the nominal (unscaled) cursor size for this window.
+    pub fn set_cursor_size(&mut self, size: impl Into<Option<u32>>) {
+        self.cursor_size_override = size.into().map(|size| size.max(1));
+        self.reload_cursor_theme();
+    }
+
+    pub fn cursor_size(&self) -> u32 {
+        self.cursor_theme.size
     }
 
     pub fn pointer_shape(&self) -> PointerShape {
         self.cursor_shape
+    }
+
+    /// Start an XDND drag source with text and/or file paths.
+    ///
+    /// The destination is resolved from the current pointer position. Use
+    /// [`X11Window::start_drag_to`] when the destination window is known.
+    pub fn start_drag(&mut self, data: impl Into<DragSourceData>) -> Result<(), WindowError> {
+        let data = data.into();
+        let (target, root_x, root_y) = self
+            .pointer_xdnd_target()
+            .ok_or_else(|| xerr("no XDND-aware window under the pointer"))?;
+        self.start_drag_to_at(&data, target, root_x, root_y)
+    }
+
+    /// Start a text drag source.
+    pub fn start_text_drag(&mut self, text: &str) -> Result<(), WindowError> {
+        self.start_drag(DragSourceData::from_text(text))
+    }
+
+    /// Start a file drag source.
+    pub fn start_file_drag(&mut self, paths: &[String]) -> Result<(), WindowError> {
+        self.start_drag(DragSourceData::from_paths(paths.iter().cloned()))
+    }
+
+    /// Start an XDND drag source at an explicit destination window and root
+    /// coordinates. This is primarily useful for tests and for callers that
+    /// track the drag target themselves.
+    pub fn start_drag_to_at(
+        &mut self,
+        data: impl Into<DragSourceData>,
+        target: Window,
+        root_x: c_int,
+        root_y: c_int,
+    ) -> Result<(), WindowError> {
+        let data = data.into();
+        if data.is_empty() {
+            return Err(xerr("drag source has no text or file payload"));
+        }
+        if self.drag_source.is_active() {
+            return Err(xerr("a drag source is already active"));
+        }
+        if target == NONE || target == self.window {
+            return Err(xerr("invalid XDND destination window"));
+        }
+        let targets = data.targets();
+        if targets.is_empty() {
+            return Err(xerr("drag source has no offered targets"));
+        }
+        let mut atoms = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let target = CString::new(target.as_str())
+                .map_err(|_| xerr("drag target contains a NUL byte"))?;
+            atoms.push(unsafe { XInternAtom(self.display, target.as_ptr(), 0) });
+        }
+        unsafe {
+            XSetSelectionOwner(
+                self.display,
+                self.atoms.xdnd_selection,
+                self.window,
+                CURRENT_TIME,
+            );
+            XChangeProperty(
+                self.display,
+                self.window,
+                self.atoms.xdnd_type_list,
+                XA_ATOM,
+                32,
+                PROP_MODE_REPLACE,
+                atoms.as_ptr().cast(),
+                atoms.len().min(c_int::MAX as usize) as c_int,
+            );
+        }
+        self.drag_source_data = data;
+        self.drag_source_target = target;
+        self.drag_source.begin(targets.clone(), CURRENT_TIME as u32);
+        self.send_drag_enter(target, &atoms);
+        self.send_drag_position(target, root_x, root_y);
+        self.inbox.push_back(WindowEvent::DragStarted { targets });
+        Ok(())
+    }
+
+    /// Convenience wrapper around [`X11Window::start_drag_to_at`] using the
+    /// pointer position as the initial destination coordinates.
+    pub fn start_drag_to(
+        &mut self,
+        data: impl Into<DragSourceData>,
+        target: Window,
+    ) -> Result<(), WindowError> {
+        let (root_x, root_y) = self.pointer_root_position().unwrap_or((0, 0));
+        self.start_drag_to_at(data, target, root_x, root_y)
+    }
+
+    fn pointer_root_position(&self) -> Option<(c_int, c_int)> {
+        let mut root_return = NONE;
+        let mut child = NONE;
+        let mut root_x = 0;
+        let mut root_y = 0;
+        let mut win_x = 0;
+        let mut win_y = 0;
+        let mut mask = 0;
+        let ok = unsafe {
+            XQueryPointer(
+                self.display,
+                self.root,
+                &mut root_return,
+                &mut child,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask,
+            )
+        };
+        (ok != 0).then_some((root_x, root_y))
+    }
+
+    fn pointer_xdnd_target(&self) -> Option<(Window, c_int, c_int)> {
+        let (root_x, root_y) = self.pointer_root_position()?;
+        let mut root_return = NONE;
+        let mut child = NONE;
+        let mut win_x = 0;
+        let mut win_y = 0;
+        let mut mask = 0;
+        let ok = unsafe {
+            XQueryPointer(
+                self.display,
+                self.root,
+                &mut root_return,
+                &mut child,
+                &mut win_x,
+                &mut win_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let mut candidate = child;
+        while candidate != NONE {
+            if unsafe { get_property(self.display, candidate, self.atoms.xdnd_aware) }.is_some() {
+                return Some((candidate, root_x, root_y));
+            }
+            let mut next = NONE;
+            let mut next_root_x = 0;
+            let mut next_root_y = 0;
+            let mut next_win_x = 0;
+            let mut next_win_y = 0;
+            let ok = unsafe {
+                XQueryPointer(
+                    self.display,
+                    candidate,
+                    &mut root_return,
+                    &mut next,
+                    &mut next_root_x,
+                    &mut next_root_y,
+                    &mut next_win_x,
+                    &mut next_win_y,
+                    &mut mask,
+                )
+            };
+            if ok == 0 || next == candidate {
+                break;
+            }
+            candidate = next;
+        }
+        None
+    }
+
+    fn send_drag_enter(&self, target: Window, atoms: &[Atom]) {
+        let mut event: XEvent = unsafe { std::mem::zeroed() };
+        event.xclient = XClientMessageEvent {
+            type_: CLIENT_MESSAGE,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            window: target,
+            message_type: self.atoms.xdnd_enter,
+            format: 32,
+            data: [
+                self.window as c_long,
+                (5i64 << 24) | i64::from(atoms.len() > 3),
+                atoms.first().copied().unwrap_or(NONE) as c_long,
+                atoms.get(1).copied().unwrap_or(NONE) as c_long,
+                atoms.get(2).copied().unwrap_or(NONE) as c_long,
+            ],
+        };
+        unsafe {
+            XSendEvent(self.display, target, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+    }
+
+    fn send_drag_position(&self, target: Window, root_x: c_int, root_y: c_int) {
+        let packed = ((root_y & 0xffff) << 16) | (root_x & 0xffff);
+        let mut event: XEvent = unsafe { std::mem::zeroed() };
+        event.xclient = XClientMessageEvent {
+            type_: CLIENT_MESSAGE,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            window: target,
+            message_type: self.atoms.xdnd_position,
+            format: 32,
+            data: [
+                self.window as c_long,
+                0,
+                packed as c_long,
+                CURRENT_TIME as c_long,
+                self.atoms.xdnd_action_copy as c_long,
+            ],
+        };
+        unsafe {
+            XSendEvent(self.display, target, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+    }
+
+    /// Drop the active drag source. The destination will request the selection
+    /// data and later send `XdndFinished`.
+    pub fn drag_drop(&mut self) -> Result<(), WindowError> {
+        if !self.drag_source.is_active() {
+            return Err(xerr("no active drag source"));
+        }
+        if !self.drag_source.mark_dropped() {
+            return Err(xerr("the drag source has already been dropped"));
+        }
+        let target = self.drag_source_target;
+        let mut event: XEvent = unsafe { std::mem::zeroed() };
+        event.xclient = XClientMessageEvent {
+            type_: CLIENT_MESSAGE,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            window: target,
+            message_type: self.atoms.xdnd_drop,
+            format: 32,
+            data: [self.window as c_long, 0, CURRENT_TIME as c_long, 0, 0],
+        };
+        unsafe {
+            XSendEvent(self.display, target, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+        Ok(())
+    }
+
+    /// Finish the active drag source locally. This is useful when the
+    /// destination does not implement `XdndFinished` (protocol version < 5).
+    pub fn finish_drag(&mut self, accepted: bool) -> bool {
+        let was_active = self.drag_source.finish(accepted);
+        if was_active {
+            self.drag_source_target = NONE;
+            self.inbox.push_back(WindowEvent::DragFinished { accepted });
+        }
+        was_active
+    }
+
+    /// Cancel the active drag source and notify the destination.
+    pub fn cancel_drag(&mut self) -> bool {
+        if !self.drag_source.is_active() {
+            return false;
+        }
+        let target = self.drag_source_target;
+        let mut event: XEvent = unsafe { std::mem::zeroed() };
+        event.xclient = XClientMessageEvent {
+            type_: CLIENT_MESSAGE,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            window: target,
+            message_type: self.atoms.xdnd_leave,
+            format: 32,
+            data: [self.window as c_long, 0, 0, 0, 0],
+        };
+        unsafe {
+            XSendEvent(self.display, target, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+        let cancelled = self.drag_source.cancel();
+        if cancelled {
+            self.drag_source_target = NONE;
+            self.inbox.push_back(WindowEvent::DragCancelled);
+        }
+        cancelled
+    }
+
+    pub fn is_drag_source_active(&self) -> bool {
+        self.drag_source.is_active()
+    }
+
+    pub fn drag_source_targets(&self) -> &[String] {
+        self.drag_source.targets()
     }
 
     /// Accept the current drag, optionally forcing a MIME target.
@@ -2083,6 +2982,7 @@ impl X11Window {
     }
 
     fn pump(&mut self, timeout_ms: i32) {
+        self.refresh_cursor_theme();
         let start = Instant::now();
         let x_fd = unsafe { XConnectionNumber(self.display) };
         let mut woken = false;
@@ -2309,7 +3209,12 @@ impl X11Window {
             }
             SELECTION_CLEAR => {
                 let clear = unsafe { event.xselectionclear };
-                if let Some(selection) = self.selection_for_atom(clear.selection) {
+                if clear.selection == self.atoms.xdnd_selection {
+                    if self.drag_source.cancel() {
+                        self.drag_source_target = NONE;
+                        out.push(WindowEvent::DragCancelled);
+                    }
+                } else if let Some(selection) = self.selection_for_atom(clear.selection) {
                     self.clipboard.clear(selection);
                     out.push(WindowEvent::SelectionClear { selection });
                 }
@@ -2326,6 +3231,23 @@ impl X11Window {
                     self.handle_drag_selection_notify(&notify, out);
                 } else if let Some(event) = self.handle_selection_notify(&notify) {
                     out.push(event);
+                }
+            }
+            GENERIC_EVENT => {
+                let mut cookie = unsafe { event.xgeneric };
+                if unsafe { XGetEventData(self.display, &mut cookie) } != 0 {
+                    if cookie.extension == self.xi_opcode && !cookie.data.is_null() {
+                        let xi_event = unsafe { &*(cookie.data as *const XIDeviceEvent) };
+                        if let Some(touch) = xi_touch_event(
+                            xi_event,
+                            self.xi_pressure_axes.get(&xi_event.deviceid).copied(),
+                        ) {
+                            out.push(touch);
+                        }
+                    }
+                    unsafe {
+                        XFreeEventData(self.display, &mut cookie);
+                    }
                 }
             }
             _ => {}
@@ -2666,6 +3588,9 @@ impl X11Window {
         &mut self,
         request: &XSelectionRequestEvent,
     ) -> Option<WindowEvent> {
+        if request.selection == self.atoms.xdnd_selection {
+            return self.handle_drag_source_selection_request(request);
+        }
         let selection = self.selection_for_atom(request.selection)?;
         let target = unsafe { atom_name(self.display, request.target) }.unwrap_or_default();
         let property = if request.property == NONE {
@@ -2763,6 +3688,109 @@ impl X11Window {
             XFlush(self.display);
         }
         Some(WindowEvent::SelectionRequest { selection, target })
+    }
+
+    fn handle_drag_source_selection_request(
+        &mut self,
+        request: &XSelectionRequestEvent,
+    ) -> Option<WindowEvent> {
+        if !self.drag_source.is_active() && !self.drag_source.has_dropped() {
+            return None;
+        }
+        let target = unsafe { atom_name(self.display, request.target) }.unwrap_or_default();
+        let property = if request.property == NONE {
+            request.target
+        } else {
+            request.property
+        };
+        let mut success = false;
+        if request.target == self.atoms.targets {
+            let mut names = vec!["TARGETS".to_owned()];
+            names.extend(self.drag_source_data.targets());
+            let atoms: Vec<Atom> = names
+                .iter()
+                .map(|name| {
+                    let cname = CString::new(name.as_str()).expect("target name has no NUL");
+                    unsafe { XInternAtom(self.display, cname.as_ptr(), 0) }
+                })
+                .collect();
+            unsafe {
+                XChangeProperty(
+                    self.display,
+                    request.requestor,
+                    property,
+                    XA_ATOM,
+                    32,
+                    PROP_MODE_REPLACE,
+                    atoms.as_ptr().cast(),
+                    atoms.len() as c_int,
+                );
+            }
+            success = true;
+        } else if let Some(data) = self.drag_source_data.target_data(&target) {
+            let type_atom = if target == "UTF8_STRING" {
+                self.atoms.utf8_string
+            } else if target == "STRING" {
+                XA_STRING
+            } else {
+                request.target
+            };
+            if data.len() > INCR_THRESHOLD {
+                let expected = data.len() as c_long;
+                unsafe {
+                    XSelectInput(self.display, request.requestor, PROPERTY_CHANGE_MASK);
+                    XChangeProperty(
+                        self.display,
+                        request.requestor,
+                        property,
+                        self.atoms.incr,
+                        32,
+                        PROP_MODE_REPLACE,
+                        (&expected as *const c_long).cast(),
+                        1,
+                    );
+                }
+                self.incr_writes.push(IncrWrite {
+                    requestor: request.requestor,
+                    property,
+                    type_atom,
+                    state: IncrWriteState::new(data),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                });
+            } else {
+                unsafe {
+                    XChangeProperty(
+                        self.display,
+                        request.requestor,
+                        property,
+                        type_atom,
+                        8,
+                        PROP_MODE_REPLACE,
+                        data.as_ptr(),
+                        data.len().min(c_int::MAX as usize) as c_int,
+                    );
+                }
+            }
+            self.drag_source.set_chosen_target(Some(&target));
+            success = true;
+        }
+        let mut notify: XEvent = unsafe { std::mem::zeroed() };
+        notify.xselection = XSelectionEvent {
+            type_: SELECTION_NOTIFY,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            requestor: request.requestor,
+            selection: request.selection,
+            target: request.target,
+            property: if success { property } else { NONE },
+            time: request.time,
+        };
+        unsafe {
+            XSendEvent(self.display, request.requestor, 0, 0, &mut notify);
+            XFlush(self.display);
+        }
+        None
     }
 
     fn handle_selection_notify(&mut self, notify: &XSelectionEvent) -> Option<WindowEvent> {
@@ -2897,12 +3925,42 @@ impl X11Window {
         } else if message == self.atoms.xdnd_drop {
             self.handle_drag_drop(client, out);
         } else if message == self.atoms.xdnd_leave {
-            if self.drag.session.leave() {
-                out.push(WindowEvent::DragLeave);
+            if self.drag_source.is_active() {
+                self.handle_drag_source_message(client, out);
+            } else {
+                if self.drag.session.leave() {
+                    out.push(WindowEvent::DragLeave);
+                }
+                self.drag.source = NONE;
+                self.drag.pending_drop = None;
+                self.drag.deadline = None;
             }
-            self.drag.source = NONE;
-            self.drag.pending_drop = None;
-            self.drag.deadline = None;
+        } else if message == self.atoms.xdnd_status || message == self.atoms.xdnd_finished {
+            self.handle_drag_source_message(client, out);
+        }
+    }
+
+    fn handle_drag_source_message(
+        &mut self,
+        client: &XClientMessageEvent,
+        out: &mut Vec<WindowEvent>,
+    ) {
+        if client.data[0] as Window != self.drag_source_target || !self.drag_source.is_active() {
+            return;
+        }
+        let message = client.message_type;
+        if message == self.atoms.xdnd_status {
+            let accepted = client.data[1] & 1 != 0;
+            self.drag_source.set_accepted(accepted);
+        } else if message == self.atoms.xdnd_finished {
+            let accepted = client.data[1] & 1 != 0;
+            if self.drag_source.finish(accepted) {
+                self.drag_source_target = NONE;
+                out.push(WindowEvent::DragFinished { accepted });
+            }
+        } else if message == self.atoms.xdnd_leave && self.drag_source.cancel() {
+            self.drag_source_target = NONE;
+            out.push(WindowEvent::DragCancelled);
         }
     }
 
@@ -3355,6 +4413,13 @@ impl X11Window {
             }
             WindowEvent::Wakeup => {
                 self.wakeup();
+                Ok(())
+            }
+            WindowEvent::Touch { .. }
+            | WindowEvent::DragStarted { .. }
+            | WindowEvent::DragFinished { .. }
+            | WindowEvent::DragCancelled => {
+                self.inbox.push_back(event.clone());
                 Ok(())
             }
             _ => Err(xerr("event type cannot be injected")),
@@ -3858,6 +4923,95 @@ mod tests {
             xcursor_name(PointerShape::ContextMenu),
             Some("context-menu")
         );
+    }
+
+    #[test]
+    fn xi_touch_events_map_phase_position_and_pressure() {
+        let mut mask = [1u8 << 2];
+        let mut values = [0.75f64];
+        let mut event: XIDeviceEvent = unsafe { std::mem::zeroed() };
+        event.type_ = GENERIC_EVENT;
+        event.evtype = XI_TOUCH_BEGIN;
+        event.detail = 4;
+        event.event_x = 12.5;
+        event.event_y = 34.5;
+        event.valuators = XIValuatorState {
+            mask_len: 1,
+            mask: mask.as_mut_ptr(),
+            values: values.as_mut_ptr(),
+        };
+        assert_eq!(xi_value_for_axis(&event, 2), Some(0.75));
+        assert_eq!(xi_value_for_axis(&event, 3), None);
+        assert_eq!(
+            xi_touch_event(
+                &event,
+                Some(XiPressureAxis {
+                    number: 2,
+                    min: 0.0,
+                    max: 1.0
+                })
+            ),
+            Some(WindowEvent::Touch {
+                id: 4,
+                x: 12.5,
+                y: 34.5,
+                pressure: 0.75,
+                phase: crate::types::TouchPhase::Began,
+            })
+        );
+
+        event.evtype = XI_TOUCH_UPDATE;
+        event.detail = 4;
+        assert!(matches!(
+            xi_touch_event(
+                &event,
+                Some(XiPressureAxis {
+                    number: 2,
+                    min: 0.0,
+                    max: 1.0
+                })
+            ),
+            Some(WindowEvent::Touch {
+                phase: crate::types::TouchPhase::Updated,
+                ..
+            })
+        ));
+
+        event.evtype = XI_TOUCH_END;
+        match xi_touch_event(&event, None) {
+            Some(WindowEvent::Touch {
+                pressure, phase, ..
+            }) => {
+                assert_eq!(pressure, 0.0);
+                assert_eq!(phase, crate::types::TouchPhase::Ended);
+            }
+            other => panic!("unexpected touch mapping: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xi_touch_pressure_accepts_16_bit_ranges() {
+        let mut mask = [1u8 << 2];
+        let mut values = [32768.0f64];
+        let mut event: XIDeviceEvent = unsafe { std::mem::zeroed() };
+        event.evtype = XI_TOUCH_BEGIN;
+        event.detail = 1;
+        event.valuators = XIValuatorState {
+            mask_len: 1,
+            mask: mask.as_mut_ptr(),
+            values: values.as_mut_ptr(),
+        };
+        let Some(WindowEvent::Touch { pressure, .. }) = xi_touch_event(
+            &event,
+            Some(XiPressureAxis {
+                number: 2,
+                min: 0.0,
+                max: 65535.0,
+            }),
+        ) else {
+            panic!("expected a touch event");
+        };
+        assert!((pressure - 0.5).abs() < 0.001);
     }
 
     #[test]

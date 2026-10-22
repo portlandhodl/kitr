@@ -9,10 +9,12 @@ and normalises both images to PPM, then a small pure-Python comparator reports
 exact (any channel difference), tolerant (per-channel delta) and aligned
 metrics and writes diff images.
 
-kitr always reserves a tab-bar strip at the top of its framebuffer, while C
-kitty hides it for single-tab windows.  The comparator therefore searches for
-the small integer (dx, dy) offset with the lowest mean error and reports both
-raw and aligned numbers.  The raw numbers include the tab-bar/letterbox gap;
+kitr reserves a tab-bar strip only when kitty's visibility rules show one
+(hidden style and the single-tab autohide case reserve zero pixels).  The
+comparator still searches for the small integer (dx, dy) offset with the lowest
+mean error and reports both raw and aligned numbers, because C kitty's
+screenshot includes a 1px right/bottom border and some startup paths can leave
+the two terminals one row apart.  The raw numbers include any such chrome gap;
 the aligned numbers are the useful behavioural signal.  Font rasterisation is
 never bit-identical between two FreeType pipelines, so the tolerant metrics are
 the pass/fail criterion.
@@ -333,7 +335,7 @@ def run_kitty(
     cmd = [kitty, "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only", *opts]
     if case.mode == "session":
         assert case.session is not None
-        cmd += ["--session", str(case.session)]
+        cmd += ["--session", str(case.session.resolve())]
     else:
         cmd += ["--hold", "--", "/bin/sh", "-c", case.script or DEFAULT_SCRIPT]
     with log.open("ab") as f:
@@ -407,7 +409,7 @@ def run_kitr(
     ]
     if case.mode == "session":
         assert case.session is not None
-        cmd += ["--session", str(case.session)]
+        cmd += ["--session", str(case.session.resolve())]
     else:
         cmd += ["--", "/bin/sh", "-c", case.script or DEFAULT_SCRIPT]
     with log.open("ab") as f:
@@ -746,7 +748,7 @@ def write_markdown(
         "`exact` counts any non-zero channel difference. `tolerant` ignores "
         "per-channel differences up to the pixel threshold. `aligned` uses the "
         "best integer offset (shown as `(dx,dy)`); `raw` compares at `(0,0)` and "
-        "therefore includes kitr's reserved tab-bar strip. Pass/fail uses "
+        "therefore includes tab-bar/border chrome differences. Pass/fail uses "
         "aligned tolerant percentage.",
         "",
         "## Results",

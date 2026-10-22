@@ -369,8 +369,38 @@ pub enum WindowEvent {
     },
     /// A drag left the window without being dropped.
     DragLeave,
+    /// A local drag source started. `targets` lists the offered MIME types.
+    DragStarted {
+        targets: Vec<String>,
+    },
+    /// A local drag source finished. `accepted` is true when the destination
+    /// consumed the data.
+    DragFinished {
+        accepted: bool,
+    },
+    /// A local drag source was cancelled by the compositor or the caller.
+    DragCancelled,
+    /// A touch point changed state. `id` is stable for the duration of the
+    /// gesture, coordinates are in window pixels and `pressure` is normalised
+    /// to the `0.0..=1.0` range.
+    Touch {
+        id: u64,
+        x: f64,
+        y: f64,
+        pressure: f64,
+        phase: TouchPhase,
+    },
     /// The event pump was woken through its wakeup pipe.
     Wakeup,
+}
+
+/// Phase of a [`WindowEvent::Touch`] gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Began,
+    Updated,
+    Ended,
+    Cancelled,
 }
 
 /// Common pointer shapes. Mapped to the X11 cursor font by the X11 backend.

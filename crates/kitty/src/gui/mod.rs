@@ -25,7 +25,9 @@ use fonts::{FontRasterizer, FontSet};
 use input::{key_event, mouse_button, mouse_modifiers, send_mouse};
 use pane::{Pane, SpawnSpec};
 
-use kitty_config::{Config, CursorShape as ConfigCursorShape};
+use kitty_config::{
+    Config, CursorShape as ConfigCursorShape, TabBarStyle, TabFontStyle, TabPowerlineStyle,
+};
 use kitty_fonts::RasterCache;
 use kitty_input::mouse::MouseAction;
 use kitty_input::{InputContext, KeyAction, KeyEvent, KeyMap, MappingResult, Modifiers};
@@ -35,8 +37,9 @@ use kitty_remote::{
     SendTextData, ServerConfig, TextExtent, Value as RemoteValue,
 };
 use kitty_render::{
-    AtlasConfig, CellMetrics, ColorResolver, GlBackend, GlBackendConfig, GlFns, LineRange,
-    RenderConfig, RendererCore, Rgba8,
+    pane_border_rects, AtlasConfig, CellMetrics, ColorResolver, DecorationInstance, DecorationKind,
+    Frame, GlBackend, GlBackendConfig, GlFns, InstanceFlags, LineRange, PaneBorderPane,
+    RenderConfig, RendererCore, Rgba8, SolidRect,
 };
 use kitty_screen::{CursorShape, Modes, Screen};
 use kitty_ui::{
@@ -103,6 +106,205 @@ fn force_full_rows(frame: &mut kitty_render::Frame, lines: u32) {
         .lines
         .push(LineRange::new(0, lines.max(1) as usize));
     frame.damage.cursor_moved = true;
+}
+
+fn rgba_of(color: kitty_config::Color) -> Rgba8 {
+    Rgba8::rgb(color.red, color.green, color.blue)
+}
+
+fn blend_srgb(top: Rgba8, bottom: Rgba8, alpha: f64) -> Rgba8 {
+    let a = alpha.clamp(0.0, 1.0);
+    let mix = |t: u8, b: u8| (a * t as f64 + (1.0 - a) * b as f64).round() as u8;
+    Rgba8::rgb(
+        mix(top.r, bottom.r),
+        mix(top.g, bottom.g),
+        mix(top.b, bottom.b),
+    )
+}
+
+fn tab_set_style(screen: &mut Screen, fg: Rgba8, bg: Rgba8, font: TabFontStyle) {
+    screen.cursor.sgr.bg = pack_sgr(bg);
+    screen.cursor.sgr.fg = pack_sgr(fg);
+    screen.cursor.sgr.bold = font.bold;
+    screen.cursor.sgr.italic = font.italic;
+}
+
+fn tab_draw_chars(screen: &mut Screen, chars: &[char], fg: Rgba8, bg: Rgba8, font: TabFontStyle) {
+    for ch in chars {
+        if screen.cursor.x >= screen.columns {
+            break;
+        }
+        tab_set_style(screen, fg, bg, font);
+        screen.draw_text(&[*ch as u32]);
+    }
+}
+
+fn tab_title_chars(title: &str, max_cells: usize) -> Vec<char> {
+    let title = title.replace('\n', " ");
+    let chars: Vec<char> = title.chars().collect();
+    if chars.len() <= max_cells || max_cells == 0 {
+        return chars.into_iter().take(max_cells).collect();
+    }
+    let mut ans: Vec<char> = chars.into_iter().take(max_cells - 1).collect();
+    ans.push('…');
+    ans
+}
+
+fn bar_fg_for_tabs(opts: &kitty_config::Options) -> Rgba8 {
+    rgba_of(opts.inactive_tab_foreground)
+}
+
+fn tab_ideal_width(style: TabBarStyle, title: &str, opts: &kitty_config::Options) -> usize {
+    let title_len = title.chars().count();
+    match style {
+        TabBarStyle::Hidden => 0,
+        TabBarStyle::Powerline => title_len + 4,
+        TabBarStyle::Separator => {
+            let sep_len = opts.tab_separator.chars().count();
+            title_len + sep_len
+        }
+        TabBarStyle::Slant => title_len + 4,
+        TabBarStyle::Fade | TabBarStyle::Custom => title_len + opts.tab_fade.len() + 1,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_powerline(
+    screen: &mut Screen,
+    title: &str,
+    x: u32,
+    max_len: u32,
+    active: bool,
+    next_active: bool,
+    tab_bg: impl Fn(bool) -> Rgba8,
+    tab_fg: impl Fn(bool) -> Rgba8,
+    bar_bg: Rgba8,
+    bar_fg: Rgba8,
+    style: TabPowerlineStyle,
+    active_font: &TabFontStyle,
+    inactive_font: &TabFontStyle,
+) {
+    let (sep, _soft) = match style {
+        TabPowerlineStyle::Angled => ('\u{e0b0}', '\u{e0b1}'),
+        TabPowerlineStyle::Round => ('\u{e0b4}', '\u{e0b5}'),
+        TabPowerlineStyle::Slanted => ('\u{e0bc}', '\u{2571}'),
+    };
+    let font = if active { *active_font } else { *inactive_font };
+    let bg = tab_bg(active);
+    let fg = tab_fg(active);
+    let next_bg = if next_active {
+        tab_bg(true)
+    } else if x == 0 {
+        bar_bg
+    } else {
+        tab_bg(false)
+    };
+    let next_fg = if next_active { tab_fg(true) } else { bar_fg };
+    // A leading space is only drawn at the very start of the bar; later tabs
+    // butt directly against the previous separator (kitty's start_draw logic).
+    let overhead = if x == 0 { 4 } else { 3 };
+    if x == 0 {
+        tab_draw_chars(screen, &[' '], fg, bg, font);
+    }
+    let title_chars = tab_title_chars(title, max_len.saturating_sub(overhead) as usize);
+    tab_draw_chars(screen, &title_chars, fg, bg, font);
+    tab_draw_chars(screen, &[' '], fg, bg, font);
+    tab_draw_chars(screen, &[sep], bg, next_bg, font);
+    tab_draw_chars(screen, &[' '], next_fg, next_bg, font);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_separator(
+    screen: &mut Screen,
+    title: &str,
+    _x: u32,
+    max_len: u32,
+    is_last: bool,
+    active: bool,
+    tab_bg: impl Fn(bool) -> Rgba8,
+    tab_fg: impl Fn(bool) -> Rgba8,
+    inactive_bg: Rgba8,
+    bar_fg: Rgba8,
+    separator: &str,
+    active_font: &TabFontStyle,
+    inactive_font: &TabFontStyle,
+) {
+    let font = if active { *active_font } else { *inactive_font };
+    let bg = tab_bg(active);
+    let fg = tab_fg(active);
+    let sep_len = separator.chars().count();
+    let title_chars = tab_title_chars(title, max_len.saturating_sub(sep_len as u32) as usize);
+    tab_draw_chars(screen, &title_chars, fg, bg, font);
+    let sep_chars: Vec<char> = separator.chars().collect();
+    if is_last {
+        let spaces: Vec<char> = std::iter::repeat_n(' ', sep_len).collect();
+        tab_draw_chars(screen, &spaces, fg, bg, font);
+    } else {
+        // kitty's default separator has a leading space drawn with the tab
+        // background, followed by the glyph on the inactive background.
+        if let Some((&first, rest)) = sep_chars.split_first() {
+            if first == ' ' {
+                tab_draw_chars(screen, &[' '], fg, bg, font);
+                tab_draw_chars(screen, rest, bar_fg, inactive_bg, font);
+            } else {
+                tab_draw_chars(screen, &sep_chars, bar_fg, inactive_bg, font);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_slant(
+    screen: &mut Screen,
+    title: &str,
+    _x: u32,
+    max_len: u32,
+    active: bool,
+    tab_bg: impl Fn(bool) -> Rgba8,
+    tab_fg: impl Fn(bool) -> Rgba8,
+    bar_bg: Rgba8,
+    active_font: &TabFontStyle,
+    inactive_font: &TabFontStyle,
+) {
+    let font = if active { *active_font } else { *inactive_font };
+    let bg = tab_bg(active);
+    let fg = tab_fg(active);
+    let title_chars = tab_title_chars(title, max_len.saturating_sub(4) as usize);
+    tab_draw_chars(screen, &['\u{e0bc}'], bar_bg, bg, font);
+    tab_draw_chars(screen, &[' '], fg, bg, font);
+    tab_draw_chars(screen, &title_chars, fg, bg, font);
+    tab_draw_chars(screen, &[' '], fg, bg, font);
+    tab_draw_chars(screen, &['\u{e0be}'], bar_bg, bg, font);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_fade(
+    screen: &mut Screen,
+    title: &str,
+    _x: u32,
+    max_len: u32,
+    active: bool,
+    tab_bg: impl Fn(bool) -> Rgba8,
+    tab_fg: impl Fn(bool) -> Rgba8,
+    bar_bg: Rgba8,
+    active_font: &TabFontStyle,
+    inactive_font: &TabFontStyle,
+) {
+    let font = if active { *active_font } else { *inactive_font };
+    let bg = tab_bg(active);
+    let fg = tab_fg(active);
+    let fade = [0.25, 0.5, 0.75, 1.0];
+    for alpha in fade {
+        let color = blend_srgb(bg, bar_bg, alpha);
+        tab_draw_chars(screen, &[' '], color, color, font);
+    }
+    let title_chars = tab_title_chars(title, max_len.saturating_sub(9) as usize);
+    tab_draw_chars(screen, &title_chars, fg, bg, font);
+    for alpha in fade.into_iter().rev() {
+        let color = blend_srgb(bg, bar_bg, alpha);
+        tab_draw_chars(screen, &[' '], color, color, font);
+    }
+    tab_draw_chars(screen, &[' '], fg, bar_bg, font);
 }
 
 fn draw_frame(
@@ -184,6 +386,13 @@ impl GuiSession {
         for bad in &config.bad_lines {
             eprintln!("kitr: config: {bad}");
         }
+        let plan = load_session_plan(options, &cfg)?;
+        let initial_tab_count = plan
+            .as_ref()
+            .and_then(|plan| plan.os_windows.first())
+            .map(|os_window| os_window.tabs.len())
+            .unwrap_or(1)
+            .max(1);
 
         let title = options.title.clone().unwrap_or_else(|| "kitr".to_string());
         let requested = options.size.unwrap_or((80, 24));
@@ -213,8 +422,13 @@ impl GuiSession {
             (cfg.window_padding_width.bottom * scale).round() as f32,
         );
         let (columns, rows) = requested;
+        let tab_bar_px = cfg.tab_bar_height(initial_tab_count, cell_h as f32);
+        // kitty treats `initial_window_height` as the total window height:
+        // a visible tab bar takes one row out of the central grid rather than
+        // growing the window.
+        let content_rows = rows.saturating_sub(u16::from(tab_bar_px > 0.0)).max(1);
         let pixel_width = columns as u32 * cell_w + (padding.0 + padding.2).max(0.0) as u32;
-        let pixel_height = (rows as u32 + 1) * cell_h + (padding.1 + padding.3).max(0.0) as u32;
+        let pixel_height = rows as u32 * cell_h + (padding.1 + padding.3).max(0.0) as u32;
         window.set_size(pixel_width.max(1), pixel_height.max(1));
         window.set_size_limits(cell_w, cell_h, None, None);
 
@@ -280,8 +494,8 @@ impl GuiSession {
             metrics,
             pixel_size: (surface_width, surface_height),
             columns: columns as u32,
-            rows: rows as u32,
-            tab_bar_px: cell_h as f32,
+            rows: content_rows as u32,
+            tab_bar_px,
             tab_ranges: Vec::new(),
             keymap,
             scrollback,
@@ -301,7 +515,6 @@ impl GuiSession {
             fallback_screen: fallback,
         };
 
-        let plan = load_session_plan(options, &cfg)?;
         session.initialize(options, input, plan)?;
         session.relayout_all();
         session.update_window_title();
@@ -642,6 +855,7 @@ impl GuiSession {
         }
         let spec = self.new_tab_spec();
         self.add_pane_at(idx, spec, LayoutAddOptions::default())?;
+        self.update_tab_bar_chrome();
         self.need_redraw = true;
         self.update_window_title();
         Ok(())
@@ -662,6 +876,7 @@ impl GuiSession {
         } else {
             self.should_close = true;
         }
+        self.update_tab_bar_chrome();
         self.need_redraw = true;
         self.update_window_title();
         true
@@ -776,6 +991,16 @@ impl GuiSession {
         self.pixel_size
     }
 
+    /// Height of the tab-bar strip in device pixels (zero when hidden).
+    pub fn tab_bar_height(&self) -> f32 {
+        self.tab_bar_px
+    }
+
+    /// Whether the tab bar is currently visible.
+    pub fn tab_bar_visible(&self) -> bool {
+        self.tab_bar_px > 0.0
+    }
+
     pub fn tab_count(&self) -> usize {
         self.tab_manager.tabs().len()
     }
@@ -842,6 +1067,7 @@ impl GuiSession {
             title: None,
         };
         self.add_pane_at(idx, spec, LayoutAddOptions::default())?;
+        self.update_tab_bar_chrome();
         self.need_redraw = true;
         self.update_window_title();
         Ok(())
@@ -1146,6 +1372,36 @@ impl GuiSession {
         Ok(())
     }
 
+    /// Current tab-bar strip height in device pixels. Zero when the style is
+    /// hidden or when fewer than `tab_bar_min_tabs` tabs exist.
+    fn tab_bar_height_px(&self) -> f32 {
+        self.config_options.tab_bar_height(
+            self.tab_manager.tabs().len(),
+            self.metrics.cell_height.max(1.0),
+        )
+    }
+
+    /// React to tab-bar visibility changes (new tab, closed tab) the same way
+    /// kitty does: the window size is unchanged and the central grid loses or
+    /// gains one row for the bar.
+    fn update_tab_bar_chrome(&mut self) {
+        let new_height = self.tab_bar_height_px();
+        if (new_height - self.tab_bar_px).abs() < 0.5 {
+            return;
+        }
+        self.tab_bar_px = new_height;
+        let cell_h = self.metrics.cell_height.max(1.0);
+        let usable_h =
+            (self.pixel_size.1 as f32 - self.padding.1 - self.padding.3 - new_height).max(cell_h);
+        let rows = (usable_h / cell_h).floor().max(1.0) as u32;
+        if rows != self.rows {
+            self.rows = rows;
+            self.relayout_all();
+        }
+        self.renderer.invalidate();
+        self.need_redraw = true;
+    }
+
     fn handle_resize(&mut self) -> io::Result<()> {
         self.surface
             .make_current()
@@ -1153,12 +1409,13 @@ impl GuiSession {
         let (width, height) = self.surface.refresh_size();
         let cell_w = self.metrics.cell_width.max(1.0);
         let cell_h = self.metrics.cell_height.max(1.0);
+        self.tab_bar_px = self.tab_bar_height_px();
         let usable_w = (width as f32 - self.padding.0 - self.padding.2).max(cell_w);
-        let usable_h = (height as f32 - self.padding.1 - self.padding.3 - cell_h).max(cell_h);
+        let usable_h =
+            (height as f32 - self.padding.1 - self.padding.3 - self.tab_bar_px).max(cell_h);
         let columns = (usable_w / cell_w).floor().max(1.0) as u32;
         let rows = (usable_h / cell_h).floor().max(1.0) as u32;
         self.pixel_size = (width, height);
-        self.tab_bar_px = cell_h;
         if columns != self.columns || rows != self.rows {
             self.columns = columns;
             self.rows = rows;
@@ -1647,6 +1904,89 @@ impl GuiSession {
     // }}}
     // {{{ Rendering
 
+    /// Split borders and background gaps in window pixel coordinates.
+    ///
+    /// The UI layout currently works in whole cells, so borders are derived
+    /// from the pane rectangles after layout rather than being reserved inside
+    /// the cell grid. Minimal borders only appear on edges shared by two
+    /// panes; full borders appear when `draw_minimal_borders` is off, margins
+    /// are configured, or a single window explicitly asks for them.
+    fn pane_chrome(&self, tab_idx: usize) -> (Vec<SolidRect>, Vec<SolidRect>) {
+        let opts = &self.config_options;
+        if opts.window_border_width <= 0.0 {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(tab) = self.tab_manager.tab(tab_idx) else {
+            return (Vec::new(), Vec::new());
+        };
+        let active_id = self.tab_manager.active_window_id();
+        let mut panes = Vec::new();
+        for wid in tab.windows().all_window_ids() {
+            let Some(window) = tab.windows().window(*wid) else {
+                continue;
+            };
+            if !window.is_visible_in_layout {
+                continue;
+            }
+            let Some((columns, rows, left, top)) = self.pane_geometry(tab_idx, *wid) else {
+                continue;
+            };
+            let cw = self.metrics.cell_width.max(1.0);
+            let ch = self.metrics.cell_height.max(1.0);
+            let rect = kitty_render::Rect::new(
+                self.padding.0 + left as f32 * cw,
+                self.tab_bar_px + self.padding.1 + top as f32 * ch,
+                columns as f32 * cw,
+                rows as f32 * ch,
+            );
+            panes.push(PaneBorderPane {
+                rect,
+                active: Some(*wid) == active_id && !window.needs_attention,
+                window_id: *wid as i64,
+            });
+        }
+        if panes.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let single = panes.len() == 1;
+        if single && !opts.draw_window_borders_for_single_window {
+            return (Vec::new(), Vec::new());
+        }
+        let margin = opts
+            .window_margin_width
+            .left
+            .max(opts.window_margin_width.top)
+            .max(
+                opts.window_margin_width
+                    .right
+                    .max(opts.window_margin_width.bottom),
+            );
+        let draw_all = !opts.draw_minimal_borders || margin > 0.0 || single;
+        let scale = self.window.scale_factor();
+        let thickness = (opts.window_border_width * scale).round().max(1.0) as f32;
+        let inactive = rgba_of(opts.inactive_border_color);
+        let active = opts.active_border_color.map(rgba_of).unwrap_or(inactive);
+        let bell = rgba_of(opts.bell_border_color);
+        let mut borders = Vec::new();
+        for line in pane_border_rects(&panes, thickness, draw_all) {
+            let color = if line.active { active } else { inactive };
+            let color = if !line.active {
+                tab.windows()
+                    .window(line.window_id.unsigned_abs() as WindowId)
+                    .filter(|window| window.needs_attention)
+                    .map(|_| bell)
+                    .unwrap_or(color)
+            } else {
+                color
+            };
+            borders.push(SolidRect {
+                rect: line.rect,
+                color,
+            });
+        }
+        (Vec::new(), borders)
+    }
+
     fn build_tab_bar(&self) -> (Screen, Vec<(usize, u32, u32)>) {
         let columns = self.columns.max(1);
         let mut screen = Screen::builder(columns, 1)
@@ -1654,57 +1994,130 @@ impl GuiSession {
             .build()
             .expect("1-row screen");
         screen.cursor.shape = CursorShape::NoCursor;
-        let bg = self.resolver.default_bg();
-        let fg = self.resolver.default_fg();
-        let active_bg = Rgba8::rgb(
-            bg.r.saturating_add(55),
-            bg.g.saturating_add(55),
-            bg.b.saturating_add(55),
-        );
-        let active_fg = Rgba8::rgb(255, 255, 255);
+        let opts = &self.config_options;
+        let bar_bg = opts
+            .tab_bar_background
+            .map(rgba_of)
+            .unwrap_or_else(|| self.resolver.default_bg());
+        let active_bg = rgba_of(opts.active_tab_background);
+        let active_fg = rgba_of(opts.active_tab_foreground);
+        let inactive_bg = rgba_of(opts.inactive_tab_background);
+        let inactive_fg = rgba_of(opts.inactive_tab_foreground);
+        let tab_bg = |active: bool| if active { active_bg } else { inactive_bg };
+        let tab_fg = |active: bool| if active { active_fg } else { inactive_fg };
+
+        // Paint the whole strip with the tab-bar background first; every tab
+        // then overwrites its own cells, like TabBar.update_horizontal().
+        screen.cursor_position(1, 1);
+        screen.cursor.sgr.bg = pack_sgr(bar_bg);
+        screen.cursor.sgr.fg = pack_sgr(inactive_fg);
+        screen.cursor.sgr.bold = false;
+        screen.cursor.sgr.italic = false;
+        let fill: Vec<u32> = std::iter::repeat_n(b' ' as u32, columns as usize).collect();
+        screen.draw_text(&fill);
+
+        let tabs = self.tab_manager.tabs();
+        let count = tabs.len();
+        if count == 0 {
+            return (screen, Vec::new());
+        }
+        let titles: Vec<String> = tabs
+            .iter()
+            .map(|tab| tab.effective_title().to_string())
+            .collect();
+        let style = opts.tab_bar_style;
+        let default_max = ((columns as usize / count.max(1)).saturating_sub(1)).max(1);
+        let ideal: Vec<usize> = titles
+            .iter()
+            .map(|title| tab_ideal_width(style, title, opts))
+            .collect();
+        let widths: Vec<usize> = ideal
+            .iter()
+            .map(|ideal| (*ideal).min(default_max.max(1)))
+            .collect();
+
         let mut ranges = Vec::new();
         let mut x = 0u32;
-        for (idx, tab) in self.tab_manager.tabs().iter().enumerate() {
+        for (idx, title) in titles.iter().enumerate() {
             if x >= columns {
                 break;
             }
             let active = idx == self.tab_manager.active_tab_idx();
-            screen.cursor.sgr.bg = pack_sgr(if active { active_bg } else { bg });
-            screen.cursor.sgr.fg = pack_sgr(if active { active_fg } else { fg });
-            screen.cursor.sgr.bold = active;
+            let is_last = idx + 1 == count;
+            let next_active = !is_last && idx + 1 == self.tab_manager.active_tab_idx();
+            let max_len = widths[idx] as u32;
+            let start = x;
             screen.cursor_position(1, x + 1);
-            let title = tab.effective_title();
-            let label = format!(" {}: {} ", idx + 1, title);
-            let available = columns - x;
-            let text: Vec<u32> = label
-                .chars()
-                .take(available as usize)
-                .map(|ch| ch as u32)
-                .collect();
-            let width = text.len() as u32;
-            if width == 0 {
-                break;
+            match style {
+                TabBarStyle::Hidden => {}
+                TabBarStyle::Powerline => {
+                    draw_tab_powerline(
+                        &mut screen,
+                        title,
+                        x,
+                        max_len,
+                        active,
+                        next_active,
+                        tab_bg,
+                        tab_fg,
+                        bar_bg,
+                        inactive_fg,
+                        opts.tab_powerline_style,
+                        &opts.active_tab_font_style,
+                        &opts.inactive_tab_font_style,
+                    );
+                }
+                TabBarStyle::Separator => {
+                    draw_tab_separator(
+                        &mut screen,
+                        title,
+                        x,
+                        max_len,
+                        is_last,
+                        active,
+                        tab_bg,
+                        tab_fg,
+                        inactive_bg,
+                        bar_fg_for_tabs(opts),
+                        &opts.tab_separator,
+                        &opts.active_tab_font_style,
+                        &opts.inactive_tab_font_style,
+                    );
+                }
+                TabBarStyle::Slant => {
+                    draw_tab_slant(
+                        &mut screen,
+                        title,
+                        x,
+                        max_len,
+                        active,
+                        tab_bg,
+                        tab_fg,
+                        bar_bg,
+                        &opts.active_tab_font_style,
+                        &opts.inactive_tab_font_style,
+                    );
+                }
+                TabBarStyle::Fade | TabBarStyle::Custom => {
+                    draw_tab_fade(
+                        &mut screen,
+                        title,
+                        x,
+                        max_len,
+                        active,
+                        tab_bg,
+                        tab_fg,
+                        bar_bg,
+                        &opts.active_tab_font_style,
+                        &opts.inactive_tab_font_style,
+                    );
+                }
             }
-            screen.draw_text(&text);
-            ranges.push((idx, x, x + width));
-            x += width;
-            if x < columns {
-                screen.cursor.sgr.bg = pack_sgr(bg);
-                screen.cursor.sgr.fg = pack_sgr(fg);
-                screen.cursor.sgr.bold = false;
-                screen.cursor_position(1, x + 1);
-                let sep: Vec<u32> = "|".chars().map(|ch| ch as u32).collect();
-                screen.draw_text(&sep);
-                x += 1;
+            let end = screen.cursor.x.min(columns);
+            if end > start {
+                ranges.push((idx, start, end));
             }
-        }
-        if x < columns {
-            screen.cursor.sgr.bg = pack_sgr(bg);
-            screen.cursor.sgr.fg = pack_sgr(fg);
-            screen.cursor.sgr.bold = false;
-            screen.cursor_position(1, x + 1);
-            let fill: Vec<u32> = std::iter::repeat_n(b' ' as u32, (columns - x) as usize).collect();
-            screen.draw_text(&fill);
+            x = end.max(start);
         }
         screen.cursor.shape = CursorShape::NoCursor;
         (screen, ranges)
@@ -1727,30 +2140,35 @@ impl GuiSession {
                 .map_err(|error| io_err(error.to_string()))?;
         }
 
-        // Tab strip.
-        let (mut bar_screen, ranges) = self.build_tab_bar();
-        self.tab_ranges = ranges;
-        self.renderer.generator.config.origin_x = 0.0;
-        self.renderer.generator.config.origin_y = 0.0;
-        self.renderer.generator.config.viewport_width = self.pixel_size.0 as f32;
-        self.renderer.generator.config.viewport_height = self.pixel_size.1 as f32;
-        let mut bar_frame = {
-            let font_metrics = self.fonts.cell_metrics();
-            let mut rasterizer = FontRasterizer {
-                fonts: &mut self.fonts,
-                cache: &mut self.raster_cache,
-                metrics: font_metrics,
+        // Tab strip. Hidden style and the single-tab case reserve no space and
+        // draw nothing, matching kitty's tab bar visibility rules.
+        let tab_idx = self.tab_manager.active_tab_idx();
+        if self.tab_bar_px > 0.0 {
+            let (mut bar_screen, ranges) = self.build_tab_bar();
+            self.tab_ranges = ranges;
+            self.renderer.generator.config.origin_x = 0.0;
+            self.renderer.generator.config.origin_y = 0.0;
+            self.renderer.generator.config.viewport_width = self.pixel_size.0 as f32;
+            self.renderer.generator.config.viewport_height = self.tab_bar_px;
+            let mut bar_frame = {
+                let font_metrics = self.fonts.cell_metrics();
+                let mut rasterizer = FontRasterizer {
+                    fonts: &mut self.fonts,
+                    cache: &mut self.raster_cache,
+                    metrics: font_metrics,
+                };
+                self.renderer
+                    .prepare_frame(&bar_screen, &mut rasterizer, &self.resolver)
             };
-            self.renderer
-                .prepare_frame(&bar_screen, &mut rasterizer, &self.resolver)
-        };
-        force_full_rows(&mut bar_frame, 1);
-        let bar_config = self.renderer.generator.config.clone();
-        draw_frame(&mut self.backend, &self.renderer, &bar_frame, &bar_config)?;
-        self.renderer.finish_frame(&mut bar_screen);
+            force_full_rows(&mut bar_frame, 1);
+            let bar_config = self.renderer.generator.config.clone();
+            draw_frame(&mut self.backend, &self.renderer, &bar_frame, &bar_config)?;
+            self.renderer.finish_frame(&mut bar_screen);
+        } else {
+            self.tab_ranges.clear();
+        }
 
         // Panes, each with its own origin/viewport.
-        let tab_idx = self.tab_manager.active_tab_idx();
         let ids = self
             .tab_manager
             .tab(tab_idx)
@@ -1799,6 +2217,48 @@ impl GuiSession {
             let config = self.renderer.generator.config.clone();
             draw_frame(&mut self.backend, &self.renderer, &frame, &config)?;
             self.renderer.finish_frame(&mut pane.handler.screen);
+        }
+
+        // Split borders are drawn last as a transparent overlay so they are
+        // not erased by the per-pane scissor clears.
+        let (gaps, borders) = self.pane_chrome(tab_idx);
+        if !gaps.is_empty() || !borders.is_empty() {
+            let mut chrome = Frame {
+                default_fg: self.resolver.default_fg(),
+                default_bg: self.resolver.default_bg(),
+                skip_clear: true,
+                ..Frame::default()
+            };
+            chrome.damage.full_redraw = true;
+            for gap in gaps {
+                chrome.backgrounds.push(kitty_render::BackgroundInstance {
+                    rect: gap.rect,
+                    cell_x: 0,
+                    cell_y: 0,
+                    color: gap.color,
+                    is_default_bg: false,
+                    flags: InstanceFlags::default(),
+                });
+            }
+            for border in borders {
+                chrome.decorations.push(DecorationInstance {
+                    rect: border.rect,
+                    cell_x: 0,
+                    cell_y: 0,
+                    kind: DecorationKind::PaneBorder,
+                    color: border.color,
+                    flags: InstanceFlags::default(),
+                });
+            }
+            let chrome_config = RenderConfig {
+                metrics: self.metrics,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                viewport_width: self.pixel_size.0 as f32,
+                viewport_height: self.pixel_size.1 as f32,
+                ..RenderConfig::default()
+            };
+            draw_frame(&mut self.backend, &self.renderer, &chrome, &chrome_config)?;
         }
 
         self.surface

@@ -106,6 +106,11 @@ fn wayland_window_lifecycle_and_shm_presentation() {
 
     window.set_pointer_shape(PointerShape::Text);
     assert_eq!(window.pointer_shape(), PointerShape::Text);
+    window.set_cursor_scale(1.5);
+    assert_eq!(window.cursor_scale(), 1.5);
+    window.set_cursor_theme(Some("Adwaita"));
+    assert_eq!(window.cursor_theme_name(), "Adwaita");
+    assert!(window.reload_cursor_theme());
     window.set_fullscreen(true);
     assert!(window.is_fullscreen());
     window.set_fullscreen(false);
@@ -124,6 +129,19 @@ fn wayland_window_lifecycle_and_shm_presentation() {
         .expect("inject motion");
     assert!(wait_for(&mut window, Duration::from_secs(1), |event| {
         matches!(event, WindowEvent::MouseMove { x, y, .. } if *x == 12.0 && *y == 34.0)
+    }));
+
+    window
+        .inject_event(&WindowEvent::Touch {
+            id: 3,
+            x: 5.0,
+            y: 6.0,
+            pressure: 0.5,
+            phase: kitty_window::TouchPhase::Began,
+        })
+        .expect("inject touch");
+    assert!(wait_for(&mut window, Duration::from_secs(1), |event| {
+        matches!(event, WindowEvent::Touch { id: 3, .. })
     }));
 
     window
@@ -286,4 +304,62 @@ fn wayland_clipboard_reads_from_an_external_owner() {
         .expect("clipboard text");
     assert_eq!(text, "wayland clipboard test");
     let _ = Command::new("wl-copy").arg("--clear").status();
+}
+
+#[test]
+fn wayland_primary_selection_reads_from_an_external_owner() {
+    let _guard = test_lock();
+    if !compositor_available() {
+        return;
+    }
+    let clear = || {
+        let _ = Command::new("wl-copy")
+            .args(["--primary", "--clear"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    clear();
+    let mut window = match WaylandWindow::new(&WindowConfig::new("primary-read", 120, 80)) {
+        Ok(window) => window,
+        Err(error) => {
+            eprintln!("skipping Wayland primary test: {error}");
+            return;
+        }
+    };
+    let status = Command::new("wl-copy")
+        .args(["--primary", "wayland primary test"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let owned = status.map(|status| status.success()).unwrap_or(false);
+    if !owned {
+        eprintln!("skipping Wayland primary test: wl-copy could not own the selection");
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && !window.has_clipboard_offer(Selection::Primary) {
+        window.poll_events(50);
+    }
+    if !window.has_clipboard_offer(Selection::Primary) {
+        eprintln!("skipping Wayland primary test: no selection event arrived");
+        clear();
+        return;
+    }
+
+    let targets = window
+        .clipboard_targets_blocking(Selection::Primary, Duration::from_secs(2))
+        .expect("primary TARGETS reply");
+    assert!(targets.iter().any(|target| target == "TARGETS"));
+    assert!(targets
+        .iter()
+        .any(|target| target == "text/plain;charset=utf-8" || target == "text/plain"));
+    let text = window
+        .clipboard_text_blocking(Selection::Primary, Duration::from_secs(2))
+        .expect("primary text");
+    assert_eq!(text, "wayland primary test");
+    clear();
 }

@@ -16,15 +16,19 @@
 //!
 //! # Intentional gaps
 //!
-//! Touch, tablet input, cursor themes and the primary selection are not
-//! implemented. `zwp_text_input_v3` provides pre-edit, commit and
-//! delete-surrounding-text events behind the `wayland` feature. `wl_data_device`
-//! drag targets (enter/motion/leave/drop) are supported; drag sources are not.
-//! Window position is controlled by the compositor, so
-//! `position`/`set_position` report or accept a best-effort value and cannot be
-//! used for absolute placement. Fractional scaling is honoured when both
-//! `fractional-scale-v1` and `viewporter` are advertised; otherwise the integer
-//! output scale is rounded.
+//! `zwp_text_input_v3` provides pre-edit, commit and delete-surrounding-text
+//! events behind the `wayland` feature. `wl_data_device` drag targets
+//! (enter/motion/leave/drop) and `wl_data_source.start_drag` sources are
+//! supported, as are both `CLIPBOARD` and `PRIMARY` selections. `wl_touch`
+//! supplies touch points; tablet-tool tilt and pressure curves from
+//! `zwp_tablet_v2` are not modelled, and `wl_touch` pressure is the protocol's
+//! implied 1.0/0.0. Cursor theme/scale state is tracked and hot-reloaded but a
+//! themed cursor surface is left to the compositor cursor layer. Window
+//! position is controlled by the compositor, so `position`/`set_position`
+//! report or accept a best-effort value and cannot be used for absolute
+//! placement. Fractional scaling is honoured when both `fractional-scale-v1`
+//! and `viewporter` are advertised; otherwise the integer output scale is
+//! rounded.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -39,13 +43,17 @@ use std::time::{Duration, Instant};
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface,
+    wl_surface, wl_touch,
 };
 use wayland_client::{
     delegate_noop, event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
+    zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
@@ -56,10 +64,10 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 use crate::clipboard::{
     ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken,
 };
-use crate::dnd::{parse_uri_list, DragSession};
+use crate::dnd::{parse_uri_list, DragSession, DragSourceData, DragSourceState};
 use crate::types::{
-    keysym, KeyAction, KeyInput, Modifiers, MouseButton, PointerShape, Selection, WindowConfig,
-    WindowError, WindowEvent,
+    keysym, KeyAction, KeyInput, Modifiers, MouseButton, PointerShape, Selection, TouchPhase,
+    WindowConfig, WindowError, WindowEvent,
 };
 use crate::wakeup::{WakeupHandle, WakeupPipe};
 
@@ -762,6 +770,8 @@ pub struct WaylandWindow {
     frame_count: u64,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+    touch: Option<wl_touch::WlTouch>,
+    active_touches: HashMap<i32, (f64, f64)>,
     keyboard_focused: bool,
     pointer_x: f64,
     pointer_y: f64,
@@ -778,6 +788,13 @@ pub struct WaylandWindow {
     serial: u32,
     data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     data_device: Option<wl_data_device::WlDataDevice>,
+    primary_manager:
+        Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
+    primary_device: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
+    primary_offer: Option<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
+    pending_primary_offer: Option<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1>,
+    pending_primary_mimes: Vec<String>,
+    primary_mimes: Vec<String>,
     data_offer: Option<wl_data_offer::WlDataOffer>,
     pending_offer: Option<wl_data_offer::WlDataOffer>,
     pending_offer_mimes: Vec<String>,
@@ -791,7 +808,10 @@ pub struct WaylandWindow {
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     text_input_state: TextInputState,
     data_source: Option<wl_data_source::WlDataSource>,
-    source_selection: Option<Selection>,
+    primary_source: Option<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1>,
+    drag_source: Option<wl_data_source::WlDataSource>,
+    drag_source_data: Option<DragSourceData>,
+    drag_source_state: DragSourceState,
     clipboard: ClipboardState,
     clipboard_seq: u64,
     pending_reads: Vec<ClipboardRead>,
@@ -812,6 +832,10 @@ pub struct WaylandWindow {
     fullscreen: bool,
     maximized: bool,
     pointer_shape: PointerShape,
+    cursor_scale: f64,
+    cursor_theme: crate::cursor::CursorTheme,
+    cursor_theme_override: Option<String>,
+    cursor_size_override: Option<u32>,
 }
 
 impl WaylandWindow {
@@ -855,6 +879,8 @@ impl WaylandWindow {
             frame_count: 0,
             keyboard: None,
             pointer: None,
+            touch: None,
+            active_touches: HashMap::new(),
             keyboard_focused: false,
             pointer_x: 0.0,
             pointer_y: 0.0,
@@ -871,6 +897,12 @@ impl WaylandWindow {
             serial: 0,
             data_device_manager: None,
             data_device: None,
+            primary_manager: None,
+            primary_device: None,
+            primary_offer: None,
+            pending_primary_offer: None,
+            pending_primary_mimes: Vec::new(),
+            primary_mimes: Vec::new(),
             data_offer: None,
             pending_offer: None,
             pending_offer_mimes: Vec::new(),
@@ -887,7 +919,10 @@ impl WaylandWindow {
                 ..TextInputState::default()
             },
             data_source: None,
-            source_selection: None,
+            primary_source: None,
+            drag_source: None,
+            drag_source_data: None,
+            drag_source_state: DragSourceState::default(),
             clipboard: ClipboardState::default(),
             clipboard_seq: 0,
             pending_reads: Vec::new(),
@@ -908,6 +943,10 @@ impl WaylandWindow {
             fullscreen: false,
             maximized: false,
             pointer_shape: PointerShape::Default,
+            cursor_scale: 1.0,
+            cursor_theme: crate::cursor::snapshot(None, None, 1.0, "left_ptr"),
+            cursor_theme_override: None,
+            cursor_size_override: None,
         };
 
         queue
@@ -956,6 +995,10 @@ impl WaylandWindow {
 
         if let (Some(manager), Some(seat)) = (self.data_device_manager.clone(), self.seat.clone()) {
             self.data_device = Some(manager.get_data_device(&seat, &self.qh, ()));
+        }
+
+        if let (Some(manager), Some(seat)) = (self.primary_manager.clone(), self.seat.clone()) {
+            self.primary_device = Some(manager.get_device(&seat, &self.qh, ()));
         }
 
         if let (Some(manager), Some(seat)) = (self.text_input_manager.clone(), self.seat.clone()) {
@@ -1233,6 +1276,222 @@ impl WaylandWindow {
         self.text_input.is_some()
     }
 
+    /// Whether the seat advertises a `wl_touch` device.
+    pub fn has_touch_input(&self) -> bool {
+        self.touch.is_some()
+    }
+
+    /// Last input serial observed from the compositor. Selection ownership and
+    /// drag sources must be created with a serial from a recent input event.
+    pub fn last_input_serial(&self) -> u32 {
+        self.serial
+    }
+
+    /// Record an input serial for tests or integration layers that forward
+    /// serials from another seat.
+    pub fn note_input_serial(&mut self, serial: u32) -> bool {
+        if serial == 0 {
+            return false;
+        }
+        self.serial = serial;
+        true
+    }
+
+    /// Start a Wayland drag source with text and/or file paths.
+    pub fn start_drag(&mut self, data: impl Into<DragSourceData>) -> Result<(), WindowError> {
+        let data = data.into();
+        if data.is_empty() {
+            return Err(werr("drag source has no text or file payload"));
+        }
+        if self.drag_source_state.is_active() {
+            return Err(werr("a drag source is already active"));
+        }
+        let manager = self
+            .data_device_manager
+            .clone()
+            .ok_or_else(|| werr("compositor does not advertise wl_data_device_manager"))?;
+        let device = self
+            .data_device
+            .clone()
+            .ok_or_else(|| werr("Wayland data device has not been created"))?;
+        let surface = self
+            .surface
+            .clone()
+            .ok_or_else(|| werr("Wayland surface has not been created"))?;
+        if self.serial == 0 {
+            return Err(werr(
+                "cannot start a drag before the compositor has sent an input serial",
+            ));
+        }
+        let targets = data.targets();
+        if targets.is_empty() {
+            return Err(werr("drag source has no offered targets"));
+        }
+        let source = manager.create_data_source(&self.qh, ());
+        for target in &targets {
+            source.offer(target.clone());
+        }
+        if source.version() >= 3 {
+            source.set_actions(wl_data_device_manager::DndAction::Copy);
+        }
+        if let Some(old) = self.drag_source.take() {
+            old.destroy();
+        }
+        device.start_drag(Some(&source), &surface, None, self.serial);
+        self.drag_source = Some(source);
+        self.drag_source_data = Some(data);
+        self.drag_source_state.begin(targets.clone(), self.serial);
+        self.inbox.push_back(WindowEvent::DragStarted { targets });
+        Ok(())
+    }
+
+    /// Start a text drag source.
+    pub fn start_text_drag(&mut self, text: &str) -> Result<(), WindowError> {
+        self.start_drag(DragSourceData::from_text(text))
+    }
+
+    /// Start a file drag source.
+    pub fn start_file_drag(&mut self, paths: &[String]) -> Result<(), WindowError> {
+        self.start_drag(DragSourceData::from_paths(paths.iter().cloned()))
+    }
+
+    /// Wayland determines the destination from the compositor's pointer
+    /// focus; the explicit target arguments exist for API parity with X11.
+    pub fn start_drag_to_at(
+        &mut self,
+        data: impl Into<DragSourceData>,
+        _target: u64,
+        _root_x: i32,
+        _root_y: i32,
+    ) -> Result<(), WindowError> {
+        self.start_drag(data)
+    }
+
+    /// Wayland determines the destination from the compositor's pointer
+    /// focus; the explicit target argument exists for API parity with X11.
+    pub fn start_drag_to(
+        &mut self,
+        data: impl Into<DragSourceData>,
+        _target: u64,
+    ) -> Result<(), WindowError> {
+        self.start_drag(data)
+    }
+
+    /// Mark the source as dropped. On Wayland the compositor reports the
+    /// physical drop through `wl_data_source.dnd_drop_performed`.
+    pub fn drag_drop(&mut self) -> Result<(), WindowError> {
+        if !self.drag_source_state.is_active() {
+            return Err(werr("no active drag source"));
+        }
+        if !self.drag_source_state.mark_dropped() {
+            return Err(werr("the drag source has already been dropped"));
+        }
+        Ok(())
+    }
+
+    /// Finish the active source locally. This sends no protocol request; the
+    /// compositor emits `dnd_finished` when the destination is done.
+    pub fn finish_drag(&mut self, accepted: bool) -> bool {
+        let was_active = self.drag_source_state.finish(accepted);
+        if was_active {
+            if let Some(source) = self.drag_source.take() {
+                source.destroy();
+            }
+            self.drag_source_data = None;
+            self.inbox.push_back(WindowEvent::DragFinished { accepted });
+        }
+        was_active
+    }
+
+    /// Cancel the active drag source.
+    pub fn cancel_drag(&mut self) -> bool {
+        let cancelled = self.drag_source_state.cancel();
+        if cancelled {
+            if let Some(source) = self.drag_source.take() {
+                source.destroy();
+            }
+            self.drag_source_data = None;
+            self.inbox.push_back(WindowEvent::DragCancelled);
+        }
+        cancelled
+    }
+
+    pub fn is_drag_source_active(&self) -> bool {
+        self.drag_source_state.is_active()
+    }
+
+    pub fn drag_source_targets(&self) -> &[String] {
+        self.drag_source_state.targets()
+    }
+
+    /// Set a per-window cursor scale.
+    pub fn set_cursor_scale(&mut self, scale: f64) {
+        let scale = scale.clamp(0.5, 8.0);
+        if (scale - self.cursor_scale).abs() < f64::EPSILON {
+            return;
+        }
+        self.cursor_scale = scale;
+        self.reload_cursor_theme();
+    }
+
+    pub fn cursor_scale(&self) -> f64 {
+        self.cursor_scale
+    }
+
+    /// Override the theme name for this window. `None` restores the
+    /// environment default.
+    pub fn set_cursor_theme<'a>(&mut self, theme: impl Into<Option<&'a str>>) {
+        self.cursor_theme_override = theme.into().map(str::to_owned);
+        self.reload_cursor_theme();
+    }
+
+    /// Alias for callers that pass a theme name directly.
+    pub fn set_cursor_theme_name(&mut self, theme: &str) {
+        self.set_cursor_theme(theme);
+    }
+
+    pub fn cursor_theme_name(&self) -> &str {
+        &self.cursor_theme.name
+    }
+
+    /// Override the nominal (unscaled) cursor size for this window.
+    pub fn set_cursor_size(&mut self, size: impl Into<Option<u32>>) {
+        self.cursor_size_override = size.into().map(|size| size.max(1));
+        self.reload_cursor_theme();
+    }
+
+    pub fn cursor_size(&self) -> u32 {
+        self.cursor_theme.size
+    }
+
+    /// Refresh the cursor theme snapshot after an environment or file change.
+    /// Wayland cursor surfaces are recreated lazily by the caller; the boolean
+    /// reports whether the theme configuration changed.
+    pub fn refresh_cursor_theme(&mut self) -> bool {
+        let theme = crate::cursor::snapshot(
+            self.cursor_theme_override.as_deref(),
+            self.cursor_size_override,
+            self.cursor_scale,
+            "left_ptr",
+        );
+        if theme.signature() == self.cursor_theme.signature() {
+            return false;
+        }
+        self.cursor_theme = theme;
+        true
+    }
+
+    /// Force a cursor-theme snapshot reload.
+    pub fn reload_cursor_theme(&mut self) -> bool {
+        self.cursor_theme = crate::cursor::snapshot(
+            self.cursor_theme_override.as_deref(),
+            self.cursor_size_override,
+            self.cursor_scale,
+            "left_ptr",
+        );
+        true
+    }
+
     /// Accept the current drag. Wayland requires the MIME type to be fixed
     /// before the source will send data.
     pub fn drag_accept(&mut self, target: Option<&str>) -> Result<Option<String>, WindowError> {
@@ -1340,6 +1599,7 @@ impl WaylandWindow {
     }
 
     fn pump(&mut self, timeout_ms: i32) {
+        self.refresh_cursor_theme();
         self.drain_clipboard_reads();
         self.drain_drag_reads();
         let start = Instant::now();
@@ -1469,7 +1729,7 @@ impl WaylandWindow {
     // {{{ Clipboard
 
     fn clipboard_selection_supported(selection: Selection) -> bool {
-        matches!(selection, Selection::Clipboard)
+        matches!(selection, Selection::Clipboard | Selection::Primary)
     }
 
     pub fn set_clipboard_text(
@@ -1478,12 +1738,10 @@ impl WaylandWindow {
         text: &str,
     ) -> Result<(), WindowError> {
         if !Self::clipboard_selection_supported(selection) {
-            return Err(werr(
-                "the PRIMARY selection is not implemented by the Wayland backend",
-            ));
+            return Err(werr("unsupported selection"));
         }
         self.clipboard.set_text(selection, text.as_bytes());
-        self.publish_clipboard(selection)
+        self.publish_selection(selection)
     }
 
     pub fn set_clipboard_targets(
@@ -1492,53 +1750,73 @@ impl WaylandWindow {
         targets: Vec<(String, Vec<u8>)>,
     ) -> Result<(), WindowError> {
         if !Self::clipboard_selection_supported(selection) {
-            return Err(werr(
-                "the PRIMARY selection is not implemented by the Wayland backend",
-            ));
+            return Err(werr("unsupported selection"));
         }
         let targets = targets
             .into_iter()
             .map(|(name, data)| ClipboardTarget { name, data })
             .collect();
         self.clipboard.set_targets(selection, targets);
-        self.publish_clipboard(selection)
+        self.publish_selection(selection)
     }
 
-    pub fn set_primary_text(&mut self, _text: &str) -> Result<(), WindowError> {
-        Err(werr(
-            "the PRIMARY selection is not implemented by the Wayland backend",
-        ))
+    pub fn set_primary_text(&mut self, text: &str) -> Result<(), WindowError> {
+        self.set_clipboard_text(Selection::Primary, text)
     }
 
-    fn publish_clipboard(&mut self, selection: Selection) -> Result<(), WindowError> {
-        let manager = self
-            .data_device_manager
-            .clone()
-            .ok_or_else(|| werr("compositor does not advertise wl_data_device_manager"))?;
-        let device = self
-            .data_device
-            .clone()
-            .ok_or_else(|| werr("Wayland data device has not been created"))?;
+    fn publish_selection(&mut self, selection: Selection) -> Result<(), WindowError> {
         if self.serial == 0 {
             return Err(werr(
-                "cannot own the clipboard before the compositor has sent an input serial",
+                "cannot own a selection before the compositor has sent an input serial",
             ));
         }
-        let source = manager.create_data_source(&self.qh, ());
-        for target in self.clipboard.targets(selection) {
-            source.offer(target.name.clone());
+        match selection {
+            Selection::Clipboard => {
+                let manager = self
+                    .data_device_manager
+                    .clone()
+                    .ok_or_else(|| werr("compositor does not advertise wl_data_device_manager"))?;
+                let device = self
+                    .data_device
+                    .clone()
+                    .ok_or_else(|| werr("Wayland data device has not been created"))?;
+                let source = manager.create_data_source(&self.qh, ());
+                for target in self.clipboard.targets(selection) {
+                    source.offer(target.name.clone());
+                }
+                if let Some(old) = self.data_source.take() {
+                    old.destroy();
+                }
+                device.set_selection(Some(&source), self.serial);
+                self.data_source = Some(source);
+            }
+            Selection::Primary => {
+                let manager = self.primary_manager.clone().ok_or_else(|| {
+                    werr("compositor does not advertise zwp_primary_selection_device_manager_v1")
+                })?;
+                let device = self
+                    .primary_device
+                    .clone()
+                    .ok_or_else(|| werr("Wayland primary selection device has not been created"))?;
+                let source = manager.create_source(&self.qh, ());
+                for target in self.clipboard.targets(selection) {
+                    source.offer(target.name.clone());
+                }
+                if let Some(old) = self.primary_source.take() {
+                    old.destroy();
+                }
+                device.set_selection(Some(&source), self.serial);
+                self.primary_source = Some(source);
+            }
         }
-        if let Some(old) = self.data_source.take() {
-            old.destroy();
-        }
-        device.set_selection(Some(&source), self.serial);
-        self.data_source = Some(source);
-        self.source_selection = Some(selection);
         Ok(())
     }
 
     pub fn has_clipboard_offer(&self, selection: Selection) -> bool {
-        Self::clipboard_selection_supported(selection) && self.data_offer.is_some()
+        match selection {
+            Selection::Clipboard => self.data_offer.is_some(),
+            Selection::Primary => self.primary_offer.is_some(),
+        }
     }
 
     pub fn request_clipboard_text(
@@ -1546,18 +1824,28 @@ impl WaylandWindow {
         selection: Selection,
     ) -> Result<ClipboardToken, WindowError> {
         if !Self::clipboard_selection_supported(selection) {
-            return Err(werr(
-                "the PRIMARY selection is not implemented by the Wayland backend",
-            ));
+            return Err(werr("unsupported selection"));
         }
-        let offer = self
-            .data_offer
-            .clone()
-            .ok_or_else(|| werr("clipboard selection has no owner"))?;
+        match selection {
+            Selection::Clipboard => {
+                if self.data_offer.is_none() {
+                    return Err(werr("clipboard selection has no owner"));
+                }
+            }
+            Selection::Primary => {
+                if self.primary_offer.is_none() {
+                    return Err(werr("primary selection has no owner"));
+                }
+            }
+        }
         self.clipboard_seq = self.clipboard_seq.wrapping_add(1).max(1);
         let sequence = self.clipboard_seq;
         let token = self.clipboard.begin(selection, "text/plain", sequence);
-        let mime = match preferred_clipboard_mime(&self.data_offer_mimes) {
+        let mimes = match selection {
+            Selection::Clipboard => self.data_offer_mimes.clone(),
+            Selection::Primary => self.primary_mimes.clone(),
+        };
+        let mime = match preferred_clipboard_mime(&mimes) {
             Some(mime) => mime.to_owned(),
             None => {
                 self.clipboard.complete(
@@ -1571,7 +1859,16 @@ impl WaylandWindow {
             .map_err(|error| werr(format!("failed to create clipboard pipe: {error}")))?;
         read.set_nonblocking(true)
             .map_err(|error| werr(format!("failed to configure clipboard pipe: {error}")))?;
-        offer.receive(mime.clone(), write.as_fd());
+        match selection {
+            Selection::Clipboard => {
+                let offer = self.data_offer.clone().expect("checked above");
+                offer.receive(mime.clone(), write.as_fd());
+            }
+            Selection::Primary => {
+                let offer = self.primary_offer.clone().expect("checked above");
+                offer.receive(mime.clone(), write.as_fd());
+            }
+        }
         drop(write);
         self.pending_reads.push(ClipboardRead {
             token,
@@ -1588,18 +1885,27 @@ impl WaylandWindow {
         selection: Selection,
     ) -> Result<ClipboardToken, WindowError> {
         if !Self::clipboard_selection_supported(selection) {
-            return Err(werr(
-                "the PRIMARY selection is not implemented by the Wayland backend",
-            ));
+            return Err(werr("unsupported selection"));
         }
-        if self.data_offer.is_none() {
-            return Err(werr("clipboard selection has no owner"));
-        }
+        let mimes = match selection {
+            Selection::Clipboard => {
+                if self.data_offer.is_none() {
+                    return Err(werr("clipboard selection has no owner"));
+                }
+                self.data_offer_mimes.clone()
+            }
+            Selection::Primary => {
+                if self.primary_offer.is_none() {
+                    return Err(werr("primary selection has no owner"));
+                }
+                self.primary_mimes.clone()
+            }
+        };
         self.clipboard_seq = self.clipboard_seq.wrapping_add(1).max(1);
         let sequence = self.clipboard_seq;
         let token = self.clipboard.begin(selection, "TARGETS", sequence);
         let mut targets = vec!["TARGETS".to_owned()];
-        targets.extend(self.data_offer_mimes.iter().cloned());
+        targets.extend(mimes.iter().cloned());
         self.clipboard
             .complete(sequence, Ok(ClipboardReply::Targets(targets.clone())));
         self.inbox.push_back(WindowEvent::SelectionNotify {
@@ -1882,7 +2188,11 @@ impl WaylandWindow {
             | WindowEvent::DragEnter { .. }
             | WindowEvent::DragMotion { .. }
             | WindowEvent::DragDrop { .. }
-            | WindowEvent::DragLeave => {
+            | WindowEvent::DragLeave
+            | WindowEvent::DragStarted { .. }
+            | WindowEvent::DragFinished { .. }
+            | WindowEvent::DragCancelled
+            | WindowEvent::Touch { .. } => {
                 self.inbox.push_back(event.clone());
                 Ok(())
             }
@@ -1962,6 +2272,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandWindow {
                 }
                 "wp_viewporter" if state.viewporter.is_none() => {
                     state.viewporter = Some(registry.bind(name, version.clamp(1, 1), qh, ()));
+                }
+                "zwp_primary_selection_device_manager_v1" if state.primary_manager.is_none() => {
+                    state.primary_manager = Some(registry.bind(name, version.clamp(1, 1), qh, ()));
                 }
                 "zwp_text_input_manager_v3" if state.text_input_manager.is_none() => {
                     state.text_input_manager =
@@ -2107,6 +2420,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandWindow {
             }
             if capabilities.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
                 state.pointer = Some(seat.get_pointer(qh, ()));
+            }
+            if capabilities.contains(wl_seat::Capability::Touch) && state.touch.is_none() {
+                state.touch = Some(seat.get_touch(qh, ()));
             }
         }
     }
@@ -2376,15 +2692,112 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandWindow {
 impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandWindow {
     fn event(
         state: &mut Self,
-        _: &wl_data_source::WlDataSource,
+        source: &wl_data_source::WlDataSource,
         event: wl_data_source::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let is_drag_source = state
+            .drag_source
+            .as_ref()
+            .is_some_and(|drag| drag.id() == source.id());
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
-                let selection = state.source_selection.unwrap_or(Selection::Clipboard);
+                let mut file = File::from(fd);
+                if is_drag_source {
+                    let targets = state
+                        .drag_source_data
+                        .as_ref()
+                        .map(DragSourceData::targets)
+                        .unwrap_or_default();
+                    if mime_type == "TARGETS" {
+                        let mut data = String::from("TARGETS\n");
+                        data.push_str(&targets.join("\n"));
+                        if !targets.is_empty() {
+                            data.push('\n');
+                        }
+                        let _ = file.write_all(data.as_bytes());
+                    } else if let Some(data) = state
+                        .drag_source_data
+                        .as_ref()
+                        .and_then(|data| data.target_data(&mime_type))
+                    {
+                        let _ = file.write_all(&data);
+                    }
+                } else {
+                    let selection = Selection::Clipboard;
+                    if mime_type == "TARGETS" {
+                        let mut data = state.clipboard.target_names(selection).join("\n");
+                        data.push('\n');
+                        let _ = file.write_all(data.as_bytes());
+                    } else if let Some(data) = state.clipboard.target_data(selection, &mime_type) {
+                        let _ = file.write_all(data);
+                    }
+                    state.inbox.push_back(WindowEvent::SelectionRequest {
+                        selection,
+                        target: mime_type,
+                    });
+                }
+            }
+            wl_data_source::Event::Cancelled => {
+                if is_drag_source {
+                    if state.drag_source_state.cancel() {
+                        state.inbox.push_back(WindowEvent::DragCancelled);
+                    }
+                    state.drag_source = None;
+                    state.drag_source_data = None;
+                } else {
+                    let selection = Selection::Clipboard;
+                    state.clipboard.clear(selection);
+                    state.data_source = None;
+                    state
+                        .inbox
+                        .push_back(WindowEvent::SelectionClear { selection });
+                }
+            }
+            wl_data_source::Event::Target { mime_type } => {
+                if is_drag_source {
+                    state
+                        .drag_source_state
+                        .set_chosen_target(mime_type.as_deref());
+                }
+            }
+            wl_data_source::Event::DndDropPerformed => {
+                if is_drag_source {
+                    state.drag_source_state.mark_dropped();
+                }
+            }
+            wl_data_source::Event::DndFinished => {
+                if is_drag_source {
+                    let accepted = state.drag_source_state.is_accepted();
+                    if state.drag_source_state.finish(accepted) {
+                        state
+                            .inbox
+                            .push_back(WindowEvent::DragFinished { accepted });
+                    }
+                    state.drag_source = None;
+                    state.drag_source_data = None;
+                }
+            }
+            wl_data_source::Event::Action { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        _: &zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+        event: zwp_primary_selection_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_source_v1::Event::Send { mime_type, fd } => {
+                let selection = Selection::Primary;
                 let mut file = File::from(fd);
                 if mime_type == "TARGETS" {
                     let mut data = state.clipboard.target_names(selection).join("\n");
@@ -2398,19 +2811,139 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandWindow {
                     target: mime_type,
                 });
             }
-            wl_data_source::Event::Cancelled => {
-                let selection = state.source_selection.unwrap_or(Selection::Clipboard);
-                state.clipboard.clear(selection);
-                state.data_source = None;
-                state.source_selection = None;
-                state
-                    .inbox
-                    .push_back(WindowEvent::SelectionClear { selection });
+            zwp_primary_selection_source_v1::Event::Cancelled => {
+                state.clipboard.clear(Selection::Primary);
+                state.primary_source = None;
+                state.inbox.push_back(WindowEvent::SelectionClear {
+                    selection: Selection::Primary,
+                });
             }
-            wl_data_source::Event::Target { .. }
-            | wl_data_source::Event::DndDropPerformed
-            | wl_data_source::Event::DndFinished
-            | wl_data_source::Event::Action { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, ()> for WaylandWindow {
+    event_created_child!(WaylandWindow, zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, [
+        0 => (zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()),
+    ]);
+
+    fn event(
+        state: &mut Self,
+        _: &zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        event: zwp_primary_selection_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_device_v1::Event::DataOffer { offer } => {
+                state.pending_primary_offer = Some(offer);
+                state.pending_primary_mimes.clear();
+            }
+            zwp_primary_selection_device_v1::Event::Selection { id } => {
+                if let Some(old) = state.primary_offer.take() {
+                    old.destroy();
+                }
+                let pending = state.pending_primary_offer.take();
+                state.primary_offer = id.or(pending);
+                state.primary_mimes = std::mem::take(&mut state.pending_primary_mimes);
+                if state.primary_offer.is_none() {
+                    state.primary_mimes.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        offer: &zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+        event: zwp_primary_selection_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_primary_selection_offer_v1::Event::Offer { mime_type } = event {
+            let id = offer.id().protocol_id();
+            let list = if state
+                .pending_primary_offer
+                .as_ref()
+                .is_some_and(|pending| pending.id().protocol_id() == id)
+            {
+                &mut state.pending_primary_mimes
+            } else {
+                &mut state.primary_mimes
+            };
+            if !list.contains(&mime_type) {
+                list.push(mime_type);
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_touch::Event::Down {
+                serial, id, x, y, ..
+            } => {
+                state.serial = serial;
+                state.active_touches.insert(id, (x, y));
+                state.inbox.push_back(WindowEvent::Touch {
+                    id: id.max(0) as u64,
+                    x,
+                    y,
+                    pressure: 1.0,
+                    phase: TouchPhase::Began,
+                });
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                if let Some(position) = state.active_touches.get_mut(&id) {
+                    *position = (x, y);
+                    state.inbox.push_back(WindowEvent::Touch {
+                        id: id.max(0) as u64,
+                        x,
+                        y,
+                        pressure: 1.0,
+                        phase: TouchPhase::Updated,
+                    });
+                }
+            }
+            wl_touch::Event::Up { id, .. } => {
+                let (x, y) = state
+                    .active_touches
+                    .remove(&id)
+                    .unwrap_or((state.pointer_x, state.pointer_y));
+                state.inbox.push_back(WindowEvent::Touch {
+                    id: id.max(0) as u64,
+                    x,
+                    y,
+                    pressure: 0.0,
+                    phase: TouchPhase::Ended,
+                });
+            }
+            wl_touch::Event::Cancel => {
+                let touches: Vec<(i32, (f64, f64))> = state.active_touches.drain().collect();
+                for (id, (x, y)) in touches {
+                    state.inbox.push_back(WindowEvent::Touch {
+                        id: id.max(0) as u64,
+                        x,
+                        y,
+                        pressure: 0.0,
+                        phase: TouchPhase::Cancelled,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -2519,6 +3052,7 @@ delegate_noop!(WaylandWindow: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandWindow: ignore wp_viewport::WpViewport);
 delegate_noop!(WaylandWindow: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandWindow: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
+delegate_noop!(WaylandWindow: ignore zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1);
 
 // }}}
 // {{{ Tests that do not need a compositor
@@ -2633,6 +3167,80 @@ mod tests {
             events[1],
             WindowEvent::MouseMove { x, y, .. } if x == 3.0 && y == 4.0
         ));
+    }
+
+    #[test]
+    fn primary_selection_shares_the_clipboard_state_machine() {
+        let mut state = ClipboardState::default();
+        state.set_text(Selection::Primary, b"primary");
+        assert!(state.has_offer(Selection::Primary));
+        assert_eq!(
+            state.target_data(Selection::Primary, "UTF8_STRING"),
+            Some(&b"primary"[..])
+        );
+        let names = state.target_names(Selection::Primary);
+        assert_eq!(names.first().map(String::as_str), Some("TARGETS"));
+        assert!(names.iter().any(|name| name == "UTF8_STRING"));
+    }
+
+    #[test]
+    fn preferred_clipboard_mime_covers_utf8_string_and_string() {
+        assert_eq!(
+            preferred_clipboard_mime(&["image/png".to_owned(), "UTF8_STRING".to_owned()]),
+            Some("UTF8_STRING")
+        );
+        assert_eq!(
+            preferred_clipboard_mime(&["STRING".to_owned()]),
+            Some("STRING")
+        );
+        assert_eq!(
+            preferred_clipboard_mime(&["text/plain".to_owned()]),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn touch_and_drag_source_events_survive_coalescing() {
+        let mut events = vec![
+            WindowEvent::Touch {
+                id: 1,
+                x: 10.0,
+                y: 20.0,
+                pressure: 1.0,
+                phase: TouchPhase::Began,
+            },
+            WindowEvent::Touch {
+                id: 1,
+                x: 11.0,
+                y: 21.0,
+                pressure: 1.0,
+                phase: TouchPhase::Updated,
+            },
+            WindowEvent::DragStarted {
+                targets: vec!["text/uri-list".to_owned()],
+            },
+            WindowEvent::DragFinished { accepted: true },
+        ];
+        coalesce_events(&mut events);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[2],
+            WindowEvent::DragStarted { ref targets } if targets == &["text/uri-list".to_owned()]
+        ));
+        assert_eq!(events[3], WindowEvent::DragFinished { accepted: true });
+    }
+
+    #[test]
+    fn drag_source_data_offers_files_before_text() {
+        let data = DragSourceData::from_paths(["/tmp/a"]).with_text("a");
+        let targets = data.targets();
+        assert_eq!(targets.first().map(String::as_str), Some("text/uri-list"));
+        assert!(targets.contains(&"text/plain;charset=utf-8".to_owned()));
+        assert!(targets.contains(&"UTF8_STRING".to_owned()));
+        assert_eq!(
+            data.target_data("text/uri-list").as_deref(),
+            Some(b"file:///tmp/a\r\n".as_slice())
+        );
     }
 
     #[test]

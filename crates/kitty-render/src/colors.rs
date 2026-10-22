@@ -310,6 +310,54 @@ pub trait ColorResolver {
     }
 }
 
+/// The 16 default ANSI colours from `kitty/options/definition.py`
+/// (`color0`..`color15`). These intentionally differ from the historic
+/// xterm values in `kitty/colors.c`'s `FG_BG_256` fallback table: kitty's
+/// defaults are `#cc0403` for red and `#f2201f` for bright red.
+pub const KITTY_DEFAULT_ANSI_COLORS: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00], // color0 black
+    [0xcc, 0x04, 0x03], // color1 red
+    [0x19, 0xcb, 0x00], // color2 green
+    [0xce, 0xcb, 0x00], // color3 yellow
+    [0x0d, 0x73, 0xcc], // color4 blue
+    [0xcb, 0x1e, 0xd1], // color5 magenta
+    [0x0d, 0xcd, 0xcd], // color6 cyan
+    [0xdd, 0xdd, 0xdd], // color7 white
+    [0x76, 0x76, 0x76], // color8 bright black
+    [0xf2, 0x20, 0x1f], // color9 bright red
+    [0x23, 0xfd, 0x00], // color10 bright green
+    [0xff, 0xfd, 0x00], // color11 bright yellow
+    [0x1a, 0x8f, 0xff], // color12 bright blue
+    [0xfd, 0x28, 0xff], // color13 bright magenta
+    [0x14, 0xff, 0xff], // color14 bright cyan
+    [0xff, 0xff, 0xff], // color15 bright white
+];
+
+/// The default 256-colour palette used when no `colorN` options are set.
+///
+/// Entries 0..=15 are [`KITTY_DEFAULT_ANSI_COLORS`]; 16..=231 are the fixed
+/// 6x6x6 cube and 232..=255 are the grayscale ramp, matching
+/// `init_FG_BG_table()` in `kitty/colors.c`.
+pub fn kitty_default_palette() -> [Rgba8; 256] {
+    let mut palette = [Rgba8::BLACK; 256];
+    for (i, c) in KITTY_DEFAULT_ANSI_COLORS.iter().enumerate() {
+        palette[i] = Rgba8::rgb(c[0], c[1], c[2]);
+    }
+    let levels = [0u8, 95, 135, 175, 215, 255];
+    for r in 0..6 {
+        for g in 0..6 {
+            for b in 0..6 {
+                palette[16 + r * 36 + g * 6 + b] = Rgba8::rgb(levels[r], levels[g], levels[b]);
+            }
+        }
+    }
+    for i in 0..24 {
+        let v = (8 + i * 10) as u8;
+        palette[232 + i] = Rgba8::rgb(v, v, v);
+    }
+    palette
+}
+
 /// A simple palette-based resolver, useful for tests, examples and as a
 /// sensible default before the full `kitty/colors.c` profile is wired up.
 #[derive(Clone, Debug)]
@@ -326,20 +374,20 @@ pub struct BasicColorResolver {
 
 impl Default for BasicColorResolver {
     fn default() -> Self {
-        Self::new(Rgba8::rgb(0xdd, 0xdd, 0xdd), Rgba8::rgb(0x11, 0x11, 0x11))
+        Self::new(Rgba8::rgb(0xdd, 0xdd, 0xdd), Rgba8::rgb(0x00, 0x00, 0x00))
     }
 }
 
 impl BasicColorResolver {
     pub fn new(fg: Rgba8, bg: Rgba8) -> Self {
         Self {
-            palette: xterm_palette(),
+            palette: kitty_default_palette(),
             fg,
             bg,
-            cursor_bg: fg,
-            cursor_fg: bg,
-            selection_bg: Rgba8::rgb(0x26, 0x4f, 0x78),
-            selection_fg: fg,
+            cursor_bg: Rgba8::rgb(0xcc, 0xcc, 0xcc),
+            cursor_fg: Rgba8::rgb(0x11, 0x11, 0x11),
+            selection_bg: Rgba8::rgb(0xff, 0xfa, 0xcd),
+            selection_fg: Rgba8::rgb(0x00, 0x00, 0x00),
             special: [bg; 8],
         }
     }
@@ -394,44 +442,6 @@ impl ColorResolver for BasicColorResolver {
     }
 }
 
-fn xterm_palette() -> [Rgba8; 256] {
-    let mut palette = [Rgba8::BLACK; 256];
-    let base: [[u8; 3]; 16] = [
-        [0x00, 0x00, 0x00],
-        [0xcd, 0x00, 0x00],
-        [0x00, 0xcd, 0x00],
-        [0xcd, 0xcd, 0x00],
-        [0x00, 0x00, 0xee],
-        [0xcd, 0x00, 0xcd],
-        [0x00, 0xcd, 0xcd],
-        [0xe5, 0xe5, 0xe5],
-        [0x7f, 0x7f, 0x7f],
-        [0xff, 0x00, 0x00],
-        [0x00, 0xff, 0x00],
-        [0xff, 0xff, 0x00],
-        [0x5c, 0x5c, 0xff],
-        [0xff, 0x00, 0xff],
-        [0x00, 0xff, 0xff],
-        [0xff, 0xff, 0xff],
-    ];
-    for (i, c) in base.iter().enumerate() {
-        palette[i] = Rgba8::rgb(c[0], c[1], c[2]);
-    }
-    let levels = [0u8, 95, 135, 175, 215, 255];
-    for r in 0..6 {
-        for g in 0..6 {
-            for b in 0..6 {
-                palette[16 + r * 36 + g * 6 + b] = Rgba8::rgb(levels[r], levels[g], levels[b]);
-            }
-        }
-    }
-    for i in 0..24 {
-        let v = (8 + i * 10) as u8;
-        palette[232 + i] = Rgba8::rgb(v, v, v);
-    }
-    palette
-}
-
 /// Blend the foreground towards the background in linear space, matching
 /// `dimmed_color_component()` in `kitty/shaders.c`.
 #[inline]
@@ -466,6 +476,30 @@ pub fn contrast_ratio(a: Rgba8, b: Rgba8) -> f32 {
 
 // }}}
 
+/// Build an [`kitty_graphics::IndexedPalette`] from a colour resolver.
+///
+/// This is what the renderer uses to expand `f=8`/`f=16` graphics-protocol
+/// images before uploading them. Entries `248..=255` follow the protocol's
+/// special-colour table and use the resolver's context colours.
+pub fn indexed_image_palette(resolver: &dyn ColorResolver) -> kitty_graphics::IndexedPalette {
+    let mut colors = [[0u8, 0, 0, 255]; 256];
+    for (index, entry) in colors.iter_mut().enumerate() {
+        let color = resolver.palette_color(index as u8);
+        *entry = [color.r, color.g, color.b, color.a];
+    }
+    let rgba = |color: Rgba8| [color.r, color.g, color.b, color.a];
+    kitty_graphics::IndexedPalette::new(
+        colors,
+        rgba(resolver.default_bg()),
+        rgba(resolver.default_fg()),
+        rgba(resolver.selection_bg()),
+        rgba(resolver.selection_fg()),
+        rgba(resolver.cursor_bg()),
+        rgba(resolver.cursor_fg()),
+        rgba(resolver.url_color()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +515,60 @@ mod tests {
             let y = linear_to_srgb(srgb_to_linear(x));
             assert!((x - y).abs() < 2e-5, "{x} != {y}");
         }
+    }
+
+    #[test]
+    fn default_palette_matches_kitty_ansi_table() {
+        // Values from kitty/options/types.py's default `color_table` and
+        // kitty/options/definition.py. This is deliberately not the xterm
+        // table in colors.c (which is only the generated-color fallback).
+        let c_table: [[u8; 3]; 16] = [
+            [0x00, 0x00, 0x00],
+            [0xcc, 0x04, 0x03],
+            [0x19, 0xcb, 0x00],
+            [0xce, 0xcb, 0x00],
+            [0x0d, 0x73, 0xcc],
+            [0xcb, 0x1e, 0xd1],
+            [0x0d, 0xcd, 0xcd],
+            [0xdd, 0xdd, 0xdd],
+            [0x76, 0x76, 0x76],
+            [0xf2, 0x20, 0x1f],
+            [0x23, 0xfd, 0x00],
+            [0xff, 0xfd, 0x00],
+            [0x1a, 0x8f, 0xff],
+            [0xfd, 0x28, 0xff],
+            [0x14, 0xff, 0xff],
+            [0xff, 0xff, 0xff],
+        ];
+        assert_eq!(KITTY_DEFAULT_ANSI_COLORS, c_table);
+        let palette = kitty_default_palette();
+        for (i, expected) in c_table.iter().enumerate() {
+            assert_eq!(
+                palette[i],
+                Rgba8::rgb(expected[0], expected[1], expected[2]),
+                "palette entry {i}"
+            );
+        }
+        // 6x6x6 cube and grayscale ramp from init_FG_BG_table().
+        assert_eq!(palette[16], Rgba8::rgb(0, 0, 0));
+        assert_eq!(palette[21], Rgba8::rgb(0, 0, 255));
+        assert_eq!(palette[196], Rgba8::rgb(255, 0, 0));
+        assert_eq!(palette[231], Rgba8::rgb(255, 255, 255));
+        assert_eq!(palette[232], Rgba8::rgb(8, 8, 8));
+        assert_eq!(palette[255], Rgba8::rgb(238, 238, 238));
+    }
+
+    #[test]
+    fn default_cursor_and_selection_colors_match_kitty() {
+        let r = BasicColorResolver::default();
+        assert_eq!(r.default_fg(), Rgba8::rgb(0xdd, 0xdd, 0xdd));
+        assert_eq!(r.default_bg(), Rgba8::rgb(0x00, 0x00, 0x00));
+        assert_eq!(r.cursor_bg(), Rgba8::rgb(0xcc, 0xcc, 0xcc));
+        assert_eq!(r.cursor_fg(), Rgba8::rgb(0x11, 0x11, 0x11));
+        assert_eq!(r.selection_bg(), Rgba8::rgb(0xff, 0xfa, 0xcd));
+        assert_eq!(r.selection_fg(), Rgba8::rgb(0x00, 0x00, 0x00));
+        assert_eq!(r.palette_color(1), Rgba8::rgb(0xcc, 0x04, 0x03));
+        assert_eq!(r.palette_color(9), Rgba8::rgb(0xf2, 0x20, 0x1f));
     }
 
     #[test]

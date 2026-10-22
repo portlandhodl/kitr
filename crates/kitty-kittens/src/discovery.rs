@@ -35,6 +35,7 @@ use kitty_remote::json::Value;
 
 use crate::error::{Error, Result};
 use crate::manifest::{KittenKind, KittenManifest, MANIFEST_FILENAMES};
+use crate::native::native_kitten;
 
 /// Where a kitten was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -872,8 +873,13 @@ impl KittenRegistry {
         let discovered: BTreeSet<&str> = self.canonical.keys().map(String::as_str).collect();
         for builtin in &self.catalog {
             if !discovered.contains(builtin.name) {
+                let state = if native_kitten(builtin.name).is_some() {
+                    "builtin, native"
+                } else {
+                    "builtin, not installed"
+                };
                 lines.push(format!(
-                    "{}\t{}\t[builtin, not installed]",
+                    "{}\t{}\t[{state}]",
                     builtin.name, builtin.description
                 ));
             }
@@ -913,6 +919,20 @@ impl KittenRegistry {
             return Ok(lines.join("\n"));
         }
         if let Some(builtin) = self.catalog.iter().find(|item| item.name == name) {
+            if let Some(native) = native_kitten(builtin.name) {
+                let mut lines = vec![
+                    format!("{} (built-in, native)", native.name),
+                    String::new(),
+                    native.description.to_owned(),
+                    String::new(),
+                    native.usage.to_owned(),
+                ];
+                if !native.aliases.is_empty() {
+                    lines.push(String::new());
+                    lines.push(format!("Aliases: {}", native.aliases.join(", ")));
+                }
+                return Ok(lines.join("\n"));
+            }
             let mut lines = vec![
                 format!("{} (built-in)", builtin.name),
                 String::new(),
