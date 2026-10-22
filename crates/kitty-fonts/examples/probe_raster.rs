@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use kitty_fonts::*;
 use std::path::Path;
 fn p(n: &str) -> std::path::PathBuf {
