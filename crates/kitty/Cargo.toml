@@ -1,0 +1,17 @@
+[package]
+name = "kitty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "kitr terminal binary"
+
+[[bin]]
+name = "kitr"
+path = "src/main.rs"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }
+kitty-vt = { path = "../kitty-vt" }
+kitty-screen = { path = "../kitty-screen" }
+kitty-os = { path = "../kitty-os" }

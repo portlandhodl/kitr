@@ -3,8 +3,41 @@
 version = 4
 
 [[package]]
+name = "kitty"
+version = "0.1.0"
+dependencies = [
+ "kitty-core",
+ "kitty-os",
+ "kitty-screen",
+ "kitty-vt",
+]
+
+[[package]]
+name = "kitty-config"
+version = "0.1.0"
+dependencies = [
+ "kitty-core",
+]
+
+[[package]]
 name = "kitty-core"
 version = "0.1.0"
+
+[[package]]
+name = "kitty-fonts"
+version = "0.1.0"
+dependencies = [
+ "kitty-core",
+ "kitty-unicode",
+]
+
+[[package]]
+name = "kitty-graphics"
+version = "0.1.0"
+dependencies = [
+ "kitty-core",
+ "kitty-screen",
+]
 
 [[package]]
 name = "kitty-input"
@@ -14,10 +47,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitty-kittens"
+version = "0.1.0"
+dependencies = [
+ "kitty-config",
+ "kitty-core",
+ "kitty-remote",
+]
+
+[[package]]
 name = "kitty-os"
 version = "0.1.0"
 dependencies = [
  "kitty-core",
+]
+
+[[package]]
+name = "kitty-remote"
+version = "0.1.0"
+
+[[package]]
+name = "kitty-render"
+version = "0.1.0"
+dependencies = [
+ "kitty-core",
+ "kitty-fonts",
+ "kitty-graphics",
+ "kitty-screen",
 ]
 
 [[package]]

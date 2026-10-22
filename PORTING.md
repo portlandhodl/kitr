@@ -676,26 +676,26 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `child-monitor.c` | `kitty-os/src/child_monitor.rs` | in progress (single-child Linux monitor; batching/parser-input modes deferred) |
 | `cleanup.c` | `kitty-os/src/cleanup.rs` | planned |
 | `colors.c` | `kitty-screen/src/colors.rs` | planned |
-| `crypto.c` | `kitty-remote/src/crypto.rs` | planned |
+| `crypto.c` | `kitty-remote/src/crypto.rs` | **ported** |
 | `cursor.c` | `kitty-screen/src/cursor.rs` | **ported** (core cursor/SGR/shape; beam/underline rendering pending) |
 | `cursor_trail.c` | `kitty-render/src/cursor_trail.rs` | planned |
-| `data-types.c` | `kitty-core/src/{base64,binary}.rs` + `kitty-vt/src/constants.rs` (module dissolved) | planned |
+| `data-types.c` | `kitty-remote/src/{base64,binary}.rs` + `kitty-vt/src/constants.rs` (module dissolved) | in progress (base64/base85/binary ported; other exports pending) |
 | `decorations.c` | `kitty-render/src/decorations.rs` | planned |
 | `desktop.c` | `kitty-os/src/desktop.rs` | planned |
 | `disk-cache.c` | `kitty-fonts/src/disk_cache.rs` | planned |
 | `dnd.c` | `kitty-input/src/dnd.rs` | planned |
-| `fast-file-copy.c` | `kitty-remote/src/fast_file_copy.rs` | planned |
-| `fontconfig.c` | `kitty-fonts/src/fontconfig.rs` | planned |
-| `font-names.c` | `kitty-fonts/src/font_names.rs` | planned |
-| `fonts.c` | `kitty-fonts/src/fonts.rs` | planned |
-| `freetype.c` | `kitty-fonts/src/freetype.rs` | planned |
+| `fast-file-copy.c` | `kitty-remote/src/fast_file_copy.rs` | in progress (descriptor copy + chunked extension; kitty wire protocol pending) |
+| `fontconfig.c` | `kitty-fonts/src/fontconfig.rs` | **ported** (matching + coverage; candidate cache pending) |
+| `font-names.c` | `kitty-fonts/src/font_names.rs` | in progress (family style/name resolution; full OpenType name tables pending) |
+| `fonts.c` | `kitty-fonts/src/fonts.rs` | in progress (specs, metrics, fallback, shaping; rasterization/atlas pending) |
+| `freetype.c` | `kitty-fonts/src/freetype.rs` | in progress (metrics/glyph lookup; rendering/variable axes pending) |
 | `freetype_render_ui_text.c` | `kitty-fonts/src/ui_text.rs` | planned |
 | `gl.c` | `kitty-render/src/gl.rs` | planned |
 | `glfw.c` | `kitty-os/src/glfw.rs` | planned |
 | `glfw-wrapper.c` | `kitty-os/src/glfw.rs` | planned |
 | `gl-wrapper.c` | `kitty-render/src/gl.rs` | planned |
 | `glyph-cache.c` | `kitty-render/src/glyph_cache.rs` | planned |
-| `graphics.c` | `kitty-graphics/src/graphics.rs` | planned |
+| `graphics.c` | `kitty-graphics/src/graphics.rs` | in progress (protocol parser + image pipeline; Screen/GPU integration pending) |
 | `history.c` | `kitty-core/src/history.rs` | **ported** (core ring; pager/rewrap pending) |
 | `hyperlink.c` | `kitty-screen/src/hyperlink.rs` | planned |
 | `key_encoding.c` | `kitty-input/src/key_encoding.rs` | **ported** |
@@ -706,21 +706,21 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `logging.c` | `kitty-os/src/logging.rs` | planned |
 | `loop-utils.c` | `kitty-os/src/loop_utils.rs` | **ported** |
 | `macos_process_info.c` | `kitty-os/src/macos_process_info.rs` | planned |
-| `mime-cache.c` | `kitty-graphics/src/mime_cache.rs` | planned |
+| `mime-cache.c` | `kitty-graphics/src/mime_cache.rs` | in progress (embedded image table; XDG mime.cache pending) |
 | `monotonic.c` | `kitty-os/src/monotonic.rs` | **ported** |
 | `mouse.c` | `kitty-input/src/mouse.rs` | **ported** (protocols/tracking; Screen selection integration pending) |
-| `png-reader.c` | `kitty-graphics/src/png_reader.rs` | planned |
+| `png-reader.c` | `kitty-graphics/src/png_reader.rs` | **ported** (no ICC/lcms color management) |
 | `resize.c` | `kitty-screen/src/resize.rs` | planned |
 | `rowcolumn-diacritics.c` | `kitty-vt/src/diacritics.rs` | planned |
 | `screen.c` | `kitty-screen/src/screen.rs` | in progress (draw/cursor/edit/scroll/alt-screen/CSI subset; graphics/resize/mouse/DnD/OSC mutations pending) |
 | `shaders.c` | `kitty-render/src/shaders.rs` | planned |
-| `shaped-run-cache.c` | `kitty-fonts/src/shaped_run_cache.rs` | planned |
-| `shlex.c` | `kitty-config/src/shlex.rs` | planned |
+| `shaped-run-cache.c` | `kitty-fonts/src/shaped_run_cache.rs` | **ported** (bounded cache; cell-group representation pending) |
+| `shlex.c` | `kitty-config/src/shlex.rs` | **ported** |
 | `simd-string.c` | `kitty-simd/src/{lib,scalar,utf8}.rs` | **ported** |
 | `simd-string-128.c` | `kitty-simd/src/x86/sse2.rs` | **ported** |
 | `simd-string-256.c` | `kitty-simd/src/x86/avx2.rs` | **ported** |
 | `simd-string-512.c` | `kitty-simd/src/x86/avx512.rs` | **ported** |
-| `state.c` | `kitty-config/src/state.rs` | planned |
+| `state.c` | `kitty-config/src/options.rs` | in progress (typed options; runtime global state pending) |
 | `systemd.c` | `kitty-os/src/systemd.rs` | planned |
 | `text-cache.c` | `kitty-core/src/text_cache.rs` | **ported** |
 | `utmp.c` | `kitty-os/src/utmp.rs` | planned |

@@ -1,0 +1,13 @@
+[package]
+name = "kitty-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OpenGL renderer, shaders and decorations ported from kitty"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }
+kitty-screen = { path = "../kitty-screen" }
+kitty-fonts = { path = "../kitty-fonts" }
+kitty-graphics = { path = "../kitty-graphics" }

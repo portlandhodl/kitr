@@ -1,0 +1,12 @@
+[package]
+name = "kitty-kittens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kitten discovery, launching and protocol helpers"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }
+kitty-config = { path = "../kitty-config" }
+kitty-remote = { path = "../kitty-remote" }

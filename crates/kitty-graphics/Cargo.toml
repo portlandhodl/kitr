@@ -1,0 +1,11 @@
+[package]
+name = "kitty-graphics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PNG decoding, MIME policy and kitty graphics protocol parsing"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }
+kitty-screen = { path = "../kitty-screen" }

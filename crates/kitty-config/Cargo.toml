@@ -1,0 +1,10 @@
+[package]
+name = "kitty-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Option storage, config parsing and shlex ported from kitty"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }

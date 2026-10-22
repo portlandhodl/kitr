@@ -1,0 +1,9 @@
+[package]
+name = "kitty-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Remote control crypto, framing and file copy ported from kitty"
+
+[dependencies]
