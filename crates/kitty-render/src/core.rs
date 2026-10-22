@@ -25,6 +25,7 @@ pub struct RendererCore {
     pub trail: CursorTrail,
     started: Instant,
     spare: Option<Frame>,
+    overlay_fingerprint: Option<u64>,
 }
 
 impl Default for RendererCore {
@@ -42,6 +43,7 @@ impl RendererCore {
             trail: CursorTrail::new(),
             started: Instant::now(),
             spare: None,
+            overlay_fingerprint: None,
         }
     }
 
@@ -102,6 +104,9 @@ impl RendererCore {
         now: f32,
     ) {
         let damage = self.damage.update(screen);
+        let fingerprint = overlay_fingerprint(&self.generator.config, screen);
+        let overlays_changed = self.overlay_fingerprint != Some(fingerprint);
+        self.overlay_fingerprint = Some(fingerprint);
         self.generator
             .generate(screen, &mut self.atlas, rasterizer, resolver, frame);
         frame.damage = damage;
@@ -133,7 +138,7 @@ impl RendererCore {
             || frame.background_image.is_some()
             || frame.logo.is_some()
             || !frame.trail.is_empty();
-        if media && !frame.damage.full_redraw {
+        if (media || overlays_changed) && !frame.damage.full_redraw {
             frame.damage.full_redraw = true;
             frame.damage.full_redraw_reason = Some(FullRedrawReason::Explicit);
         }
@@ -169,12 +174,94 @@ impl RendererCore {
     }
 }
 
+fn overlay_fingerprint(config: &RenderConfig, screen: &Screen) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn mix(hash: &mut u64, value: u64) {
+        for byte in value.to_le_bytes() {
+            *hash ^= byte as u64;
+            *hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    fn mix_color(hash: &mut u64, color: Option<crate::colors::Rgba8>) {
+        mix(
+            hash,
+            match color {
+                Some(c) => 1 + c.to_argb_u32() as u64,
+                None => 0,
+            },
+        );
+    }
+
+    let mut hash = OFFSET;
+    mix(&mut hash, config.selections.len() as u64);
+    for selection in &config.selections {
+        mix(&mut hash, selection.start.x as u64);
+        mix(&mut hash, selection.start.y as u64);
+        mix(&mut hash, selection.end.x as u64);
+        mix(&mut hash, selection.end.y as u64);
+        mix(&mut hash, u64::from(selection.start.in_left_half));
+        mix(&mut hash, u64::from(selection.end.in_left_half));
+        mix(&mut hash, selection.mode as u64);
+        mix(&mut hash, u64::from(selection.rectangle));
+    }
+    mix_color(&mut hash, config.selection_bg);
+    mix_color(&mut hash, config.selection_fg);
+    mix(&mut hash, u64::from(config.hyperlink_underline));
+    mix_color(&mut hash, config.hyperlink_color);
+    if let Some(hover) = config.hyperlink_hover {
+        mix(&mut hash, 1);
+        mix(&mut hash, hover.x as u64);
+        mix(&mut hash, hover.y as u64);
+        mix(&mut hash, screen.hyperlink_id_at(hover.x, hover.y) as u64);
+    } else {
+        mix(&mut hash, 0);
+    }
+    mix_color(&mut hash, config.hyperlink_hover_bg);
+    match &config.tab_bar {
+        Some(spec) => {
+            mix(&mut hash, 1);
+            mix(&mut hash, spec.titles.len() as u64);
+            for title in &spec.titles {
+                mix(&mut hash, title.len() as u64);
+                for byte in title.bytes() {
+                    mix(&mut hash, byte as u64);
+                }
+            }
+            mix(&mut hash, spec.active as u64);
+            mix(&mut hash, spec.height.to_bits() as u64);
+            mix(&mut hash, spec.border_width.to_bits() as u64);
+            mix(&mut hash, spec.padding.left.to_bits() as u64);
+            mix(&mut hash, spec.padding.top.to_bits() as u64);
+            mix(&mut hash, spec.padding.right.to_bits() as u64);
+            mix(&mut hash, spec.padding.bottom.to_bits() as u64);
+            mix(&mut hash, spec.min_tab_width.to_bits() as u64);
+            mix(&mut hash, spec.max_tab_width.to_bits() as u64);
+            mix(&mut hash, spec.font_id as u64);
+            for color in [
+                spec.colors.background,
+                spec.colors.inactive_background,
+                spec.colors.active_background,
+                spec.colors.foreground,
+                spec.colors.active_foreground,
+                spec.colors.border,
+                spec.colors.active_border,
+            ] {
+                mix(&mut hash, color.to_argb_u32() as u64);
+            }
+        }
+        None => mix(&mut hash, 0),
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::atlas::GlyphBitmap;
     use crate::colors::{BasicColorResolver, Rgba8};
     use crate::damage::FullRedrawReason;
+    use crate::overlays::SelectionRange;
     use kitty_screen::Screen;
 
     fn resolve() -> BasicColorResolver {
@@ -288,5 +375,39 @@ mod tests {
 
         let frame = core.prepare_frame_at(&s, &mut rasterize, &r, 1.2);
         assert!(frame.trail.is_empty());
+    }
+    #[test]
+    fn overlay_changes_force_a_full_redraw() {
+        let mut s = Screen::builder(10, 3).scrollback(8).build().unwrap();
+        s.draw_text(&[b'a' as u32, b'b' as u32]);
+        let r = resolve();
+        let mut core = RendererCore::default();
+        let _ = core.prepare_frame(&s, &mut rasterize, &r);
+        s.reset_dirty();
+        let frame = core.prepare_frame(&s, &mut rasterize, &r);
+        core.recycle_frame(frame);
+        let frame = core.prepare_frame(&s, &mut rasterize, &r);
+        assert!(!frame.damage.full_redraw);
+        core.recycle_frame(frame);
+
+        core.generator.config.selections = vec![SelectionRange::cell(0, 0, 1, 0)];
+        let frame = core.prepare_frame(&s, &mut rasterize, &r);
+        assert!(frame.damage.full_redraw);
+        assert_eq!(
+            frame.damage.full_redraw_reason,
+            Some(FullRedrawReason::Explicit)
+        );
+        core.recycle_frame(frame);
+
+        let frame = core.prepare_frame(&s, &mut rasterize, &r);
+        assert!(
+            !frame.damage.full_redraw,
+            "unchanged overlay should not force redraw"
+        );
+        core.recycle_frame(frame);
+
+        core.generator.config.selections[0].end.x = 2;
+        let frame = core.prepare_frame(&s, &mut rasterize, &r);
+        assert!(frame.damage.full_redraw);
     }
 }

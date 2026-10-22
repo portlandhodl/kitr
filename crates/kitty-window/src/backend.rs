@@ -210,6 +210,54 @@ impl WindowBackend {
         }
     }
 
+    pub fn set_ime_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::X11(window) => window.set_ime_enabled(enabled),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.set_ime_enabled(enabled),
+        }
+    }
+
+    pub fn ime_enabled(&self) -> bool {
+        match self {
+            Self::X11(window) => window.ime_enabled(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.ime_enabled(),
+        }
+    }
+
+    pub fn drag_accept(&mut self, target: Option<&str>) -> Result<Option<String>, WindowError> {
+        match self {
+            Self::X11(window) => window.drag_accept(target),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.drag_accept(target),
+        }
+    }
+
+    pub fn drag_reject(&mut self) {
+        match self {
+            Self::X11(window) => window.drag_reject(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.drag_reject(),
+        }
+    }
+
+    pub fn is_drag_active(&self) -> bool {
+        match self {
+            Self::X11(window) => window.is_drag_active(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.is_drag_active(),
+        }
+    }
+
+    pub fn drag_target(&self) -> Option<&str> {
+        match self {
+            Self::X11(window) => window.drag_target(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(window) => window.drag_target(),
+        }
+    }
+
     pub fn set_fullscreen(&mut self, fullscreen: bool) {
         match self {
             Self::X11(window) => window.set_fullscreen(fullscreen),

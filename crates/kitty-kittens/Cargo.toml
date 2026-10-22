@@ -10,3 +10,7 @@ description = "Kitten discovery, launching and protocol helpers"
 kitty-core = { path = "../kitty-core" }
 kitty-config = { path = "../kitty-config" }
 kitty-remote = { path = "../kitty-remote" }
+
+[[bench]]
+name = "kittens"
+harness = false

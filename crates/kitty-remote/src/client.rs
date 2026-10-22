@@ -17,7 +17,7 @@ use crate::json::{self, Value};
 use crate::protocol::CryptoState;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +95,31 @@ impl Client {
         )
     }
 
+    /// Connect to an abstract-namespace Unix socket in plain mode.
+    pub fn connect_addr_plain(addr: &SocketAddr) -> Result<Self> {
+        Self::connect_addr(addr, None, ClientConfig::default())
+    }
+
+    /// Connect to an abstract-namespace Unix socket with X25519/AES-GCM
+    /// encryption using the server's raw public key.
+    pub fn connect_addr_encrypted(addr: &SocketAddr, server_public_key: &[u8]) -> Result<Self> {
+        Self::connect_addr(
+            addr,
+            Some(server_public_key.to_vec()),
+            ClientConfig::default(),
+        )
+    }
+
+    /// Connect to an explicit [`SocketAddr`] (path or abstract namespace).
+    pub fn connect_addr(
+        addr: &SocketAddr,
+        server_public_key: Option<Vec<u8>>,
+        config: ClientConfig,
+    ) -> Result<Self> {
+        let stream = UnixStream::connect_addr(addr)?;
+        Self::from_stream(stream, server_public_key, config)
+    }
+
     /// Connect with an explicit public key (`None` for plain mode) and config.
     pub fn connect(
         path: impl AsRef<Path>,
@@ -102,6 +127,14 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Self> {
         let stream = UnixStream::connect(path.as_ref())?;
+        Self::from_stream(stream, server_public_key, config)
+    }
+
+    fn from_stream(
+        stream: UnixStream,
+        server_public_key: Option<Vec<u8>>,
+        config: ClientConfig,
+    ) -> Result<Self> {
         if let Some(timeout) = config.read_timeout {
             stream.set_read_timeout(Some(timeout))?;
         }

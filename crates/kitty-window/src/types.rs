@@ -331,6 +331,44 @@ pub enum WindowEvent {
         target: String,
         succeeded: bool,
     },
+    /// Updated input-method pre-edit text. `cursor` is a character range into
+    /// `text`; the start and end are equal for a simple caret.
+    Preedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// Text committed by an input method.
+    Commit {
+        text: String,
+    },
+    /// The input method asked the application to delete text around the
+    /// cursor. Lengths are in UTF-8 bytes, before and after the cursor.
+    DeleteSurrounding {
+        before: u32,
+        after: u32,
+    },
+    /// A drag entered the window. `targets` lists the offered MIME types.
+    DragEnter {
+        x: f64,
+        y: f64,
+        targets: Vec<String>,
+    },
+    /// A drag moved inside the window.
+    DragMotion {
+        x: f64,
+        y: f64,
+        targets: Vec<String>,
+    },
+    /// A drag was dropped on the window.
+    DragDrop {
+        x: f64,
+        y: f64,
+        paths: Vec<String>,
+        text: Option<String>,
+        target: Option<String>,
+    },
+    /// A drag left the window without being dropped.
+    DragLeave,
     /// The event pump was woken through its wakeup pipe.
     Wakeup,
 }

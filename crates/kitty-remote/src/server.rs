@@ -32,7 +32,7 @@ use crate::protocol::{CryptoState, SealedMessage};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -229,6 +229,31 @@ impl RemoteServer {
         if let Some(mode) = config.socket_mode {
             fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
         }
+        Ok(Self {
+            listener,
+            path,
+            key,
+            handler,
+            config: Arc::new(config),
+            registry: Arc::new(Registry::default()),
+        })
+    }
+
+    /// Bind an abstract-namespace Unix socket (Linux `unix:@name`).
+    ///
+    /// This is a small convenience wrapper over [`UnixListener::bind_addr`];
+    /// the caller constructs the [`SocketAddr`] with
+    /// `std::os::linux::net::SocketAddrExt::from_abstract_name`.
+    pub fn bind_addr(
+        addr: &SocketAddr,
+        handler: Arc<dyn RemoteHandler>,
+        config: ServerConfig,
+    ) -> Result<Self> {
+        let key = ServerKey::generate()?;
+        let listener = UnixListener::bind_addr(addr)?;
+        listener.set_nonblocking(true)?;
+        // Abstract sockets have no filesystem path to unlink on shutdown.
+        let path = PathBuf::new();
         Ok(Self {
             listener,
             path,

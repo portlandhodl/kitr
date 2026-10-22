@@ -252,6 +252,16 @@ impl Tab {
         self.layouts.apply(&mut self.windows);
     }
 
+    /// Restore serialized layout state (including other layouts) for this tab.
+    ///
+    /// This convenience borrows both the layout manager and window list
+    /// internally, which callers cannot do through the individual `_mut`
+    /// accessors.
+    pub fn unserialize_layout_state_from_session(&mut self, state: &crate::value::Value) -> bool {
+        self.layouts
+            .unserialize_layout_state_from_session(state, &mut self.windows)
+    }
+
     pub fn active_window(&self) -> Option<&Window> {
         self.windows.active_window()
     }

@@ -1,49 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! X11 + EGL GUI frontend.
+//! X11 + EGL GUI frontend with tabs, kitty-ui layouts and remote control.
 //!
-//! The window, EGL surface, fonts and input layers live in their own crates;
-//! this module owns the event loop that ties them to the terminal screen and
-//! the child PTY. Rendering uses `kitty-render`'s GL backend through a
-//! caller-provided current EGL surface (see `GlBackend::with_loader`).
-//!
-//! DPI handling is deliberately coarse: the X11 backend exposes the `Xft.dpi`
-//! scale factor, and the configured font size is multiplied by it when the
-//! faces are loaded. Window pixels and cell metrics are therefore already
-//! scaled; there is no separate per-monitor fractional scaling or text
-//! re-layout beyond that.
+//! One native window owns a [`kitty_ui::TabManager`]. Each tab contains one or
+//! more PTY panes; layouts allocate pane rectangles in cell coordinates and
+//! the renderer draws every pane with its own `RenderConfig` origin/viewport.
+//! The tab bar is a one-row [`Screen`] rendered through the same font atlas.
 
 mod colors;
 mod fonts;
 mod input;
+mod pane;
+mod remote;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colors::ConfigColorResolver;
 use fonts::{FontRasterizer, FontSet};
-use input::{key_event, mouse_button, mouse_modifiers, send_mouse, ModeTracker};
-use kitty_input::mouse::MouseAction;
-use kitty_input::InputContext;
+use input::{key_event, mouse_button, mouse_modifiers, send_mouse};
+use pane::{Pane, SpawnSpec};
 
 use kitty_config::{Config, CursorShape as ConfigCursorShape};
 use kitty_fonts::RasterCache;
-use kitty_os::child::{ExitStatus, SpawnConfig};
-use kitty_os::pty::WindowSize;
-use kitty_os::{loop_utils, ChildProcess};
-use kitty_render::{
-    AtlasConfig, CellMetrics, GlBackend, GlBackendConfig, GlFns, RenderConfig, RendererCore,
+use kitty_input::mouse::MouseAction;
+use kitty_input::{InputContext, KeyAction, KeyEvent, KeyMap, MappingResult, Modifiers};
+use kitty_os::child::ExitStatus;
+use kitty_remote::{
+    color_as_u32, CommandError, CommandResult, GetTextRequest, ScreenshotFormat, ScreenshotImage,
+    SendTextData, ServerConfig, TextExtent, Value as RemoteValue,
 };
-use kitty_screen::{CursorShape, Modes, Parser, Screen, ScreenHandler};
+use kitty_render::{
+    AtlasConfig, CellMetrics, ColorResolver, GlBackend, GlBackendConfig, GlFns, LineRange,
+    RenderConfig, RendererCore, Rgba8,
+};
+use kitty_screen::{CursorShape, Modes, Screen};
+use kitty_ui::{
+    parse_sessions, AddWindowOptions, Edge, LayoutAddOptions, LayoutConfig, Region, RestorePlan,
+    SessionOptions, TabId, TabManager, Window, WindowId, WindowLocation,
+};
 use kitty_window::{Selection as WindowSelection, WindowConfig, WindowEvent, X11Window};
 
-use crate::{inherited_env, resolve_command, Input, Options, RunOutcome};
+use crate::{resolve_command, Input, Options, RunOutcome};
+use remote::{encode_png, encode_ppm, encode_screenshot, RemoteBridge, RemoteJob};
 
 const CELL_FALLBACK_WIDTH: u32 = 8;
 const CELL_FALLBACK_HEIGHT: u32 = 16;
-const MAX_PENDING_INPUT: usize = 4 * 1024 * 1024;
 const IDLE_POLL: Duration = Duration::from_millis(50);
+const REMOTE_POLL: Duration = Duration::from_millis(5);
 const SCREENSHOT_SETTLE: Duration = Duration::from_millis(150);
 
 fn io_err(message: impl Into<String>) -> io::Error {
@@ -60,15 +68,63 @@ fn config_cursor(shape: ConfigCursorShape) -> CursorShape {
     }
 }
 
+fn layout_base(name: &str) -> &str {
+    name.split_once(':').map(|(base, _)| base).unwrap_or(name)
+}
+
+/// Enabled layouts for a new tab. When `splits` is enabled it is made the
+/// current layout so Ctrl+Shift+Enter has explicit horizontal/vertical split
+/// semantics; otherwise the configured order is used unchanged.
+fn effective_layouts(config: &kitty_config::Options) -> Vec<String> {
+    let mut layouts = config.enabled_layouts.clone();
+    if layouts.is_empty() {
+        layouts.push("splits".into());
+    }
+    if let Some(index) = layouts
+        .iter()
+        .position(|name| layout_base(name) == "splits")
+    {
+        let splits = layouts.remove(index);
+        layouts.insert(0, splits);
+    }
+    layouts
+}
+
+fn pack_sgr(color: Rgba8) -> u32 {
+    ((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | 2
+}
+
+fn force_full_rows(frame: &mut kitty_render::Frame, lines: u32) {
+    frame.damage.full_redraw = false;
+    frame.damage.full_redraw_reason = None;
+    frame.damage.lines.clear();
+    frame
+        .damage
+        .lines
+        .push(LineRange::new(0, lines.max(1) as usize));
+    frame.damage.cursor_moved = true;
+}
+
+fn draw_frame(
+    backend: &mut Option<GlBackend>,
+    renderer: &RendererCore,
+    frame: &kitty_render::Frame,
+    config: &RenderConfig,
+) -> io::Result<()> {
+    backend
+        .as_mut()
+        .ok_or_else(|| io_err("OpenGL backend is shut down"))?
+        .render_with_atlas(frame, config, &renderer.atlas)
+        .map(|_| ())
+        .map_err(|error| io_err(error.to_string()))
+}
+
 /// A live GUI terminal session.
 ///
-/// This type is public so integration tests can drive individual frames,
-/// inject synthetic window events, resize the native window and capture the
-/// framebuffer. The `kitr` binary uses [`run_gui`] instead.
+/// The public methods operate on the active tab and active pane. Tests use
+/// them to inject synthetic events, switch tabs, capture the framebuffer and
+/// inspect the active screen.
 pub struct GuiSession {
-    // Keep the GL backend before the surface/window so callers that forget to
-    // call `shutdown` still tear down GL resources first. `backend` is an
-    // Option so `shutdown` can drop it while the context is current.
     backend: Option<GlBackend>,
     surface: kitty_window::EglWindowSurface,
     window: X11Window,
@@ -76,27 +132,37 @@ pub struct GuiSession {
     fonts: FontSet,
     raster_cache: RasterCache,
     resolver: ConfigColorResolver,
-    parser: Parser,
-    handler: ScreenHandler,
-    tracker: ModeTracker,
-    child: ChildProcess,
-    write_queue: VecDeque<u8>,
-    read_buffer: Vec<u8>,
+    config_options: kitty_config::Options,
+
+    tab_manager: TabManager,
+    panes: HashMap<WindowId, Pane>,
+    next_window_id: WindowId,
+
     padding: (f32, f32, f32, f32),
     metrics: CellMetrics,
     pixel_size: (u32, u32),
     columns: u32,
     rows: u32,
+    tab_bar_px: f32,
+    tab_ranges: Vec<(usize, u32, u32)>,
+
+    keymap: KeyMap,
+    scrollback: u32,
+    listen_env: Option<String>,
+    remote_rx: Option<Receiver<RemoteJob>>,
+    remote_server: Option<kitty_remote::ServerHandle>,
+
     need_redraw: bool,
     frame_count: u64,
     output_bytes: u64,
-    pty_eof: bool,
-    exit_status: Option<ExitStatus>,
-    exited_at: Option<Instant>,
-    timed_out: bool,
     should_close: bool,
     mouse_down: bool,
     last_title: Option<String>,
+    timed_out: bool,
+    exit_status: Option<ExitStatus>,
+    final_errors: Vec<String>,
+    final_screen: Option<Screen>,
+    fallback_screen: Screen,
 }
 
 impl GuiSession {
@@ -122,7 +188,7 @@ impl GuiSession {
         let title = options.title.clone().unwrap_or_else(|| "kitr".to_string());
         let requested = options.size.unwrap_or((80, 24));
         let provisional_width = requested.0 as u32 * CELL_FALLBACK_WIDTH;
-        let provisional_height = requested.1 as u32 * CELL_FALLBACK_HEIGHT;
+        let provisional_height = (requested.1 as u32 + 1) * CELL_FALLBACK_HEIGHT;
 
         let mut window = X11Window::open(
             &WindowConfig::new(
@@ -148,7 +214,7 @@ impl GuiSession {
         );
         let (columns, rows) = requested;
         let pixel_width = columns as u32 * cell_w + (padding.0 + padding.2).max(0.0) as u32;
-        let pixel_height = rows as u32 * cell_h + (padding.1 + padding.3).max(0.0) as u32;
+        let pixel_height = (rows as u32 + 1) * cell_h + (padding.1 + padding.3).max(0.0) as u32;
         window.set_size(pixel_width.max(1), pixel_height.max(1));
         window.set_size_limits(cell_w, cell_h, None, None);
 
@@ -175,11 +241,6 @@ impl GuiSession {
             cfg.scrollback_lines.min(u32::MAX as u64) as u32
         }
         .max(1);
-        let mut screen = Screen::builder(columns as u32, rows as u32)
-            .scrollback(scrollback)
-            .build()
-            .map_err(|error| io_err(error.to_string()))?;
-        screen.cursor.shape = config_cursor(cfg.cursor_shape);
 
         let render_config = RenderConfig {
             metrics,
@@ -196,25 +257,14 @@ impl GuiSession {
         let renderer = RendererCore::new(render_config, AtlasConfig::default());
         let resolver = ConfigColorResolver::new(&cfg);
 
-        let command = resolve_command(options);
-        let mut spawn = SpawnConfig::new(command[0].clone());
-        spawn.argv = command;
-        spawn.env = inherited_env();
-        spawn.initial_window_size = Some(WindowSize::new(rows, columns));
-        spawn.stdin_pipe = false;
-        let mut child = kitty_os::spawn(&spawn)?;
-        // The child calls setsid() before exec. Wait for that (and for exec
-        // failure reporting) so signal_group() can never target our own group
-        // if shutdown happens immediately after opening.
-        let _ = child.wait_for_exec(Some(Duration::from_secs(2)));
-        loop_utils::set_nonblocking(child.master_fd(), true)?;
+        let keymap = build_keymap(&cfg);
 
-        let mut write_queue = VecDeque::new();
-        if let Input::Bytes(bytes) = &input {
-            write_queue.extend(bytes);
-        }
+        let (remote_rx, remote_server, listen_env) = start_remote(options.listen_on.as_deref())?;
 
-        Ok(Self {
+        let fallback = Screen::builder(1, 1)
+            .build()
+            .map_err(|error| io_err(error.to_string()))?;
+        let mut session = Self {
             backend: Some(backend),
             surface,
             window,
@@ -222,32 +272,492 @@ impl GuiSession {
             fonts,
             raster_cache: RasterCache::new(),
             resolver,
-            parser: Parser::new(),
-            handler: ScreenHandler::new(screen),
-            tracker: ModeTracker::new(),
-            child,
-            write_queue,
-            read_buffer: vec![0u8; 64 * 1024],
+            config_options: cfg.clone(),
+            tab_manager: TabManager::new(1),
+            panes: HashMap::new(),
+            next_window_id: 1,
             padding,
             metrics,
             pixel_size: (surface_width, surface_height),
             columns: columns as u32,
             rows: rows as u32,
+            tab_bar_px: cell_h as f32,
+            tab_ranges: Vec::new(),
+            keymap,
+            scrollback,
+            listen_env,
+            remote_rx,
+            remote_server,
             need_redraw: true,
             frame_count: 0,
             output_bytes: 0,
-            pty_eof: false,
-            exit_status: None,
-            exited_at: None,
-            timed_out: false,
             should_close: false,
             mouse_down: false,
             last_title: Some(title),
-        })
+            timed_out: false,
+            exit_status: None,
+            final_errors: Vec::new(),
+            final_screen: None,
+            fallback_screen: fallback,
+        };
+
+        let plan = load_session_plan(options, &cfg)?;
+        session.initialize(options, input, plan)?;
+        session.relayout_all();
+        session.update_window_title();
+        Ok(session)
+    }
+
+    fn initialize(
+        &mut self,
+        options: &Options,
+        input: Input,
+        plan: Option<RestorePlan>,
+    ) -> io::Result<()> {
+        if let Some(plan) = plan {
+            self.restore_plan(plan)?;
+        } else {
+            let layouts = effective_layouts(&self.config_options);
+            let layout = layouts[0].clone();
+            let tab_id = self
+                .tab_manager
+                .add_tab("", None, &layouts, self.layout_config())
+                .map_err(io_err)?;
+            let idx = self
+                .tab_manager
+                .tabs()
+                .iter()
+                .position(|tab| tab.id == tab_id)
+                .unwrap_or(0);
+            if let Some(tab) = self.tab_manager.tab_mut(idx) {
+                let _ = tab.set_enabled_layouts(&layouts);
+                if let Err(error) = tab.set_layout(&layout) {
+                    eprintln!("kitr: layout: {error}");
+                }
+            }
+            let spec = self.spawn_spec_from_options(options);
+            self.add_pane_at(idx, spec, LayoutAddOptions::default())?;
+            if let Input::Bytes(bytes) = &input {
+                if let Some(pane) = self.active_pane_mut() {
+                    pane.write(bytes);
+                }
+            }
+        }
+        self.need_redraw = true;
+        Ok(())
+    }
+
+    fn restore_plan(&mut self, plan: RestorePlan) -> io::Result<()> {
+        let Some(os_window) = plan.os_windows.first().cloned() else {
+            return Err(io_err("session defines no OS windows"));
+        };
+        if plan.os_windows.len() > 1 {
+            eprintln!(
+                "kitr: session defines {} OS windows; this build opens the first one and ignores the rest",
+                plan.os_windows.len()
+            );
+        }
+        let tabs = os_window.tabs.clone();
+        for tab_restore in &tabs {
+            let mut layouts = tab_restore.enabled_layouts.clone();
+            if layouts.is_empty() {
+                layouts = effective_layouts(&self.config_options);
+            }
+            let tab_id = self
+                .tab_manager
+                .add_tab(
+                    tab_restore.name.clone(),
+                    tab_restore.cwd.clone(),
+                    &layouts,
+                    self.layout_config(),
+                )
+                .map_err(|error| io_err(format!("session: {error}")))?;
+            let tab_idx = self
+                .tab_manager
+                .tabs()
+                .iter()
+                .position(|tab| tab.id == tab_id)
+                .unwrap_or(0);
+            let mut restored_windows = Vec::new();
+            for window_spec in &tab_restore.windows {
+                let wid = self.alloc_window_id();
+                let title = window_spec
+                    .title
+                    .clone()
+                    .or_else(|| window_spec.launch.title.clone())
+                    .unwrap_or_default();
+                let mut window = Window::new(wid, title);
+                window.serialized_id = if window_spec.serialized_id != 0 {
+                    window_spec.serialized_id
+                } else {
+                    wid
+                };
+                window.cwd = window_spec.cwd.clone();
+                window.launch = window_spec.launch.clone();
+                restored_windows.push(window);
+            }
+            {
+                let tab = self.tab_manager.tab_mut(tab_idx).expect("new tab");
+                if let Err(error) = tab.set_enabled_layouts(&layouts) {
+                    eprintln!("kitr: session: {error}");
+                }
+                if let Err(error) = tab.set_layout(&tab_restore.layout) {
+                    eprintln!("kitr: session: {error}");
+                }
+                for window in restored_windows {
+                    tab.add_window_raw(
+                        window,
+                        AddWindowOptions {
+                            make_active: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+                if let Some(state) = &tab_restore.layout_state {
+                    if !tab.unserialize_layout_state_from_session(state) {
+                        eprintln!(
+                            "kitr: session: could not restore layout state for tab {:?}",
+                            tab_restore.name
+                        );
+                    }
+                }
+                tab.apply_layout();
+                let ids = tab.windows().all_window_ids().to_vec();
+                let mut focus_id = ids.get(tab_restore.active_window_idx).copied();
+                for (index, spec) in tab_restore.windows.iter().enumerate() {
+                    let Some(needle) = spec.focus_matching_window.as_deref() else {
+                        continue;
+                    };
+                    let matches = ids
+                        .get(index)
+                        .and_then(|wid| tab.windows().window(*wid))
+                        .map(|window| window.effective_title().contains(needle))
+                        .unwrap_or(false);
+                    if matches {
+                        focus_id = ids.get(index).copied();
+                    }
+                }
+                if let Some(wid) = focus_id {
+                    tab.set_active_window(wid);
+                }
+            }
+            let ids = self
+                .tab_manager
+                .tab(tab_idx)
+                .map(|tab| tab.windows().all_window_ids().to_vec())
+                .unwrap_or_default();
+            for (index, wid) in ids.iter().copied().enumerate() {
+                let Some(window_spec) = tab_restore.windows.get(index) else {
+                    continue;
+                };
+                let (pane_columns, pane_rows) = self
+                    .pane_geometry(tab_idx, wid)
+                    .map(|(columns, rows, _, _)| (columns, rows))
+                    .unwrap_or((self.columns, self.rows));
+                let spec = self.spawn_spec_from_restore(window_spec, wid);
+                let pane = Pane::spawn(
+                    &spec,
+                    pane_columns,
+                    pane_rows,
+                    self.scrollback,
+                    config_cursor(self.config_options.cursor_shape),
+                )?;
+                self.panes.insert(wid, pane);
+            }
+        }
+        let mut active = os_window
+            .active_tab_idx
+            .min(self.tab_manager.tabs().len().saturating_sub(1));
+        if let Some(spec) = os_window.focus_tab_spec.as_deref() {
+            let needle = spec.strip_prefix("title:").unwrap_or(spec);
+            if let Some(index) = self
+                .tab_manager
+                .tabs()
+                .iter()
+                .position(|tab| tab.effective_title().contains(needle))
+            {
+                active = index;
+            }
+        }
+        self.tab_manager.set_active_tab_idx(active);
+        Ok(())
+    }
+
+    fn alloc_window_id(&mut self) -> WindowId {
+        let id = self.next_window_id;
+        self.next_window_id += 1;
+        id
+    }
+
+    fn layout_config(&self) -> LayoutConfig {
+        LayoutConfig {
+            central: Region::new(0, 0, self.columns.max(1) as i32, self.rows.max(1) as i32),
+            cell_width: 1,
+            cell_height: 1,
+            draw_minimal_borders: false,
+            alignment_x: 0,
+            alignment_y: 0,
+        }
+    }
+
+    fn spawn_spec_from_options(&self, options: &Options) -> SpawnSpec {
+        SpawnSpec {
+            argv: resolve_command(options),
+            cwd: None,
+            env: self.base_env(None),
+            title: options.title.clone(),
+        }
+    }
+
+    fn spawn_spec_from_restore(
+        &self,
+        window: &kitty_ui::WindowRestore,
+        wid: WindowId,
+    ) -> SpawnSpec {
+        let mut argv: Vec<OsString> = window.launch.args.iter().map(OsString::from).collect();
+        if argv.is_empty() {
+            argv = vec![self.default_shell()];
+        }
+        let mut env = self.base_env(Some(wid));
+        for (key, value) in &window.launch.env {
+            env.push((OsString::from(key), OsString::from(value)));
+        }
+        for (key, value) in &window.launch.vars {
+            env.push((
+                OsString::from(format!("KITTY_VAR_{key}")),
+                OsString::from(value),
+            ));
+        }
+        SpawnSpec {
+            argv,
+            cwd: window.cwd.clone(),
+            env,
+            title: window.title.clone().or_else(|| window.launch.title.clone()),
+        }
+    }
+
+    fn default_shell(&self) -> OsString {
+        let shell = self.config_options.shell.as_str();
+        if shell.is_empty() || shell == "." {
+            crate::default_shell()
+        } else {
+            OsString::from(shell)
+        }
+    }
+
+    fn base_env(&self, window_id: Option<WindowId>) -> Vec<(OsString, OsString)> {
+        let mut env: Vec<(OsString, OsString)> = self
+            .config_options
+            .env
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect();
+        if let Some(wid) = window_id {
+            env.push((
+                OsString::from("KITTY_WINDOW_ID"),
+                OsString::from(wid.to_string()),
+            ));
+        }
+        if let Some(address) = &self.listen_env {
+            env.push((OsString::from("KITTY_LISTEN_ON"), OsString::from(address)));
+        }
+        env
+    }
+
+    fn new_tab_spec(&self) -> SpawnSpec {
+        SpawnSpec {
+            argv: vec![self.default_shell()],
+            cwd: None,
+            env: self.base_env(None),
+            title: None,
+        }
+    }
+
+    fn add_pane_at(
+        &mut self,
+        tab_idx: usize,
+        spec: SpawnSpec,
+        opts: LayoutAddOptions,
+    ) -> io::Result<WindowId> {
+        let wid = self.alloc_window_id();
+        let title = spec.title.clone().unwrap_or_default();
+        let window = Window::new(wid, title);
+        let tab = self
+            .tab_manager
+            .tab_mut(tab_idx)
+            .ok_or_else(|| io_err("invalid tab index"))?;
+        tab.add_window(window, &opts);
+        tab.apply_layout();
+        let (columns, rows) = self
+            .pane_geometry(tab_idx, wid)
+            .map(|(columns, rows, _, _)| (columns, rows))
+            .unwrap_or((self.columns, self.rows));
+        let spec = SpawnSpec {
+            env: spec
+                .env
+                .into_iter()
+                .chain(self.base_env(Some(wid)))
+                .collect(),
+            ..spec
+        };
+        match Pane::spawn(
+            &spec,
+            columns,
+            rows,
+            self.scrollback,
+            config_cursor(self.config_options.cursor_shape),
+        ) {
+            Ok(pane) => {
+                self.panes.insert(wid, pane);
+                // A split changes the geometry of the existing panes too.
+                self.relayout_all();
+                self.need_redraw = true;
+                Ok(wid)
+            }
+            Err(error) => {
+                if let Some(tab) = self.tab_manager.tab_mut(tab_idx) {
+                    tab.close_window(wid);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn new_tab(&mut self) -> io::Result<()> {
+        let layouts = effective_layouts(&self.config_options);
+        let layout = layouts[0].clone();
+        let tab_id = self
+            .tab_manager
+            .add_tab("", None, &layouts, self.layout_config())
+            .map_err(io_err)?;
+        let idx = self
+            .tab_manager
+            .tabs()
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .unwrap_or(0);
+        if let Some(tab) = self.tab_manager.tab_mut(idx) {
+            let _ = tab.set_enabled_layouts(&layouts);
+            let _ = tab.set_layout(&layout);
+        }
+        let spec = self.new_tab_spec();
+        self.add_pane_at(idx, spec, LayoutAddOptions::default())?;
+        self.need_redraw = true;
+        self.update_window_title();
+        Ok(())
+    }
+
+    fn close_tab_at(&mut self, idx: usize) -> bool {
+        let Some(tab) = self.tab_manager.tab(idx) else {
+            return false;
+        };
+        let ids = tab.windows().all_window_ids().to_vec();
+        for wid in ids {
+            if let Some(mut pane) = self.panes.remove(&wid) {
+                pane.terminate();
+            }
+        }
+        if self.tab_manager.tabs().len() > 1 {
+            self.tab_manager.close_tab(idx);
+        } else {
+            self.should_close = true;
+        }
+        self.need_redraw = true;
+        self.update_window_title();
+        true
+    }
+
+    fn close_window_id(&mut self, wid: WindowId) -> bool {
+        let Some(tab_idx) = self.tab_index_for_window(wid) else {
+            return false;
+        };
+        let single = self
+            .tab_manager
+            .tab(tab_idx)
+            .map(|tab| tab.windows().len() <= 1)
+            .unwrap_or(true);
+        if single {
+            return self.close_tab_at(tab_idx);
+        }
+        if let Some(mut pane) = self.panes.remove(&wid) {
+            pane.terminate();
+        }
+        if let Some(tab) = self.tab_manager.tab_mut(tab_idx) {
+            tab.close_window(wid);
+        }
+        self.relayout_all();
+        self.need_redraw = true;
+        true
+    }
+
+    fn tab_index_for_window(&self, wid: WindowId) -> Option<usize> {
+        self.tab_manager
+            .tabs()
+            .iter()
+            .position(|tab| tab.windows().window(wid).is_some())
+    }
+
+    fn relayout_all(&mut self) {
+        let config = self.layout_config();
+        let count = self.tab_manager.tabs().len();
+        for tab_idx in 0..count {
+            let ids = {
+                let Some(tab) = self.tab_manager.tab_mut(tab_idx) else {
+                    continue;
+                };
+                tab.layouts_mut().set_config(config);
+                tab.apply_layout();
+                tab.windows().all_window_ids().to_vec()
+            };
+            for wid in ids {
+                let Some((columns, rows, _, _)) = self.pane_geometry(tab_idx, wid) else {
+                    continue;
+                };
+                if let Some(pane) = self.panes.get_mut(&wid) {
+                    if pane.resize(columns, rows) {
+                        self.need_redraw = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn pane_geometry(&self, tab_idx: usize, wid: WindowId) -> Option<(u32, u32, i32, i32)> {
+        let window = self.tab_manager.tab(tab_idx)?.windows().window(wid)?;
+        let geometry = window.geometry;
+        let left = geometry.left.max(0);
+        let top = geometry.top.max(0);
+        let columns = (geometry.right - geometry.left).max(1) as u32;
+        let rows = (geometry.bottom - geometry.top).max(1) as u32;
+        Some((columns, rows, left, top))
+    }
+
+    fn pane_origin(&self, tab_idx: usize, wid: WindowId) -> Option<(f32, f32)> {
+        let (_, _, left, top) = self.pane_geometry(tab_idx, wid)?;
+        Some((
+            self.padding.0 + left as f32 * self.metrics.cell_width,
+            self.tab_bar_px + self.padding.1 + top as f32 * self.metrics.cell_height,
+        ))
+    }
+
+    fn active_pane(&self) -> Option<&Pane> {
+        let wid = self.tab_manager.active_window_id()?;
+        self.panes.get(&wid)
+    }
+
+    fn active_pane_mut(&mut self) -> Option<&mut Pane> {
+        let wid = self.tab_manager.active_window_id()?;
+        self.panes.get_mut(&wid)
     }
 
     pub fn screen(&self) -> &Screen {
-        &self.handler.screen
+        if let Some(pane) = self.active_pane() {
+            return pane.screen();
+        }
+        if let Some(screen) = &self.final_screen {
+            return screen;
+        }
+        &self.fallback_screen
     }
 
     pub fn frame_count(&self) -> u64 {
@@ -259,11 +769,82 @@ impl GuiSession {
     }
 
     pub fn child_pid(&self) -> i32 {
-        self.child.pid()
+        self.active_pane().map(|pane| pane.child.pid()).unwrap_or(0)
     }
 
     pub fn window_size(&self) -> (u32, u32) {
         self.pixel_size
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tab_manager.tabs().len()
+    }
+
+    pub fn active_tab_index(&self) -> usize {
+        self.tab_manager.active_tab_idx()
+    }
+
+    pub fn active_tab_id(&self) -> Option<TabId> {
+        self.tab_manager.active_tab().map(|tab| tab.id)
+    }
+
+    pub fn tab_titles(&self) -> Vec<String> {
+        self.tab_manager
+            .tabs()
+            .iter()
+            .map(|tab| tab.effective_title())
+            .collect()
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.panes.len()
+    }
+
+    pub fn active_window_id(&self) -> Option<WindowId> {
+        self.tab_manager.active_window_id()
+    }
+
+    pub fn pane_rect(&self, wid: WindowId) -> Option<(u32, u32, u32, u32)> {
+        let tab_idx = self.tab_index_for_window(wid)?;
+        let (columns, rows, left, top) = self.pane_geometry(tab_idx, wid)?;
+        Some((left as u32, top as u32, columns, rows))
+    }
+
+    pub fn select_tab(&mut self, idx: usize) -> bool {
+        let changed = self.tab_manager.set_active_tab_idx(idx);
+        if changed {
+            self.need_redraw = true;
+            self.update_window_title();
+        }
+        changed
+    }
+
+    pub fn new_tab_for_test(&mut self, command: &[&str]) -> io::Result<()> {
+        let layouts = effective_layouts(&self.config_options);
+        let layout = layouts[0].clone();
+        let tab_id = self
+            .tab_manager
+            .add_tab("", None, &layouts, self.layout_config())
+            .map_err(io_err)?;
+        let idx = self
+            .tab_manager
+            .tabs()
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .unwrap_or(0);
+        if let Some(tab) = self.tab_manager.tab_mut(idx) {
+            let _ = tab.set_layout(&layout);
+        }
+        let spec = SpawnSpec {
+            argv: command.iter().map(OsString::from).collect(),
+            cwd: None,
+            env: self.base_env(None),
+            title: None,
+        };
+        self.add_pane_at(idx, spec, LayoutAddOptions::default())?;
+        self.need_redraw = true;
+        self.update_window_title();
+        Ok(())
     }
 
     pub fn inject_event(&mut self, event: &WindowEvent) -> io::Result<()> {
@@ -277,32 +858,32 @@ impl GuiSession {
     }
 
     pub fn write_child(&mut self, bytes: &[u8]) {
-        if self.write_queue.len() + bytes.len() <= MAX_PENDING_INPUT {
-            self.write_queue.extend(bytes);
+        if let Some(pane) = self.active_pane_mut() {
+            pane.write(bytes);
         }
     }
 
     /// Process one bounded event-loop iteration. Returns false when the
-    /// session has stopped (child exit, close request or timeout).
+    /// session has stopped (all tabs closed, close request or timeout).
     pub fn step(&mut self, timeout: Duration) -> io::Result<bool> {
-        self.read_child()?;
-        self.flush_child()?;
-        self.check_child()?;
+        self.read_all()?;
+        self.flush_all()?;
+        self.check_children()?;
+        self.process_remote_jobs()?;
 
-        if self.should_close || (self.exit_status.is_some() && self.pty_eof) {
+        if self.should_close {
             return Ok(false);
-        }
-        if let Some(at) = self.exited_at {
-            if at.elapsed() >= Duration::from_millis(200) {
-                self.pty_eof = true;
-                return Ok(false);
-            }
         }
 
         let timeout_ms = if self.need_redraw {
             0
         } else {
-            timeout.as_millis().min(i32::MAX as u128) as i32
+            let limit = if self.remote_rx.is_some() {
+                timeout.min(REMOTE_POLL)
+            } else {
+                timeout
+            };
+            limit.as_millis().min(i32::MAX as u128) as i32
         };
         let events = self.window.poll_events(timeout_ms.max(0));
         for event in events {
@@ -311,9 +892,10 @@ impl GuiSession {
         if self.should_close {
             return Ok(false);
         }
-        self.read_child()?;
-        self.flush_child()?;
-        self.check_child()?;
+        self.read_all()?;
+        self.flush_all()?;
+        self.check_children()?;
+        self.process_remote_jobs()?;
 
         if self.need_redraw {
             self.render()?;
@@ -356,9 +938,7 @@ impl GuiSession {
         write_ppm(path, width, height, &pixels)
     }
 
-    /// Run until the child exits, the window closes or `timeout` elapses.
-    /// When `screenshot` is set, capture the framebuffer after the first
-    /// child output has had time to settle and exit.
+    /// Run until the session stops or `timeout` elapses.
     pub fn run(
         mut self,
         timeout: Option<Duration>,
@@ -409,57 +989,47 @@ impl GuiSession {
         }
         self.shutdown();
         if screenshot.is_some() && !self.timed_out {
-            // A screenshot run intentionally stops a still-running child, so
-            // report success rather than the SIGTERM exit status.
             self.exit_status = Some(ExitStatus::Exited(0));
         }
         Ok(self.into_outcome())
     }
 
-    /// Terminate the child, drain the PTY and release GPU resources.
+    /// Terminate all children, stop the remote server and release GPU state.
     pub fn shutdown(&mut self) {
+        if let Some(wid) = self.tab_manager.active_window_id() {
+            if let Some(pane) = self.panes.get_mut(&wid) {
+                let placeholder = Screen::builder(1, 1).build().expect("1x1 screen");
+                self.final_screen = Some(std::mem::replace(&mut pane.handler.screen, placeholder));
+            }
+        }
+        let active = self.tab_manager.active_window_id();
+        let mut any_status = None;
+        for (wid, mut pane) in self.panes.drain() {
+            pane.terminate();
+            if any_status.is_none() {
+                any_status = pane.exit_status;
+            }
+            if Some(wid) == active {
+                self.exit_status = pane.exit_status;
+            }
+        }
         if self.exit_status.is_none() {
-            let _ = self.child.signal_group(15);
-            let start = Instant::now();
-            while self.exit_status.is_none() && start.elapsed() < Duration::from_millis(300) {
-                let _ = self.read_child();
-                let _ = self.flush_child();
-                let _ = self.check_child();
-                if self.exit_status.is_none() {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-            if self.exit_status.is_none() {
-                let _ = self.child.signal_group(9);
-                let start = Instant::now();
-                while self.exit_status.is_none() && start.elapsed() < Duration::from_secs(2) {
-                    let _ = self.check_child();
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+            self.exit_status = any_status;
         }
-        for _ in 0..20 {
-            let _ = self.read_child();
-            if self.pty_eof {
-                break;
-            }
-            let _ = self.flush_child();
-            std::thread::sleep(Duration::from_millis(5));
+        if let Some(mut server) = self.remote_server.take() {
+            server.shutdown();
         }
-        if let Some(status) = self.exit_status {
-            self.exit_status = Some(status);
-        } else {
-            self.exit_status = self.child.try_wait().ok().flatten();
-        }
-        // Drop GL objects while the EGL context is still current.
         let _ = self.surface.make_current();
         let _ = self.backend.take();
     }
 
     fn into_outcome(mut self) -> RunOutcome {
-        let errors = std::mem::take(&mut self.handler.errors);
+        let errors = self.final_errors;
         let placeholder = Screen::builder(1, 1).build().expect("1x1 screen");
-        let screen = std::mem::replace(&mut self.handler.screen, placeholder);
+        let screen = self
+            .final_screen
+            .take()
+            .unwrap_or_else(|| std::mem::replace(&mut self.fallback_screen, placeholder));
         RunOutcome {
             exit: self.exit_status.unwrap_or(ExitStatus::Unknown(-1)),
             timed_out: self.timed_out,
@@ -471,62 +1041,62 @@ impl GuiSession {
 
     // {{{ PTY I/O
 
-    fn read_child(&mut self) -> io::Result<()> {
-        if self.pty_eof {
-            return Ok(());
-        }
-        let mut chunks = 0usize;
-        while chunks < 16 {
-            chunks += 1;
-            match loop_utils::read_once(self.child.master_fd(), &mut self.read_buffer)? {
-                loop_utils::IoOutcome::Completed(0) => {
-                    self.pty_eof = true;
-                    break;
+    fn read_all(&mut self) -> io::Result<()> {
+        let mut had_output = false;
+        let mut titles = Vec::new();
+        for (wid, pane) in self.panes.iter_mut() {
+            let count = pane.read()?;
+            if count > 0 {
+                had_output = true;
+                self.output_bytes += count as u64;
+            }
+            if let Some(title) = pane.tracker.title.take() {
+                if pane.last_title.as_deref() != Some(title.as_str()) {
+                    pane.last_title = Some(title.clone());
+                    titles.push((*wid, title));
                 }
-                loop_utils::IoOutcome::Completed(n) => {
-                    let chunk = self.read_buffer[..n].to_vec();
-                    self.tracker.feed(&chunk);
-                    self.handler.feed(&mut self.parser, &chunk);
-                    self.output_bytes += n as u64;
-                    self.need_redraw = true;
-                    if let Some(title) = self.tracker.title.take() {
-                        if self.last_title.as_deref() != Some(title.as_str()) {
-                            let _ = self.window.set_title(&title);
-                            self.last_title = Some(title);
-                        }
+            }
+        }
+        if had_output {
+            self.need_redraw = true;
+        }
+        let active = self.tab_manager.active_window_id();
+        let mut active_changed = false;
+        for (wid, title) in titles {
+            if let Some(tab_idx) = self.tab_index_for_window(wid) {
+                if let Some(tab) = self.tab_manager.tab_mut(tab_idx) {
+                    if let Some(window) = tab.windows_mut().window_mut(wid) {
+                        window.title = title;
+                        active_changed |= Some(wid) == active;
                     }
                 }
-                loop_utils::IoOutcome::WouldBlock => break,
-                loop_utils::IoOutcome::Interrupted => continue,
             }
+        }
+        if active_changed {
+            self.update_window_title();
         }
         Ok(())
     }
 
-    fn flush_child(&mut self) -> io::Result<()> {
-        while !self.write_queue.is_empty() {
-            let (front, _) = self.write_queue.as_slices();
-            match loop_utils::write_once(self.child.master_fd(), front)? {
-                loop_utils::IoOutcome::Completed(0) => {
-                    self.write_queue.clear();
-                    break;
-                }
-                loop_utils::IoOutcome::Completed(n) => {
-                    self.write_queue.drain(..n);
-                }
-                loop_utils::IoOutcome::WouldBlock => break,
-                loop_utils::IoOutcome::Interrupted => continue,
-            }
+    fn flush_all(&mut self) -> io::Result<()> {
+        for pane in self.panes.values_mut() {
+            pane.flush()?;
         }
         Ok(())
     }
 
-    fn check_child(&mut self) -> io::Result<()> {
-        if self.exit_status.is_none() {
-            if let Some(status) = self.child.try_wait()? {
-                self.exit_status = Some(status);
-                self.exited_at = Some(Instant::now());
+    fn check_children(&mut self) -> io::Result<()> {
+        let mut closed = Vec::new();
+        for (wid, pane) in self.panes.iter_mut() {
+            pane.check()?;
+            if let Some(at) = pane.exited_at {
+                if at.elapsed() >= Duration::from_millis(200) {
+                    closed.push(*wid);
+                }
             }
+        }
+        for wid in closed {
+            self.close_window_id(wid);
         }
         Ok(())
     }
@@ -541,7 +1111,11 @@ impl GuiSession {
             WindowEvent::Expose { .. } => self.need_redraw = true,
             WindowEvent::Focus { focused } => {
                 self.need_redraw = true;
-                if self.handler.screen.modes.contains(Modes::FOCUS_TRACKING) {
+                if self
+                    .active_pane()
+                    .map(|pane| pane.screen().modes.contains(Modes::FOCUS_TRACKING))
+                    .unwrap_or(false)
+                {
                     self.write_child(if focused { b"\x1b[I" } else { b"\x1b[O" });
                 }
             }
@@ -567,6 +1141,7 @@ impl GuiSession {
             | WindowEvent::Move { .. }
             | WindowEvent::Enter { .. }
             | WindowEvent::SelectionClear { .. } => {}
+            _ => {}
         }
         Ok(())
     }
@@ -579,18 +1154,15 @@ impl GuiSession {
         let cell_w = self.metrics.cell_width.max(1.0);
         let cell_h = self.metrics.cell_height.max(1.0);
         let usable_w = (width as f32 - self.padding.0 - self.padding.2).max(cell_w);
-        let usable_h = (height as f32 - self.padding.1 - self.padding.3).max(cell_h);
+        let usable_h = (height as f32 - self.padding.1 - self.padding.3 - cell_h).max(cell_h);
         let columns = (usable_w / cell_w).floor().max(1.0) as u32;
         let rows = (usable_h / cell_h).floor().max(1.0) as u32;
         self.pixel_size = (width, height);
+        self.tab_bar_px = cell_h;
         if columns != self.columns || rows != self.rows {
             self.columns = columns;
             self.rows = rows;
-            self.handler.screen.resize(rows, columns);
-            let _ = self.child.resize(WindowSize::new(
-                rows.min(u16::MAX as u32) as u16,
-                columns.min(u16::MAX as u32) as u16,
-            ));
+            self.relayout_all();
             self.renderer.invalidate();
             self.need_redraw = true;
         }
@@ -604,49 +1176,238 @@ impl GuiSession {
 
     fn handle_key(&mut self, key: &kitty_window::KeyInput) {
         let event = key_event(key);
-        if matches!(event.action, kitty_input::KeyAction::Release) {
-            // Release events only produce bytes when the kitty protocol asks
-            // for them; the encoder decides. Shortcuts fire on press only.
-        } else if key.modifiers.control && key.modifiers.shift {
-            let base = event.key;
-            if base == b'c' as u32 {
-                self.copy_selection();
-                return;
-            }
-            if base == b'v' as u32 {
-                self.paste_clipboard();
-                return;
-            }
-        }
-        if matches!(event.action, kitty_input::KeyAction::Release) {
-            let ctx = input::input_context(&self.handler.screen, &self.tracker);
-            if let kitty_input::KeyOutput::Bytes(bytes) = input::encode_key_for_screen(&event, &ctx)
-            {
-                self.write_child(&bytes);
-            }
+        if matches!(event.action, KeyAction::Release) {
+            self.encode_and_write(&event);
             return;
         }
-        if key.modifiers.shift && key.keysym == kitty_window::keysym::PAGE_UP {
-            self.scrollback_up();
-            return;
+        let result = self.keymap.dispatch(&event);
+        match result {
+            MappingResult::Action(action) => {
+                let action = action.clone();
+                self.execute_action(&action);
+            }
+            MappingResult::Consumed => {}
+            MappingResult::NotConsumed(flush) => {
+                for event in flush {
+                    self.encode_and_write(&event);
+                }
+                self.encode_and_write(&event);
+            }
         }
-        if key.modifiers.shift && key.keysym == kitty_window::keysym::PAGE_DOWN {
-            self.scrollback_down();
+    }
+
+    fn encode_and_write(&mut self, event: &KeyEvent) {
+        let Some(pane) = self.active_pane_mut() else {
             return;
-        }
-        let ctx = input::input_context(&self.handler.screen, &self.tracker);
-        match input::encode_key_for_screen(&event, &ctx) {
-            kitty_input::KeyOutput::Bytes(bytes) => self.write_child(&bytes),
-            kitty_input::KeyOutput::Text(text) => self.write_child(text.as_bytes()),
+        };
+        let ctx = pane.input_context();
+        match input::encode_key_for_screen(event, &ctx) {
+            kitty_input::KeyOutput::Bytes(bytes) => pane.write(&bytes),
+            kitty_input::KeyOutput::Text(text) => pane.write(text.as_bytes()),
             kitty_input::KeyOutput::None | kitty_input::KeyOutput::Shortcut => {}
         }
     }
 
+    fn execute_action(&mut self, action: &str) {
+        let words: Vec<&str> = action.split_whitespace().collect();
+        let Some(name) = words.first().copied() else {
+            return;
+        };
+        match name {
+            "new_tab" | "new_os_window" => {
+                let _ = self.new_tab();
+            }
+            "close_tab" => {
+                self.close_tab_at(self.tab_manager.active_tab_idx());
+            }
+            "next_tab" => {
+                self.tab_manager.next_tab(1);
+                self.need_redraw = true;
+                self.update_window_title();
+            }
+            "previous_tab" => {
+                self.tab_manager.next_tab(-1);
+                self.need_redraw = true;
+                self.update_window_title();
+            }
+            "new_window" => {
+                let location = match words.get(1).copied() {
+                    Some("horizontal") => WindowLocation::VSplit,
+                    Some("vertical") => WindowLocation::HSplit,
+                    Some("left") | Some("before") => WindowLocation::Before,
+                    Some("right") | Some("after") => WindowLocation::After,
+                    _ => WindowLocation::Split,
+                };
+                self.split_active(location);
+            }
+            "new_window_horizontal" | "vsplit" => self.split_active(WindowLocation::VSplit),
+            "new_window_vertical" | "hsplit" => self.split_active(WindowLocation::HSplit),
+            "close_window" => {
+                if let Some(wid) = self.tab_manager.active_window_id() {
+                    self.close_window_id(wid);
+                }
+            }
+            "next_window" => {
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.next_window(1);
+                }
+                self.need_redraw = true;
+            }
+            "previous_window" => {
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.next_window(-1);
+                }
+                self.need_redraw = true;
+            }
+            "neighboring_window" | "focus_window" => {
+                if let Some(edge) = words.get(1).and_then(|word| edge_from_name(word)) {
+                    self.focus_direction(edge);
+                }
+            }
+            "move_window" => {
+                let delta = match words.get(1).copied() {
+                    Some("left") | Some("up") => -1,
+                    Some("right") | Some("down") => 1,
+                    Some(value) => value.parse::<i64>().unwrap_or(0),
+                    None => 0,
+                };
+                if delta != 0 {
+                    let changed = self
+                        .tab_manager
+                        .active_tab_mut()
+                        .map(|tab| tab.move_window(delta))
+                        .unwrap_or(false);
+                    if changed {
+                        self.relayout_all();
+                        self.need_redraw = true;
+                    }
+                }
+            }
+            "resize_window" => {
+                let (increment, horizontal) = match words.get(1).copied() {
+                    Some("wider") => (2.0, true),
+                    Some("narrower") => (-2.0, true),
+                    Some("taller") => (2.0, false),
+                    Some("shorter") => (-2.0, false),
+                    _ => (0.0, true),
+                };
+                if increment != 0.0
+                    && self
+                        .tab_manager
+                        .active_tab_mut()
+                        .map(|tab| tab.resize_active_window(increment, horizontal))
+                        .unwrap_or(false)
+                {
+                    self.relayout_all();
+                    self.need_redraw = true;
+                }
+            }
+            "next_layout" | "toggle_layout" => {
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.next_layout(1);
+                }
+                self.relayout_all();
+                self.need_redraw = true;
+            }
+            "previous_layout" => {
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.next_layout(-1);
+                }
+                self.relayout_all();
+                self.need_redraw = true;
+            }
+            "scrollback_up" => {
+                if let Some(pane) = self.active_pane_mut() {
+                    pane.scrollback_up();
+                }
+                self.renderer.invalidate();
+                self.need_redraw = true;
+            }
+            "scrollback_down" => {
+                if let Some(pane) = self.active_pane_mut() {
+                    pane.scrollback_down();
+                }
+                self.renderer.invalidate();
+                self.need_redraw = true;
+            }
+            "copy_to_clipboard" => self.copy_selection(),
+            "paste_from_clipboard" => self.paste_clipboard(),
+            "launch_kitten" | "kitten" => {
+                if let Some(name) = words.get(1) {
+                    let args: Vec<String> = words[2..].iter().map(|x| (*x).to_string()).collect();
+                    if let Err(error) = self.launch_kitten(name, &args) {
+                        eprintln!("kitr: kitten {name}: {error}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn launch_kitten(&mut self, name: &str, args: &[String]) -> io::Result<()> {
+        let registry = kitty_kittens::KittenRegistry::discover_default();
+        let entry = registry.lookup(name).ok_or_else(|| {
+            io_err(format!(
+                "unknown kitten {name:?} (searched {} paths)",
+                registry.searched_paths().len()
+            ))
+        })?;
+        let mut bootstrap = kitty_kittens::BootstrapEnv::from_process_env();
+        bootstrap.window_id = self.tab_manager.active_window_id();
+        bootstrap.listen_on = self.listen_env.clone();
+        let options = kitty_kittens::LaunchOptions {
+            bootstrap,
+            ..Default::default()
+        };
+        let plan = kitty_kittens::build_launch(entry, name, args, &options)
+            .map_err(|error| io_err(error.to_string()))?;
+        let spec = SpawnSpec {
+            argv: plan.argv,
+            cwd: Some(plan.cwd),
+            env: plan.env.into_iter().collect(),
+            title: Some(format!("kitten: {name}")),
+        };
+        let tab_idx = self.tab_manager.active_tab_idx();
+        self.add_pane_at(
+            tab_idx,
+            spec,
+            LayoutAddOptions {
+                location: WindowLocation::Split,
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    fn split_active(&mut self, location: WindowLocation) {
+        let tab_idx = self.tab_manager.active_tab_idx();
+        let spec = self.new_tab_spec();
+        let _ = self.add_pane_at(
+            tab_idx,
+            spec,
+            LayoutAddOptions {
+                location,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn focus_direction(&mut self, edge: Edge) {
+        let Some(tab) = self.tab_manager.active_tab_mut() else {
+            return;
+        };
+        tab.neighboring_window(edge);
+        self.need_redraw = true;
+    }
+
     fn copy_selection(&mut self) {
-        if !self.handler.screen.has_selection() {
+        let Some(pane) = self.active_pane() else {
+            return;
+        };
+        if !pane.screen().has_selection() {
             return;
         }
-        let text = self.handler.screen.selected_text();
+        let text = pane.screen().selected_text();
         let _ = self
             .window
             .set_clipboard_text(WindowSelection::Clipboard, &text);
@@ -660,45 +1421,15 @@ impl GuiSession {
         else {
             return;
         };
-        if self.handler.screen.modes.contains(Modes::BRACKETED_PASTE) {
-            self.write_child(b"\x1b[200~");
-            self.write_child(text.as_bytes());
-            self.write_child(b"\x1b[201~");
+        let Some(pane) = self.active_pane_mut() else {
+            return;
+        };
+        if pane.screen().modes.contains(Modes::BRACKETED_PASTE) {
+            pane.write(b"\x1b[200~");
+            pane.write(text.as_bytes());
+            pane.write(b"\x1b[201~");
         } else {
-            self.write_child(text.as_bytes());
-        }
-    }
-
-    fn scrollback_up(&mut self) {
-        if self.handler.screen.is_using_alternate_linebuf() {
-            return;
-        }
-        let count = self.handler.screen.lines.saturating_sub(1).max(1);
-        self.handler
-            .screen
-            .reverse_scroll_and_fill_from_scrollback(count);
-        self.need_redraw = true;
-        self.renderer.invalidate();
-    }
-
-    fn scrollback_down(&mut self) {
-        if self.handler.screen.is_using_alternate_linebuf() {
-            return;
-        }
-        let count = self.handler.screen.lines.saturating_sub(1).max(1);
-        self.handler.screen.scroll(count);
-        self.need_redraw = true;
-        self.renderer.invalidate();
-    }
-
-    fn mouse_geometry(&self) -> input::MouseGeometryState {
-        input::MouseGeometryState {
-            left: self.padding.0 as f64,
-            top: self.padding.1 as f64,
-            cell_width: self.metrics.cell_width as f64,
-            cell_height: self.metrics.cell_height as f64,
-            columns: self.columns,
-            lines: self.rows,
+            pane.write(text.as_bytes());
         }
     }
 
@@ -710,9 +1441,43 @@ impl GuiSession {
         y: f64,
         modifiers: kitty_window::Modifiers,
     ) {
-        let ctx = input::input_context(&self.handler.screen, &self.tracker);
+        if y < self.tab_bar_px as f64 {
+            if pressed && button == kitty_window::MouseButton::Left {
+                if let Some(idx) = self.tab_at_x(x) {
+                    self.select_tab(idx);
+                }
+            }
+            return;
+        }
+        if let Some(wid) = self.pane_at(x, y) {
+            if Some(wid) != self.tab_manager.active_window_id() {
+                if let Some(tab) = self.tab_manager.active_tab_mut() {
+                    tab.set_active_window(wid);
+                }
+                self.need_redraw = true;
+            }
+        }
+        let Some(wid) = self.tab_manager.active_window_id() else {
+            return;
+        };
+        let Some((origin_x, origin_y)) = self.pane_origin(self.tab_manager.active_tab_idx(), wid)
+        else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&wid) else {
+            return;
+        };
+        let ctx = pane.input_context();
         let mods = mouse_modifiers(modifiers);
-        let Some(position) = self.mouse_geometry().position(x, y) else {
+        let geometry = input::MouseGeometryState {
+            left: 0.0,
+            top: 0.0,
+            cell_width: self.metrics.cell_width as f64,
+            cell_height: self.metrics.cell_height as f64,
+            columns: pane.columns,
+            lines: pane.rows,
+        };
+        let Some(position) = geometry.position(x - origin_x as f64, y - origin_y as f64) else {
             return;
         };
         if input::mouse_goes_to_child(&ctx, mods) {
@@ -723,7 +1488,7 @@ impl GuiSession {
                 MouseAction::Release
             };
             if let Some(bytes) = send_mouse(&ctx, &position, kbutton, action, mods) {
-                self.write_child(&bytes);
+                pane.write(&bytes);
             }
             self.mouse_down = pressed;
             return;
@@ -733,16 +1498,16 @@ impl GuiSession {
         }
         if pressed {
             self.mouse_down = true;
-            self.handler
+            pane.handler
                 .screen
                 .start_selection(position.cell_x, position.cell_y);
         } else {
             self.mouse_down = false;
-            self.handler
+            pane.handler
                 .screen
                 .update_selection_ext(position.cell_x, position.cell_y, true, true);
-            if self.handler.screen.has_selection() {
-                let text = self.handler.screen.selected_text();
+            if pane.screen().has_selection() {
+                let text = pane.screen().selected_text();
                 let _ = self.window.set_primary_text(&text);
             }
             self.need_redraw = true;
@@ -750,9 +1515,30 @@ impl GuiSession {
     }
 
     fn handle_mouse_move(&mut self, x: f64, y: f64, modifiers: kitty_window::Modifiers) {
-        let ctx = input::input_context(&self.handler.screen, &self.tracker);
+        if y < self.tab_bar_px as f64 {
+            return;
+        }
+        let Some(wid) = self.tab_manager.active_window_id() else {
+            return;
+        };
+        let Some((origin_x, origin_y)) = self.pane_origin(self.tab_manager.active_tab_idx(), wid)
+        else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&wid) else {
+            return;
+        };
+        let ctx = pane.input_context();
         let mods = mouse_modifiers(modifiers);
-        let Some(position) = self.mouse_geometry().position(x, y) else {
+        let geometry = input::MouseGeometryState {
+            left: 0.0,
+            top: 0.0,
+            cell_width: self.metrics.cell_width as f64,
+            cell_height: self.metrics.cell_height as f64,
+            columns: pane.columns,
+            lines: pane.rows,
+        };
+        let Some(position) = geometry.position(x - origin_x as f64, y - origin_y as f64) else {
             return;
         };
         if input::mouse_goes_to_child(&ctx, mods) {
@@ -762,12 +1548,12 @@ impl GuiSession {
                 MouseAction::Move
             };
             if let Some(bytes) = send_mouse(&ctx, &position, None, action, mods) {
-                self.write_child(&bytes);
+                pane.write(&bytes);
             }
             return;
         }
-        if self.mouse_down && self.handler.screen.selections().in_progress {
-            self.handler
+        if self.mouse_down && pane.screen().selections().in_progress {
+            pane.handler
                 .screen
                 .update_selection(position.cell_x, position.cell_y);
             self.need_redraw = true;
@@ -775,9 +1561,30 @@ impl GuiSession {
     }
 
     fn handle_scroll(&mut self, x: f64, y: f64, delta_y: f64, modifiers: kitty_window::Modifiers) {
-        let ctx = input::input_context(&self.handler.screen, &self.tracker);
+        if y < self.tab_bar_px as f64 {
+            return;
+        }
+        let Some(wid) = self.tab_manager.active_window_id() else {
+            return;
+        };
+        let Some((origin_x, origin_y)) = self.pane_origin(self.tab_manager.active_tab_idx(), wid)
+        else {
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&wid) else {
+            return;
+        };
+        let ctx = pane.input_context();
         let mods = mouse_modifiers(modifiers);
-        let Some(position) = self.mouse_geometry().position(x, y) else {
+        let geometry = input::MouseGeometryState {
+            left: 0.0,
+            top: 0.0,
+            cell_width: self.metrics.cell_width as f64,
+            cell_height: self.metrics.cell_height as f64,
+            columns: pane.columns,
+            lines: pane.rows,
+        };
+        let Some(position) = geometry.position(x - origin_x as f64, y - origin_y as f64) else {
             return;
         };
         if input::mouse_goes_to_child(&ctx, mods) {
@@ -792,60 +1599,781 @@ impl GuiSession {
                 button,
                 mods,
             ) {
-                self.write_child(&bytes);
+                pane.write(&bytes);
             }
         } else if delta_y > 0.0 {
-            self.scrollback_up();
+            pane.scrollback_up();
+            self.need_redraw = true;
         } else {
-            self.scrollback_down();
+            pane.scrollback_down();
+            self.need_redraw = true;
         }
+    }
+
+    fn pane_at(&self, x: f64, y: f64) -> Option<WindowId> {
+        let tab_idx = self.tab_manager.active_tab_idx();
+        let tab = self.tab_manager.tab(tab_idx)?;
+        for wid in tab.windows().all_window_ids() {
+            let Some(window) = tab.windows().window(*wid) else {
+                continue;
+            };
+            if !window.is_visible_in_layout {
+                continue;
+            }
+            let Some((columns, rows, left, top)) = self.pane_geometry(tab_idx, *wid) else {
+                continue;
+            };
+            let x0 = self.padding.0 as f64 + left as f64 * self.metrics.cell_width as f64;
+            let y0 = self.tab_bar_px as f64
+                + self.padding.1 as f64
+                + top as f64 * self.metrics.cell_height as f64;
+            let x1 = x0 + columns as f64 * self.metrics.cell_width as f64;
+            let y1 = y0 + rows as f64 * self.metrics.cell_height as f64;
+            if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                return Some(*wid);
+            }
+        }
+        None
+    }
+
+    fn tab_at_x(&self, x: f64) -> Option<usize> {
+        let x = x.max(0.0) as u32;
+        self.tab_ranges
+            .iter()
+            .find(|(_, start, end)| x >= *start && x < *end)
+            .map(|(idx, _, _)| *idx)
     }
 
     // }}}
     // {{{ Rendering
 
+    fn build_tab_bar(&self) -> (Screen, Vec<(usize, u32, u32)>) {
+        let columns = self.columns.max(1);
+        let mut screen = Screen::builder(columns, 1)
+            .scrollback(1)
+            .build()
+            .expect("1-row screen");
+        screen.cursor.shape = CursorShape::NoCursor;
+        let bg = self.resolver.default_bg();
+        let fg = self.resolver.default_fg();
+        let active_bg = Rgba8::rgb(
+            bg.r.saturating_add(55),
+            bg.g.saturating_add(55),
+            bg.b.saturating_add(55),
+        );
+        let active_fg = Rgba8::rgb(255, 255, 255);
+        let mut ranges = Vec::new();
+        let mut x = 0u32;
+        for (idx, tab) in self.tab_manager.tabs().iter().enumerate() {
+            if x >= columns {
+                break;
+            }
+            let active = idx == self.tab_manager.active_tab_idx();
+            screen.cursor.sgr.bg = pack_sgr(if active { active_bg } else { bg });
+            screen.cursor.sgr.fg = pack_sgr(if active { active_fg } else { fg });
+            screen.cursor.sgr.bold = active;
+            screen.cursor_position(1, x + 1);
+            let title = tab.effective_title();
+            let label = format!(" {}: {} ", idx + 1, title);
+            let available = columns - x;
+            let text: Vec<u32> = label
+                .chars()
+                .take(available as usize)
+                .map(|ch| ch as u32)
+                .collect();
+            let width = text.len() as u32;
+            if width == 0 {
+                break;
+            }
+            screen.draw_text(&text);
+            ranges.push((idx, x, x + width));
+            x += width;
+            if x < columns {
+                screen.cursor.sgr.bg = pack_sgr(bg);
+                screen.cursor.sgr.fg = pack_sgr(fg);
+                screen.cursor.sgr.bold = false;
+                screen.cursor_position(1, x + 1);
+                let sep: Vec<u32> = "|".chars().map(|ch| ch as u32).collect();
+                screen.draw_text(&sep);
+                x += 1;
+            }
+        }
+        if x < columns {
+            screen.cursor.sgr.bg = pack_sgr(bg);
+            screen.cursor.sgr.fg = pack_sgr(fg);
+            screen.cursor.sgr.bold = false;
+            screen.cursor_position(1, x + 1);
+            let fill: Vec<u32> = std::iter::repeat_n(b' ' as u32, (columns - x) as usize).collect();
+            screen.draw_text(&fill);
+        }
+        screen.cursor.shape = CursorShape::NoCursor;
+        (screen, ranges)
+    }
+
     fn render(&mut self) -> io::Result<()> {
         self.surface
             .make_current()
             .map_err(|error| io_err(error.to_string()))?;
-        let font_metrics = self.fonts.cell_metrics();
-        let mut rasterizer = FontRasterizer {
-            fonts: &mut self.fonts,
-            cache: &mut self.raster_cache,
-            metrics: font_metrics,
-        };
-        let frame =
+
+        let cell_w = self.metrics.cell_width.max(1.0);
+        let cell_h = self.metrics.cell_height.max(1.0);
+        {
+            let backend = self
+                .backend
+                .as_mut()
+                .ok_or_else(|| io_err("OpenGL backend is shut down"))?;
+            backend
+                .clear(self.resolver.default_bg())
+                .map_err(|error| io_err(error.to_string()))?;
+        }
+
+        // Tab strip.
+        let (mut bar_screen, ranges) = self.build_tab_bar();
+        self.tab_ranges = ranges;
+        self.renderer.generator.config.origin_x = 0.0;
+        self.renderer.generator.config.origin_y = 0.0;
+        self.renderer.generator.config.viewport_width = self.pixel_size.0 as f32;
+        self.renderer.generator.config.viewport_height = self.pixel_size.1 as f32;
+        let mut bar_frame = {
+            let font_metrics = self.fonts.cell_metrics();
+            let mut rasterizer = FontRasterizer {
+                fonts: &mut self.fonts,
+                cache: &mut self.raster_cache,
+                metrics: font_metrics,
+            };
             self.renderer
-                .prepare_frame(&self.handler.screen, &mut rasterizer, &self.resolver);
-        let render_config = self.renderer.generator.config.clone();
-        self.backend
-            .as_mut()
-            .ok_or_else(|| io_err("OpenGL backend is shut down"))?
-            .sync_atlas(&self.renderer.atlas, &frame)
-            .map_err(|error| io_err(error.to_string()))?;
-        self.backend
-            .as_mut()
-            .ok_or_else(|| io_err("OpenGL backend is shut down"))?
-            .render(&frame, &render_config)
-            .map_err(|error| io_err(error.to_string()))?;
+                .prepare_frame(&bar_screen, &mut rasterizer, &self.resolver)
+        };
+        force_full_rows(&mut bar_frame, 1);
+        let bar_config = self.renderer.generator.config.clone();
+        draw_frame(&mut self.backend, &self.renderer, &bar_frame, &bar_config)?;
+        self.renderer.finish_frame(&mut bar_screen);
+
+        // Panes, each with its own origin/viewport.
+        let tab_idx = self.tab_manager.active_tab_idx();
+        let ids = self
+            .tab_manager
+            .tab(tab_idx)
+            .map(|tab| tab.windows().all_window_ids().to_vec())
+            .unwrap_or_default();
+        let active = self.tab_manager.active_window_id();
+        for wid in ids {
+            let visible = self
+                .tab_manager
+                .tab(tab_idx)
+                .and_then(|tab| tab.windows().window(wid))
+                .map(|window| window.is_visible_in_layout)
+                .unwrap_or(false);
+            if !visible {
+                continue;
+            }
+            let Some((columns, rows, left, top)) = self.pane_geometry(tab_idx, wid) else {
+                continue;
+            };
+            let origin_x = self.padding.0 + left as f32 * cell_w;
+            let origin_y = self.tab_bar_px + self.padding.1 + top as f32 * cell_h;
+            self.renderer.generator.config.origin_x = origin_x;
+            self.renderer.generator.config.origin_y = origin_y;
+            self.renderer.generator.config.viewport_width = columns as f32 * cell_w;
+            self.renderer.generator.config.viewport_height = rows as f32 * cell_h;
+            let Some(pane) = self.panes.get_mut(&wid) else {
+                continue;
+            };
+            let saved_cursor = pane.handler.screen.cursor.shape;
+            if Some(wid) != active {
+                pane.handler.screen.cursor.shape = CursorShape::NoCursor;
+            }
+            let mut frame = {
+                let font_metrics = self.fonts.cell_metrics();
+                let mut rasterizer = FontRasterizer {
+                    fonts: &mut self.fonts,
+                    cache: &mut self.raster_cache,
+                    metrics: font_metrics,
+                };
+                self.renderer
+                    .prepare_frame(&pane.handler.screen, &mut rasterizer, &self.resolver)
+            };
+            pane.handler.screen.cursor.shape = saved_cursor;
+            let lines = pane.handler.screen.lines;
+            force_full_rows(&mut frame, lines);
+            let config = self.renderer.generator.config.clone();
+            draw_frame(&mut self.backend, &self.renderer, &frame, &config)?;
+            self.renderer.finish_frame(&mut pane.handler.screen);
+        }
+
         self.surface
             .swap_buffers()
             .map_err(|error| io_err(error.to_string()))?;
-        self.renderer.finish_frame(&mut self.handler.screen);
         self.frame_count += 1;
         self.need_redraw = false;
         Ok(())
     }
 
     // }}}
+    // {{{ Remote control
+
+    fn process_remote_jobs(&mut self) -> io::Result<()> {
+        loop {
+            let job = {
+                let Some(rx) = self.remote_rx.as_ref() else {
+                    return Ok(());
+                };
+                match rx.try_recv() {
+                    Ok(job) => job,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.remote_rx = None;
+                        return Ok(());
+                    }
+                }
+            };
+            match job {
+                RemoteJob::GetText(request, reply) => {
+                    let _ = reply.send(self.handle_get_text(request));
+                }
+                RemoteJob::SendText(request, reply) => {
+                    let _ = reply.send(self.handle_send_text(request));
+                }
+                RemoteJob::SendKey(request, reply) => {
+                    let _ = reply.send(self.handle_send_key(request));
+                }
+                RemoteJob::ResizeWindow(request, reply) => {
+                    let _ = reply.send(self.handle_resize_window(request));
+                }
+                RemoteJob::CloseWindow(request, reply) => {
+                    let _ = reply.send(self.handle_close_window(request));
+                }
+                RemoteJob::CloseTab(request, reply) => {
+                    let _ = reply.send(self.handle_close_tab(request));
+                }
+                RemoteJob::FocusWindow(request, reply) => {
+                    let _ = reply.send(self.handle_focus_window(request));
+                }
+                RemoteJob::SetWindowTitle(request, reply) => {
+                    let _ = reply.send(self.handle_set_window_title(request));
+                }
+                RemoteJob::GetColors(reply) => {
+                    let _ = reply.send(Ok(RemoteValue::String(self.resolver.as_kitty_conf())));
+                }
+                RemoteJob::SetColors(request, reply) => {
+                    let _ = reply.send(self.handle_set_colors(request));
+                }
+                RemoteJob::Screenshot(request, reply) => {
+                    let _ = reply.send(self.handle_screenshot(request));
+                }
+            }
+        }
+    }
+
+    fn resolve_window_for_match(&self, spec: Option<&str>) -> Option<(usize, WindowId)> {
+        let spec = spec?;
+        if let Some(id) = spec.strip_prefix("id:") {
+            let id = id.parse::<WindowId>().ok()?;
+            return self.tab_index_for_window(id).map(|tab_idx| (tab_idx, id));
+        }
+        let needle = spec.strip_prefix("title:").unwrap_or(spec);
+        for (tab_idx, tab) in self.tab_manager.tabs().iter().enumerate() {
+            for wid in tab.windows().all_window_ids() {
+                if let Some(window) = tab.windows().window(*wid) {
+                    if window.effective_title().contains(needle) {
+                        return Some((tab_idx, *wid));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn handle_get_text(&mut self, request: GetTextRequest) -> CommandResult {
+        let tab_idx = self.tab_manager.active_tab_idx();
+        let wid =
+            if let Some((_, wid)) = self.resolve_window_for_match(request.match_spec.as_deref()) {
+                wid
+            } else if request.match_spec.is_some() {
+                return Err(CommandError::new("No matching window found"));
+            } else {
+                self.tab_manager
+                    .active_window_id()
+                    .ok_or_else(|| CommandError::new("No active window"))?
+            };
+        let Some(pane) = self.panes.get(&wid) else {
+            return Err(CommandError::new("Window has no screen"));
+        };
+        {
+            let screen = pane.screen();
+            let text = match request.extent {
+                TextExtent::Selection => screen.selected_text(),
+                TextExtent::All => {
+                    let mut lines = Vec::new();
+                    for lnum in (0..screen.historybuf().count).rev() {
+                        lines.push(screen.history_line_text(lnum));
+                    }
+                    for y in 0..screen.lines {
+                        lines.push(screen.line_text(y));
+                    }
+                    while lines.last().is_some_and(|line| line.is_empty()) {
+                        lines.pop();
+                    }
+                    lines.join("\n")
+                }
+                _ => crate::dump_screen(screen),
+            };
+            if request.extent == TextExtent::Selection && request.clear_selection {
+                if let Some(pane) = self.panes.get_mut(&wid) {
+                    pane.handler.screen.clear_selection();
+                }
+            }
+            let _ = tab_idx;
+            Ok(RemoteValue::String(text))
+        }
+    }
+
+    fn target_windows(
+        &self,
+        match_spec: Option<&str>,
+        all: bool,
+        exclude_active: bool,
+    ) -> Vec<WindowId> {
+        let active = self.tab_manager.active_window_id();
+        if let Some((_, wid)) = self.resolve_window_for_match(match_spec) {
+            return vec![wid];
+        }
+        if match_spec.is_some() {
+            return Vec::new();
+        }
+        if all {
+            let tab_idx = self.tab_manager.active_tab_idx();
+            return self
+                .tab_manager
+                .tab(tab_idx)
+                .map(|tab| tab.windows().all_window_ids().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|wid| !exclude_active || Some(*wid) != active)
+                .collect();
+        }
+        active.into_iter().collect()
+    }
+
+    fn handle_send_text(&mut self, request: kitty_remote::SendTextRequest) -> CommandResult {
+        let targets = self.target_windows(
+            request.match_spec.as_deref(),
+            request.all,
+            request.exclude_active,
+        );
+        if targets.is_empty() {
+            return Err(CommandError::new("No matching window found"));
+        }
+        let bytes = match request.data {
+            SendTextData::Text(text) => text.into_bytes(),
+            SendTextData::Base64(bytes) => bytes,
+            SendTextData::KittyKey(text) => {
+                return Err(CommandError::new(format!(
+                    "kitty-key send-text is not supported: {text}"
+                )))
+            }
+            SendTextData::Session(_) => {
+                return Err(CommandError::new(
+                    "session broadcast send-text is not supported",
+                ))
+            }
+        };
+        for wid in targets {
+            if let Some(pane) = self.panes.get_mut(&wid) {
+                let wrap = match request.bracketed_paste {
+                    kitty_remote::BracketedPaste::Disable => false,
+                    kitty_remote::BracketedPaste::Enable => true,
+                    kitty_remote::BracketedPaste::Auto => {
+                        pane.screen().modes.contains(Modes::BRACKETED_PASTE)
+                    }
+                };
+                if wrap {
+                    pane.write(b"\x1b[200~");
+                    pane.write(&bytes);
+                    pane.write(b"\x1b[201~");
+                } else {
+                    pane.write(&bytes);
+                }
+            }
+        }
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_send_key(&mut self, request: kitty_remote::SendKeyRequest) -> CommandResult {
+        let targets = self.target_windows(
+            request.match_spec.as_deref(),
+            request.all,
+            request.exclude_active,
+        );
+        if targets.is_empty() {
+            return Err(CommandError::new("No matching window found"));
+        }
+        let mut chunks = Vec::new();
+        for key in &request.keys {
+            let shortcut = kitty_input::parse_shortcut(key).ok_or_else(|| {
+                CommandError::new(format!("Invalid key name for send-key: {key}"))
+            })?;
+            let no_text_mods = shortcut.mods.bits()
+                & (Modifiers::CTRL.bits() | Modifiers::ALT.bits() | Modifiers::SUPER.bits())
+                == 0;
+            let text = if no_text_mods {
+                char::from_u32(shortcut.key).map(|ch| ch.to_string())
+            } else {
+                None
+            };
+            let event = KeyEvent {
+                key: shortcut.key,
+                shifted_key: 0,
+                alternate_key: 0,
+                native_key: 0,
+                modifiers: shortcut.mods,
+                action: KeyAction::Press,
+                text,
+            };
+            let Some((_, wid)) = targets.iter().map(|wid| (0usize, *wid)).next() else {
+                continue;
+            };
+            let Some(pane) = self.panes.get(&wid) else {
+                continue;
+            };
+            let ctx = pane.input_context();
+            match input::encode_key_for_screen(&event, &ctx) {
+                kitty_input::KeyOutput::Bytes(bytes) => chunks.push(bytes),
+                kitty_input::KeyOutput::Text(text) => chunks.push(text.into_bytes()),
+                kitty_input::KeyOutput::None | kitty_input::KeyOutput::Shortcut => {}
+            }
+        }
+        for wid in targets {
+            if let Some(pane) = self.panes.get_mut(&wid) {
+                for chunk in &chunks {
+                    pane.write(chunk);
+                }
+            }
+        }
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_resize_window(
+        &mut self,
+        request: kitty_remote::ResizeWindowRequest,
+    ) -> CommandResult {
+        if let Some((tab_idx, wid)) = self.resolve_window_for_match(request.match_spec.as_deref()) {
+            self.tab_manager.set_active_tab_idx(tab_idx);
+            if let Some(tab) = self.tab_manager.tab_mut(tab_idx) {
+                tab.set_active_window(wid);
+            }
+        }
+        let tab_idx = self.tab_manager.active_tab_idx();
+        let Some(tab) = self.tab_manager.tab_mut(tab_idx) else {
+            return Err(CommandError::new("No active tab"));
+        };
+        match request.axis {
+            kitty_remote::ResizeAxis::Reset => {
+                tab.layouts_mut().remove_all_biases();
+                tab.apply_layout();
+            }
+            kitty_remote::ResizeAxis::Horizontal => {
+                if !tab.resize_active_window(request.increment as f64, true) {
+                    return Err(CommandError::new("Cannot resize this window horizontally"));
+                }
+            }
+            kitty_remote::ResizeAxis::Vertical => {
+                if !tab.resize_active_window(request.increment as f64, false) {
+                    return Err(CommandError::new("Cannot resize this window vertically"));
+                }
+            }
+        }
+        self.relayout_all();
+        self.need_redraw = true;
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_close_window(&mut self, request: kitty_remote::CloseWindowRequest) -> CommandResult {
+        let wid =
+            if let Some((_, wid)) = self.resolve_window_for_match(request.match_spec.as_deref()) {
+                wid
+            } else if request.match_spec.is_some() {
+                if request.ignore_no_match {
+                    return Ok(RemoteValue::Null);
+                }
+                return Err(CommandError::new("No matching window found"));
+            } else {
+                match self.tab_manager.active_window_id() {
+                    Some(wid) => wid,
+                    None => {
+                        if request.ignore_no_match {
+                            return Ok(RemoteValue::Null);
+                        }
+                        return Err(CommandError::new("No active window"));
+                    }
+                }
+            };
+        self.close_window_id(wid);
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_close_tab(&mut self, request: kitty_remote::CloseTabRequest) -> CommandResult {
+        let idx = if let Some(spec) = request.match_spec.as_deref() {
+            let needle = spec.strip_prefix("title:").unwrap_or(spec);
+            self.tab_manager
+                .tabs()
+                .iter()
+                .position(|tab| tab.effective_title().contains(needle))
+        } else {
+            Some(self.tab_manager.active_tab_idx())
+        };
+        let Some(idx) = idx else {
+            if request.ignore_no_match {
+                return Ok(RemoteValue::Null);
+            }
+            return Err(CommandError::new("No matching tab found"));
+        };
+        self.close_tab_at(idx);
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_focus_window(&mut self, request: kitty_remote::FocusWindowRequest) -> CommandResult {
+        let Some((tab_idx, wid)) = self.resolve_window_for_match(request.match_spec.as_deref())
+        else {
+            return Err(CommandError::new("No matching window found"));
+        };
+        self.tab_manager.set_active_tab_idx(tab_idx);
+        if let Some(tab) = self.tab_manager.tab_mut(tab_idx) {
+            tab.set_active_window(wid);
+        }
+        self.need_redraw = true;
+        self.update_window_title();
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_set_window_title(
+        &mut self,
+        request: kitty_remote::SetWindowTitleRequest,
+    ) -> CommandResult {
+        let (tab_idx, wid) = if let Some((tab_idx, wid)) =
+            self.resolve_window_for_match(request.match_spec.as_deref())
+        {
+            (tab_idx, wid)
+        } else if request.match_spec.is_some() {
+            return Err(CommandError::new("No matching window found"));
+        } else {
+            let Some(wid) = self.tab_manager.active_window_id() else {
+                return Err(CommandError::new("No active window"));
+            };
+            (self.tab_manager.active_tab_idx(), wid)
+        };
+        if let Some(tab) = self.tab_manager.tab_mut(tab_idx) {
+            if let Some(window) = tab.windows_mut().window_mut(wid) {
+                window.override_title = request.title.clone();
+            }
+        }
+        self.need_redraw = true;
+        self.update_window_title();
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_set_colors(&mut self, request: kitty_remote::SetColorsRequest) -> CommandResult {
+        if request.reset {
+            self.resolver = ConfigColorResolver::new(&self.config_options);
+        } else if let Some(items) = request.colors.as_object() {
+            for (name, value) in items {
+                let Some(number) = color_as_u32(value) else {
+                    continue;
+                };
+                let color = Rgba8::rgb(
+                    ((number >> 16) & 0xff) as u8,
+                    ((number >> 8) & 0xff) as u8,
+                    (number & 0xff) as u8,
+                );
+                if let Some(index) = name
+                    .strip_prefix("color")
+                    .and_then(|index| index.parse::<u8>().ok())
+                {
+                    self.resolver.set_palette_color(index, color);
+                } else {
+                    self.resolver.set_named_color(name, color);
+                }
+            }
+        }
+        self.need_redraw = true;
+        Ok(RemoteValue::Null)
+    }
+
+    fn handle_screenshot(
+        &mut self,
+        request: kitty_remote::ScreenshotRequest,
+    ) -> Result<ScreenshotImage, CommandError> {
+        self.render_now()
+            .map_err(|error| CommandError::new(error.to_string()))?;
+        let (width, height, rgba) = self
+            .capture_rgba()
+            .map_err(|error| CommandError::new(error.to_string()))?;
+        let bytes = match request.format {
+            ScreenshotFormat::Png => encode_png(width, height, &rgba),
+            ScreenshotFormat::Ppm => encode_ppm(width, height, &rgba),
+        };
+        if !request.output_path.is_empty() {
+            std::fs::write(&request.output_path, &bytes)
+                .map_err(|error| CommandError::new(error.to_string()))?;
+        }
+        Ok(encode_screenshot(bytes, request.format, width, height))
+    }
+
+    fn update_window_title(&mut self) {
+        let title = self
+            .tab_manager
+            .active_tab()
+            .map(|tab| tab.effective_title())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "kitr".to_string());
+        if self.last_title.as_deref() != Some(title.as_str()) {
+            let _ = self.window.set_title(&title);
+            self.last_title = Some(title);
+        }
+    }
+
+    // }}}
+}
+
+fn edge_from_name(name: &str) -> Option<Edge> {
+    match name {
+        "left" => Some(Edge::Left),
+        "right" => Some(Edge::Right),
+        "top" | "up" => Some(Edge::Top),
+        "bottom" | "down" => Some(Edge::Bottom),
+        _ => None,
+    }
+}
+
+fn build_keymap(config: &kitty_config::Options) -> KeyMap {
+    let mut keys = KeyMap::new(Modifiers(config.kitty_mod.0));
+    if !config.clear_all_shortcuts {
+        for line in [
+            "kitty_mod+t new_tab",
+            "kitty_mod+w close_tab",
+            "kitty_mod+left previous_tab",
+            "kitty_mod+right next_tab",
+            "kitty_mod+enter new_window",
+            "ctrl+alt+left neighboring_window left",
+            "ctrl+alt+right neighboring_window right",
+            "ctrl+alt+up neighboring_window up",
+            "ctrl+alt+down neighboring_window down",
+            "kitty_mod+alt+left neighboring_window left",
+            "kitty_mod+alt+right neighboring_window right",
+            "kitty_mod+alt+up neighboring_window up",
+            "kitty_mod+alt+down neighboring_window down",
+            "kitty_mod+alt+shift+left move_window left",
+            "kitty_mod+alt+shift+right move_window right",
+            "kitty_mod+alt+shift+up move_window up",
+            "kitty_mod+alt+shift+down move_window down",
+            "kitty_mod+alt+plus resize_window wider",
+            "kitty_mod+alt+minus resize_window narrower",
+            "kitty_mod+alt+page_up resize_window taller",
+            "kitty_mod+alt+page_down resize_window shorter",
+            "kitty_mod+space next_layout",
+            "kitty_mod+c copy_to_clipboard",
+            "kitty_mod+v paste_from_clipboard",
+            "shift+page_up scrollback_up",
+            "shift+page_down scrollback_down",
+        ] {
+            if let Err(error) = keys.add_line(line) {
+                eprintln!("kitr: default keymap: {error}");
+            }
+        }
+    }
+    for line in &config.map {
+        if let Err(error) = keys.add_line(line) {
+            eprintln!("kitr: map: {error}");
+        }
+    }
+    keys
+}
+
+fn load_session_plan(
+    options: &Options,
+    config: &kitty_config::Options,
+) -> io::Result<Option<RestorePlan>> {
+    let Some(path) = &options.session else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| io_err(format!("cannot read session {}: {error}", path.display())))?;
+    let shell = if config.shell.is_empty() || config.shell == "." {
+        crate::default_shell().to_string_lossy().into_owned()
+    } else {
+        config.shell.clone()
+    };
+    let session_options = SessionOptions {
+        enabled_layouts: config.enabled_layouts.clone(),
+        shell,
+    };
+    let environ: BTreeMap<String, String> = std::env::vars().collect();
+    let path_text = path.to_string_lossy();
+    let sessions = parse_sessions(
+        &raw,
+        &session_options,
+        Some(&environ),
+        &path_text,
+        &path_text,
+    )
+    .map_err(|error| io_err(format!("session {}: {error}", path.display())))?;
+    if sessions.is_empty() {
+        return Err(io_err(format!(
+            "session {} defines no tabs",
+            path.display()
+        )));
+    }
+    if sessions.len() > 1 {
+        eprintln!(
+            "kitr: session defines {} OS windows; using the first",
+            sessions.len()
+        );
+    }
+    Ok(Some(sessions[0].restore_plan()))
+}
+
+type RemoteRuntime = (
+    Option<Receiver<RemoteJob>>,
+    Option<kitty_remote::ServerHandle>,
+    Option<String>,
+);
+
+fn start_remote(listen_on: Option<&OsStr>) -> io::Result<RemoteRuntime> {
+    let Some(listen_on) = listen_on else {
+        return Ok((None, None, None));
+    };
+    let raw = listen_on.to_string_lossy();
+    let address = raw.strip_prefix("unix:").unwrap_or(&raw);
+    let (bridge, receiver) = RemoteBridge::new();
+    let handler: Arc<dyn kitty_remote::RemoteHandler> = Arc::new(bridge);
+    let config = ServerConfig::default();
+    #[cfg(target_os = "linux")]
+    if let Some(name) = address.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+            .map_err(|error| io_err(format!("invalid abstract socket name: {error}")))?;
+        let server = kitty_remote::RemoteServer::bind_addr(&addr, handler, config)
+            .map_err(|error| io_err(format!("cannot listen on unix:@{name}: {error}")))?;
+        let handle = server
+            .start()
+            .map_err(|error| io_err(format!("cannot start remote server: {error}")))?;
+        return Ok((Some(receiver), Some(handle), Some(format!("unix:@{name}"))));
+    }
+    let path = Path::new(address);
+    let server = kitty_remote::RemoteServer::bind(path, handler, config)
+        .map_err(|error| io_err(format!("cannot listen on {}: {error}", path.display())))?;
+    let handle = server
+        .start()
+        .map_err(|error| io_err(format!("cannot start remote server: {error}")))?;
+    Ok((
+        Some(receiver),
+        Some(handle),
+        Some(format!("unix:{}", path.display())),
+    ))
 }
 
 fn load_config(options: &Options) -> Config {
-    let paths: Vec<std::path::PathBuf> = options
-        .config
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
+    let paths: Vec<PathBuf> = options.config.iter().map(PathBuf::from).collect();
     Config::load_lenient(&paths, &[] as &[&str])
 }
 
@@ -875,4 +2403,41 @@ pub fn run_gui(options: &Options, input: Input) -> io::Result<RunOutcome> {
         .timeout
         .or_else(|| options.screenshot.as_ref().map(|_| Duration::from_secs(10)));
     session.run(timeout, options.screenshot.as_deref())
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use super::*;
+
+    #[test]
+    fn default_kitty_mod_shortcuts_match() {
+        let config = kitty_config::Options::default();
+        let mut keys = build_keymap(&config);
+        let event = KeyEvent {
+            key: b't' as u32,
+            shifted_key: 0,
+            alternate_key: 0,
+            native_key: 0,
+            modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            action: KeyAction::Press,
+            text: None,
+        };
+        assert_eq!(
+            keys.dispatch(&event),
+            MappingResult::Action("new_tab".into())
+        );
+        let event = KeyEvent {
+            key: kitty_input::key_constants::GLFW_FKEY_LEFT,
+            shifted_key: 0,
+            alternate_key: 0,
+            native_key: 0,
+            modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            action: KeyAction::Press,
+            text: None,
+        };
+        assert_eq!(
+            keys.dispatch(&event),
+            MappingResult::Action("previous_tab".into())
+        );
+    }
 }

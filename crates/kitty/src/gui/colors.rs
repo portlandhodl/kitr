@@ -42,6 +42,49 @@ impl ConfigColorResolver {
             selection_fg,
         }
     }
+
+    /// Set a palette entry (used by the remote `set-colors` command).
+    pub fn set_palette_color(&mut self, index: u8, color: Rgba8) {
+        self.palette[index as usize] = color;
+    }
+
+    /// Set one of the special colours by kitty.conf name.
+    pub fn set_named_color(&mut self, name: &str, color: Rgba8) -> bool {
+        match name {
+            "foreground" => self.fg = color,
+            "background" => self.bg = color,
+            "cursor" => self.cursor_bg = color,
+            "cursor_text_color" | "cursor_text" => self.cursor_fg = color,
+            "selection_background" => self.selection_bg = color,
+            "selection_foreground" => self.selection_fg = color,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Return the current colours as kitty.conf lines for `get-colors`.
+    pub fn as_kitty_conf(&self) -> String {
+        fn hex(c: Rgba8) -> String {
+            format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+        }
+        let mut out = String::new();
+        out.push_str(&format!("foreground {}\n", hex(self.fg)));
+        out.push_str(&format!("background {}\n", hex(self.bg)));
+        out.push_str(&format!("cursor {}\n", hex(self.cursor_bg)));
+        out.push_str(&format!("cursor_text_color {}\n", hex(self.cursor_fg)));
+        out.push_str(&format!(
+            "selection_background {}\n",
+            hex(self.selection_bg)
+        ));
+        out.push_str(&format!(
+            "selection_foreground {}\n",
+            hex(self.selection_fg)
+        ));
+        for (index, color) in self.palette.iter().enumerate() {
+            out.push_str(&format!("color{index} {}\n", hex(*color)));
+        }
+        out
+    }
 }
 
 impl ColorResolver for ConfigColorResolver {

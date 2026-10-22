@@ -34,7 +34,14 @@ kitty-fonts = { path = "../kitty-fonts", optional = true }
 kitty-config = { path = "../kitty-config", optional = true }
 kitty-input = { path = "../kitty-input", optional = true }
 kitty-unicode = { path = "../kitty-unicode", optional = true }
+kitty-ui = { path = "../kitty-ui" }
+kitty-remote = { path = "../kitty-remote" }
+kitty-kittens = { path = "../kitty-kittens" }
 
 [[example]]
 name = "bench_gui"
+required-features = ["gui"]
+
+[[example]]
+name = "bench_tabs_remote"
 required-features = ["gui"]

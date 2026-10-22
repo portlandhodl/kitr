@@ -119,3 +119,31 @@ usually by 1.1x-2x, with the largest wins in native screen/parser dispatch and
 the ASCII width fast path. The result still says nothing about terminal
 performance as a whole until the renderer, fonts and I/O loop exist. Re-run
 these benchmarks after each phase rather than treating them as a product claim.
+
+## GUI tabs and remote control
+
+`crates/kitty/examples/bench_tabs_remote.rs` measures the new multi-tab GUI and
+the remote-control round trip. It starts its own Xvfb when `$DISPLAY` is unset,
+uses two `/bin/sh -c 'sleep 20'` tabs for the tab loop, then runs 200
+`get-text` requests over a Unix socket against a GUI loop processing one
+`step()` per iteration. Tab-switch numbers include selecting the tab and a full
+frame render (all panes plus the tab strip).
+
+Reproduce:
+
+```sh
+cargo run -p kitty --release --example bench_tabs_remote
+```
+
+Measured on the same host as the table above (release build, Xvfb, no DRI3
+hardware acceleration):
+
+| Workload | Result |
+|---|---:|
+| tab switch + render | 1.21 ms/op (829 ops/s) |
+| remote `get-text` round trip | 1.174 ms/op (852 ops/s) |
+
+These are GUI-loop throughput numbers, not end-to-end typing latency. The
+remote round trip is intentionally capped by a 5 ms GUI poll interval while a
+remote server is active, so the floor is roughly poll scheduling plus socket
+and JSON framing.

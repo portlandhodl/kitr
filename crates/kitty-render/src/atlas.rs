@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 
+use crate::shaped::{ShapedRunOutput, ShapedRunRequest};
+
 /// Maximum number of codepoints stored in a single glyph key. This matches
 /// `MAX_NUM_CODEPOINTS_PER_CELL` from `kitty/line.h`.
 pub const MAX_GLYPH_CODEPOINTS: usize = 24;
@@ -138,6 +140,9 @@ pub struct GlyphKey {
     pub font_id: u16,
     pub glyph_id: u32,
     pub flags: u32,
+    /// Non-zero for sprites produced by a shaped run. The atlas treats it as
+    /// part of the cache key, so identical runs share one sprite.
+    pub run_hash: u64,
     pub text: GlyphText,
 }
 
@@ -147,6 +152,7 @@ impl GlyphKey {
             font_id,
             glyph_id,
             flags,
+            run_hash: 0,
             text: GlyphText {
                 len: 0,
                 chars: [0; MAX_GLYPH_CODEPOINTS],
@@ -161,12 +167,35 @@ impl GlyphKey {
             font_id,
             glyph_id: chars.first().copied().unwrap_or(0),
             flags,
+            run_hash: 0,
+            text: GlyphText::new(chars),
+        }
+    }
+
+    /// Build a key for a cluster produced by a shaped run.
+    pub fn from_shaped_run(
+        font_id: u16,
+        chars: &[u32],
+        flags: u32,
+        run_hash: u64,
+        glyph_id: u32,
+    ) -> Self {
+        Self {
+            font_id,
+            glyph_id,
+            flags,
+            run_hash,
             text: GlyphText::new(chars),
         }
     }
 
     pub fn with_glyph_id(mut self, glyph_id: u32) -> Self {
         self.glyph_id = glyph_id;
+        self
+    }
+
+    pub fn with_run_hash(mut self, run_hash: u64) -> Self {
+        self.run_hash = run_hash;
         self
     }
 }
@@ -230,6 +259,14 @@ impl GlyphBitmap {
 /// convenient.
 pub trait GlyphRasterizer {
     fn rasterize(&mut self, glyph: &GlyphKey) -> Option<GlyphBitmap>;
+
+    /// Optionally shape a run of adjacent cells.
+    ///
+    /// Returning `None` (the default) means the caller should fall back to
+    /// per-cell glyphs. See [`ShapedRunOutput`] for the expected geometry.
+    fn shape_run(&mut self, _run: &ShapedRunRequest<'_>) -> Option<ShapedRunOutput> {
+        None
+    }
 }
 
 impl<F> GlyphRasterizer for F

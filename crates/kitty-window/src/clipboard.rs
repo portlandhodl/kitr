@@ -71,6 +71,109 @@ pub struct ClipboardTarget {
     pub data: Vec<u8>,
 }
 
+/// Payload size at which X11 transfers switch to `INCR`.
+pub const INCR_THRESHOLD: usize = 256 * 1024;
+/// Chunk size used for `INCR` writes.
+pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Chunk iterator for an outgoing `INCR` transfer.
+#[derive(Clone, Debug)]
+pub struct IncrWriteState {
+    data: Vec<u8>,
+    offset: usize,
+    chunk_size: usize,
+    finished: bool,
+}
+
+impl IncrWriteState {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self::with_chunk_size(data, INCR_CHUNK_SIZE)
+    }
+
+    pub fn with_chunk_size(data: Vec<u8>, chunk_size: usize) -> Self {
+        Self {
+            data,
+            offset: 0,
+            chunk_size: chunk_size.max(1),
+            finished: false,
+        }
+    }
+
+    /// Return the next chunk. The final call returns an empty slice exactly
+    /// once, which is how X11 marks the end of an `INCR` transfer.
+    pub fn next_chunk(&mut self) -> Option<&[u8]> {
+        if self.finished {
+            return None;
+        }
+        if self.offset >= self.data.len() {
+            self.finished = true;
+            return Some(&[]);
+        }
+        let end = self
+            .offset
+            .saturating_add(self.chunk_size)
+            .min(self.data.len());
+        let chunk = &self.data[self.offset..end];
+        self.offset = end;
+        Some(chunk)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.offset)
+    }
+}
+
+/// Accumulator for an incoming `INCR` transfer.
+#[derive(Clone, Debug, Default)]
+pub struct IncrReadState {
+    expected: usize,
+    data: Vec<u8>,
+    finished: bool,
+}
+
+impl IncrReadState {
+    pub fn new(expected: usize) -> Self {
+        Self {
+            expected,
+            data: Vec::with_capacity(expected.min(INCR_CHUNK_SIZE * 4)),
+            finished: false,
+        }
+    }
+
+    /// Append a chunk. An empty chunk finishes the transfer; some owners also
+    /// finish at the advertised size without sending an empty terminator.
+    pub fn push(&mut self, chunk: &[u8]) -> bool {
+        if self.finished {
+            return true;
+        }
+        self.data.extend_from_slice(chunk);
+        if chunk.is_empty() || (self.expected > 0 && self.data.len() >= self.expected) {
+            self.finished = true;
+        }
+        self.finished
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn expected(&self) -> usize {
+        self.expected
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Offer {
     targets: Vec<ClipboardTarget>,
@@ -199,6 +302,13 @@ impl ClipboardState {
             pending.reply = Some(reply);
         }
         Some(ClipboardToken(token))
+    }
+
+    /// Token of the pending request waiting on an X11 property atom.
+    pub fn token_for_property(&self, property: u64) -> Option<ClipboardToken> {
+        self.pending.iter().find_map(|(token, pending)| {
+            (pending.property == property).then_some(ClipboardToken(*token))
+        })
     }
 
     /// Complete the oldest pending request matching a selection and target.
@@ -340,5 +450,39 @@ mod tests {
             state.take_result(second),
             Some(Err(ClipboardError::WindowClosed))
         );
+    }
+    #[test]
+    fn incr_write_state_emits_chunks_then_terminator() {
+        let mut state = IncrWriteState::with_chunk_size(b"abcdefgh".to_vec(), 3);
+        assert_eq!(state.next_chunk(), Some(&b"abc"[..]));
+        assert_eq!(state.next_chunk(), Some(&b"def"[..]));
+        assert_eq!(state.next_chunk(), Some(&b"gh"[..]));
+        assert_eq!(state.next_chunk(), Some(&[][..]));
+        assert!(state.is_finished());
+        assert_eq!(state.next_chunk(), None);
+        assert_eq!(state.remaining(), 0);
+    }
+
+    #[test]
+    fn incr_read_state_finishes_on_empty_or_expected_size() {
+        let mut state = IncrReadState::new(5);
+        assert!(!state.push(b"ab"));
+        assert!(!state.push(b"cd"));
+        assert!(state.push(b"e"));
+        assert_eq!(state.data(), b"abcde");
+        assert_eq!(state.into_data(), b"abcde".to_vec());
+
+        let mut state = IncrReadState::new(100);
+        assert!(!state.push(b"chunk"));
+        assert!(state.push(&[]));
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn pending_requests_can_be_found_by_property() {
+        let mut state = ClipboardState::default();
+        let token = state.begin(Selection::Clipboard, "UTF8_STRING", 99);
+        assert_eq!(state.token_for_property(99), Some(token));
+        assert_eq!(state.token_for_property(100), None);
     }
 }

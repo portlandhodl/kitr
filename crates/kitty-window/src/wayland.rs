@@ -16,12 +16,15 @@
 //!
 //! # Intentional gaps
 //!
-//! IME/preedit, drag-and-drop, touch, tablet input, cursor themes and the
-//! primary selection are not implemented. Window position is controlled by the
-//! compositor, so `position`/`set_position` report or accept a best-effort
-//! value and cannot be used for absolute placement. Fractional scaling is
-//! honoured when both `fractional-scale-v1` and `viewporter` are advertised;
-//! otherwise the integer output scale is rounded.
+//! Touch, tablet input, cursor themes and the primary selection are not
+//! implemented. `zwp_text_input_v3` provides pre-edit, commit and
+//! delete-surrounding-text events behind the `wayland` feature. `wl_data_device`
+//! drag targets (enter/motion/leave/drop) are supported; drag sources are not.
+//! Window position is controlled by the compositor, so
+//! `position`/`set_position` report or accept a best-effort value and cannot be
+//! used for absolute placement. Fractional scaling is honoured when both
+//! `fractional-scale-v1` and `viewporter` are advertised; otherwise the integer
+//! output scale is rounded.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -44,12 +47,16 @@ use wayland_client::{
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use crate::clipboard::{
     ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken,
 };
+use crate::dnd::{parse_uri_list, DragSession};
 use crate::types::{
     keysym, KeyAction, KeyInput, Modifiers, MouseButton, PointerShape, Selection, WindowConfig,
     WindowError, WindowEvent,
@@ -480,6 +487,136 @@ struct ClipboardRead {
     data: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct DragRead {
+    target: String,
+    x: f64,
+    y: f64,
+    file: UnixStream,
+    data: Vec<u8>,
+    deadline: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TextInputPending {
+    preedit: Option<(String, Option<(usize, usize)>)>,
+    commit: Option<String>,
+    delete: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TextInputState {
+    enabled: bool,
+    focused: bool,
+    pending: TextInputPending,
+    serial: u32,
+    preedit: String,
+    cursor: Option<(usize, usize)>,
+}
+
+impl TextInputState {
+    #[cfg(test)]
+    fn serial(&self) -> u32 {
+        self.serial
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> bool {
+        if self.enabled == enabled {
+            return false;
+        }
+        self.enabled = enabled;
+        if !enabled {
+            self.focused = false;
+            self.pending = TextInputPending::default();
+            self.preedit.clear();
+            self.cursor = None;
+        }
+        true
+    }
+
+    fn enter(&mut self) {
+        self.focused = true;
+    }
+
+    fn leave(&mut self) -> Vec<WindowEvent> {
+        self.focused = false;
+        self.pending = TextInputPending::default();
+        if self.preedit.is_empty() && self.cursor.is_none() {
+            return Vec::new();
+        }
+        self.preedit.clear();
+        self.cursor = None;
+        vec![WindowEvent::Preedit {
+            text: String::new(),
+            cursor: None,
+        }]
+    }
+
+    fn set_preedit(&mut self, text: String, cursor_begin: i32, cursor_end: i32) {
+        let cursor = text_cursor_range(&text, cursor_begin, cursor_end);
+        self.pending.preedit = Some((text, cursor));
+    }
+
+    fn set_commit(&mut self, text: String) {
+        self.pending.commit = Some(text);
+    }
+
+    fn set_delete(&mut self, before: u32, after: u32) {
+        self.pending.delete = Some((before, after));
+    }
+
+    fn done(&mut self, serial: u32) -> Vec<WindowEvent> {
+        self.serial = serial;
+        let mut events = Vec::new();
+        if let Some((text, cursor)) = self.pending.preedit.take() {
+            if text != self.preedit || cursor != self.cursor {
+                self.preedit = text.clone();
+                self.cursor = cursor;
+                events.push(WindowEvent::Preedit { text, cursor });
+            }
+        }
+        if let Some(text) = self.pending.commit.take() {
+            if !text.is_empty() {
+                if !self.preedit.is_empty() {
+                    self.preedit.clear();
+                    self.cursor = None;
+                    events.push(WindowEvent::Preedit {
+                        text: String::new(),
+                        cursor: None,
+                    });
+                }
+                events.push(WindowEvent::Commit { text });
+            }
+        }
+        if let Some((before, after)) = self.pending.delete.take() {
+            events.push(WindowEvent::DeleteSurrounding { before, after });
+        }
+        events
+    }
+}
+
+fn clamp_byte_offset(text: &str, offset: i32) -> usize {
+    let mut offset = offset.max(0) as usize;
+    if offset > text.len() {
+        offset = text.len();
+    }
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn text_cursor_range(text: &str, begin: i32, end: i32) -> Option<(usize, usize)> {
+    if begin < 0 && end < 0 {
+        return None;
+    }
+    let first = clamp_byte_offset(text, begin.max(0));
+    let last = clamp_byte_offset(text, if end < 0 { begin.max(0) } else { end });
+    let first = text[..first].chars().count();
+    let last = text[..last].chars().count();
+    Some((first.min(last), first.max(last)))
+}
+
 // }}}
 // {{{ Protocol state helpers (unit tested without a compositor)
 
@@ -643,7 +780,16 @@ pub struct WaylandWindow {
     data_device: Option<wl_data_device::WlDataDevice>,
     data_offer: Option<wl_data_offer::WlDataOffer>,
     pending_offer: Option<wl_data_offer::WlDataOffer>,
+    pending_offer_mimes: Vec<String>,
     data_offer_mimes: Vec<String>,
+    dnd_offer: Option<wl_data_offer::WlDataOffer>,
+    dnd_mimes: Vec<String>,
+    dnd_session: DragSession,
+    dnd_serial: u32,
+    dnd_reads: Vec<DragRead>,
+    text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
+    text_input_state: TextInputState,
     data_source: Option<wl_data_source::WlDataSource>,
     source_selection: Option<Selection>,
     clipboard: ClipboardState,
@@ -727,7 +873,19 @@ impl WaylandWindow {
             data_device: None,
             data_offer: None,
             pending_offer: None,
+            pending_offer_mimes: Vec::new(),
             data_offer_mimes: Vec::new(),
+            dnd_offer: None,
+            dnd_mimes: Vec::new(),
+            dnd_session: DragSession::default(),
+            dnd_serial: 0,
+            dnd_reads: Vec::new(),
+            text_input_manager: None,
+            text_input: None,
+            text_input_state: TextInputState {
+                enabled: true,
+                ..TextInputState::default()
+            },
             data_source: None,
             source_selection: None,
             clipboard: ClipboardState::default(),
@@ -798,6 +956,10 @@ impl WaylandWindow {
 
         if let (Some(manager), Some(seat)) = (self.data_device_manager.clone(), self.seat.clone()) {
             self.data_device = Some(manager.get_data_device(&seat, &self.qh, ()));
+        }
+
+        if let (Some(manager), Some(seat)) = (self.text_input_manager.clone(), self.seat.clone()) {
+            self.text_input = Some(manager.get_text_input(&seat, &self.qh, ()));
         }
 
         self.surface = Some(surface.clone());
@@ -1038,6 +1200,70 @@ impl WaylandWindow {
         self.pointer_shape
     }
 
+    /// Enable or disable `zwp_text_input_v3` processing.
+    pub fn set_ime_enabled(&mut self, enabled: bool) {
+        let had_preedit = !self.text_input_state.preedit.is_empty();
+        if !self.text_input_state.set_enabled(enabled) {
+            return;
+        }
+        if !enabled && had_preedit {
+            self.inbox.push_back(WindowEvent::Preedit {
+                text: String::new(),
+                cursor: None,
+            });
+        }
+        if let Some(text_input) = self.text_input.clone() {
+            if enabled {
+                if self.text_input_state.focused {
+                    text_input.enable();
+                    text_input.set_cursor_rectangle(0, 0, self.width as i32, self.height as i32);
+                }
+            } else {
+                text_input.disable();
+            }
+            text_input.commit();
+        }
+    }
+
+    pub fn ime_enabled(&self) -> bool {
+        self.text_input_state.enabled
+    }
+
+    pub fn has_text_input(&self) -> bool {
+        self.text_input.is_some()
+    }
+
+    /// Accept the current drag. Wayland requires the MIME type to be fixed
+    /// before the source will send data.
+    pub fn drag_accept(&mut self, target: Option<&str>) -> Result<Option<String>, WindowError> {
+        if !self.dnd_session.is_active() {
+            return Ok(None);
+        }
+        let chosen = self.dnd_session.accept(target);
+        if let Some(offer) = &self.dnd_offer {
+            offer.accept(self.dnd_serial, chosen.clone());
+        }
+        Ok(chosen)
+    }
+
+    pub fn drag_reject(&mut self) {
+        if !self.dnd_session.is_active() {
+            return;
+        }
+        self.dnd_session.reject();
+        if let Some(offer) = &self.dnd_offer {
+            offer.accept(self.dnd_serial, None);
+        }
+    }
+
+    pub fn is_drag_active(&self) -> bool {
+        self.dnd_session.is_active()
+    }
+
+    pub fn drag_target(&self) -> Option<&str> {
+        self.dnd_session.chosen_target()
+    }
+
     pub fn bell(&mut self) {}
 
     pub fn set_fullscreen(&mut self, fullscreen: bool) {
@@ -1115,6 +1341,7 @@ impl WaylandWindow {
 
     fn pump(&mut self, timeout_ms: i32) {
         self.drain_clipboard_reads();
+        self.drain_drag_reads();
         let start = Instant::now();
         let mut woken = false;
         let mut queue = match self.queue.take() {
@@ -1181,6 +1408,7 @@ impl WaylandWindow {
             self.inbox.push_back(WindowEvent::Wakeup);
         }
         self.drain_clipboard_reads();
+        self.drain_drag_reads();
         self.repeat_tick();
     }
 
@@ -1496,6 +1724,112 @@ impl WaylandWindow {
         }
     }
 
+    fn begin_wayland_drop(&mut self) {
+        if !self.dnd_session.is_active() {
+            return;
+        }
+        let Some(target) = self.dnd_session.chosen_target().map(str::to_owned) else {
+            self.dnd_session.leave();
+            if let Some(offer) = self.dnd_offer.take() {
+                offer.destroy();
+            }
+            return;
+        };
+        let Some(offer) = self.dnd_offer.clone() else {
+            return;
+        };
+        let (x, y) = self.dnd_session.position();
+        offer.accept(self.dnd_serial, Some(target.clone()));
+        let (read, write) = match UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(_) => {
+                self.dnd_session.leave();
+                return;
+            }
+        };
+        let _ = read.set_nonblocking(true);
+        offer.receive(target.clone(), write.as_fd());
+        drop(write);
+        self.dnd_reads.push(DragRead {
+            target,
+            x,
+            y,
+            file: read,
+            data: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(10),
+        });
+    }
+
+    fn drain_drag_reads(&mut self) {
+        let now = Instant::now();
+        let mut index = 0;
+        while index < self.dnd_reads.len() {
+            let mut finished = false;
+            let mut failure = false;
+            {
+                let read = &mut self.dnd_reads[index];
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match read.file.read(&mut buffer) {
+                        Ok(0) => {
+                            finished = true;
+                            break;
+                        }
+                        Ok(count) => read.data.extend_from_slice(&buffer[..count]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            failure = true;
+                            finished = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if finished {
+                let read = self.dnd_reads.remove(index);
+                if failure {
+                    self.inbox.push_back(WindowEvent::DragLeave);
+                } else {
+                    let is_uri_list = read.target.eq_ignore_ascii_case("text/uri-list");
+                    let (paths, text) = if is_uri_list {
+                        let payload = String::from_utf8_lossy(&read.data);
+                        (parse_uri_list(&payload), None)
+                    } else {
+                        (
+                            Vec::new(),
+                            Some(String::from_utf8_lossy(&read.data).into_owned()),
+                        )
+                    };
+                    self.inbox.push_back(WindowEvent::DragDrop {
+                        x: read.x,
+                        y: read.y,
+                        paths,
+                        text,
+                        target: Some(read.target),
+                    });
+                }
+                if let Some(offer) = self.dnd_offer.take() {
+                    if !failure {
+                        offer.finish();
+                    }
+                    offer.destroy();
+                }
+                self.dnd_session.leave();
+                self.dnd_mimes.clear();
+            } else if self.dnd_reads[index].deadline <= now {
+                self.dnd_reads.remove(index);
+                self.inbox.push_back(WindowEvent::DragLeave);
+                if let Some(offer) = self.dnd_offer.take() {
+                    offer.destroy();
+                }
+                self.dnd_session.leave();
+                self.dnd_mimes.clear();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     // }}}
     // {{{ Synthetic events for tests
 
@@ -1541,7 +1875,14 @@ impl WaylandWindow {
             | WindowEvent::Expose { .. }
             | WindowEvent::SelectionClear { .. }
             | WindowEvent::SelectionRequest { .. }
-            | WindowEvent::SelectionNotify { .. } => {
+            | WindowEvent::SelectionNotify { .. }
+            | WindowEvent::Preedit { .. }
+            | WindowEvent::Commit { .. }
+            | WindowEvent::DeleteSurrounding { .. }
+            | WindowEvent::DragEnter { .. }
+            | WindowEvent::DragMotion { .. }
+            | WindowEvent::DragDrop { .. }
+            | WindowEvent::DragLeave => {
                 self.inbox.push_back(event.clone());
                 Ok(())
             }
@@ -1621,6 +1962,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandWindow {
                 }
                 "wp_viewporter" if state.viewporter.is_none() => {
                     state.viewporter = Some(registry.bind(name, version.clamp(1, 1), qh, ()));
+                }
+                "zwp_text_input_manager_v3" if state.text_input_manager.is_none() => {
+                    state.text_input_manager =
+                        Some(registry.bind(name, version.clamp(1, 1), qh, ()));
                 }
                 _ => {}
             }
@@ -1929,19 +2274,67 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandWindow {
         match event {
             wl_data_device::Event::DataOffer { id } => {
                 state.pending_offer = Some(id);
-                state.data_offer_mimes.clear();
+                state.pending_offer_mimes.clear();
             }
             wl_data_device::Event::Selection { id } => {
                 if let Some(old) = state.data_offer.take() {
                     old.destroy();
                 }
-                state.data_offer = id.or_else(|| state.pending_offer.take());
+                let pending = state.pending_offer.take();
+                state.data_offer = id.or(pending);
+                state.data_offer_mimes = std::mem::take(&mut state.pending_offer_mimes);
                 if state.data_offer.is_none() {
                     state.data_offer_mimes.clear();
                 }
             }
-            // Drag-and-drop enter/motion/leave/drop are not implemented; they
-            // must not disturb the clipboard selection.
+            wl_data_device::Event::Enter {
+                serial, x, y, id, ..
+            } => {
+                if let Some(old) = state.dnd_offer.take() {
+                    old.destroy();
+                }
+                let pending = state.pending_offer.take();
+                state.dnd_offer = id.or(pending);
+                state.dnd_mimes = std::mem::take(&mut state.pending_offer_mimes);
+                state.dnd_serial = serial;
+                state.dnd_session.begin(state.dnd_mimes.clone());
+                state.dnd_session.set_position(x, y);
+                state.dnd_session.set_serial(serial);
+                let targets = state.dnd_session.targets().to_vec();
+                state
+                    .inbox
+                    .push_back(WindowEvent::DragEnter { x, y, targets });
+            }
+            wl_data_device::Event::Motion { x, y, .. } => {
+                if !state.dnd_session.is_active() {
+                    return;
+                }
+                state.dnd_session.set_position(x, y);
+                if let (Some(offer), Some(target)) =
+                    (&state.dnd_offer, state.dnd_session.chosen_target())
+                {
+                    if !state.dnd_session.is_rejected() {
+                        offer.accept(state.dnd_serial, Some(target.to_owned()));
+                    }
+                }
+                let targets = state.dnd_session.targets().to_vec();
+                state
+                    .inbox
+                    .push_back(WindowEvent::DragMotion { x, y, targets });
+            }
+            wl_data_device::Event::Leave => {
+                if state.dnd_session.leave() {
+                    state.inbox.push_back(WindowEvent::DragLeave);
+                }
+                if let Some(offer) = state.dnd_offer.take() {
+                    offer.destroy();
+                }
+                state.dnd_mimes.clear();
+                state.dnd_reads.clear();
+            }
+            wl_data_device::Event::Drop => {
+                state.begin_wayland_drop();
+            }
             _ => {}
         }
     }
@@ -1950,15 +2343,31 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandWindow {
 impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandWindow {
     fn event(
         state: &mut Self,
-        _: &wl_data_offer::WlDataOffer,
+        offer: &wl_data_offer::WlDataOffer,
         event: wl_data_offer::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_data_offer::Event::Offer { mime_type } = event {
-            if !state.data_offer_mimes.contains(&mime_type) {
-                state.data_offer_mimes.push(mime_type);
+            let id = offer.id().protocol_id();
+            let list = if state
+                .pending_offer
+                .as_ref()
+                .is_some_and(|pending| pending.id().protocol_id() == id)
+            {
+                &mut state.pending_offer_mimes
+            } else if state
+                .dnd_offer
+                .as_ref()
+                .is_some_and(|dnd| dnd.id().protocol_id() == id)
+            {
+                &mut state.dnd_mimes
+            } else {
+                &mut state.data_offer_mimes
+            };
+            if !list.contains(&mime_type) {
+                list.push(mime_type);
             }
         }
     }
@@ -2041,6 +2450,66 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandWindow
     }
 }
 
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        _: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => {
+                state.text_input_state.enter();
+                if state.text_input_state.enabled {
+                    if let Some(text_input) = state.text_input.clone() {
+                        text_input.enable();
+                        text_input.set_cursor_rectangle(
+                            0,
+                            0,
+                            state.width as i32,
+                            state.height as i32,
+                        );
+                        text_input.commit();
+                    }
+                }
+            }
+            zwp_text_input_v3::Event::Leave { .. } => {
+                let events = state.text_input_state.leave();
+                state.inbox.extend(events);
+            }
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => {
+                state.text_input_state.set_preedit(
+                    text.unwrap_or_default(),
+                    cursor_begin,
+                    cursor_end,
+                );
+            }
+            zwp_text_input_v3::Event::CommitString { text } => {
+                state.text_input_state.set_commit(text.unwrap_or_default());
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => {
+                state
+                    .text_input_state
+                    .set_delete(before_length, after_length);
+            }
+            zwp_text_input_v3::Event::Done { serial } => {
+                let events = state.text_input_state.done(serial);
+                state.inbox.extend(events);
+            }
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(WaylandWindow: ignore wl_compositor::WlCompositor);
 delegate_noop!(WaylandWindow: ignore wl_shm::WlShm);
 delegate_noop!(WaylandWindow: ignore wl_shm_pool::WlShmPool);
@@ -2049,6 +2518,7 @@ delegate_noop!(WaylandWindow: ignore wl_data_device_manager::WlDataDeviceManager
 delegate_noop!(WaylandWindow: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandWindow: ignore wp_viewport::WpViewport);
 delegate_noop!(WaylandWindow: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+delegate_noop!(WaylandWindow: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 
 // }}}
 // {{{ Tests that do not need a compositor
@@ -2172,6 +2642,109 @@ mod tests {
         assert_eq!(text.as_deref(), Some("a"));
         assert_eq!(fallback_key(30, KeyAction::Release).1, None);
         assert_eq!(fallback_key(1, KeyAction::Press).0, keysym::ESCAPE);
+    }
+    #[test]
+    fn text_input_enable_disable_is_idempotent() {
+        let mut state = TextInputState::default();
+        assert!(!state.enabled);
+        assert!(state.set_enabled(true));
+        assert!(state.enabled);
+        assert!(!state.set_enabled(true));
+        state.enter();
+        assert!(state.focused);
+        assert!(state.set_enabled(false));
+        assert!(!state.enabled);
+        assert!(!state.focused);
+    }
+
+    #[test]
+    fn text_input_preedit_and_commit_apply_on_done() {
+        let mut state = TextInputState::default();
+        state.set_enabled(true);
+        state.enter();
+        state.set_preedit("にほ".to_owned(), 6, 6);
+        state.set_commit("日本".to_owned());
+        let events = state.done(7);
+        assert_eq!(state.serial(), 7);
+        assert_eq!(
+            events,
+            vec![
+                WindowEvent::Preedit {
+                    text: "にほ".to_owned(),
+                    cursor: Some((2, 2))
+                },
+                WindowEvent::Preedit {
+                    text: String::new(),
+                    cursor: None
+                },
+                WindowEvent::Commit {
+                    text: "日本".to_owned()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn text_input_preedit_cursor_uses_utf8_byte_offsets() {
+        let mut state = TextInputState::default();
+        state.set_preedit("café".to_owned(), 3, 5);
+        let events = state.done(1);
+        assert_eq!(
+            events,
+            vec![WindowEvent::Preedit {
+                text: "café".to_owned(),
+                cursor: Some((3, 4))
+            }]
+        );
+        state.set_preedit("café".to_owned(), -1, -1);
+        let events = state.done(2);
+        assert_eq!(
+            events,
+            vec![WindowEvent::Preedit {
+                text: "café".to_owned(),
+                cursor: None
+            }]
+        );
+    }
+
+    #[test]
+    fn text_input_delete_surrounding_is_reported() {
+        let mut state = TextInputState::default();
+        state.set_delete(4, 7);
+        assert_eq!(
+            state.done(1),
+            vec![WindowEvent::DeleteSurrounding {
+                before: 4,
+                after: 7
+            }]
+        );
+        assert!(state.done(2).is_empty());
+    }
+
+    #[test]
+    fn text_input_leave_clears_visible_preedit() {
+        let mut state = TextInputState::default();
+        state.enter();
+        state.set_preedit("x".to_owned(), 1, 1);
+        state.done(1);
+        assert_eq!(
+            state.leave(),
+            vec![WindowEvent::Preedit {
+                text: String::new(),
+                cursor: None
+            }]
+        );
+        assert!(!state.focused);
+        assert!(state.leave().is_empty());
+    }
+
+    #[test]
+    fn text_input_ignores_unchanged_preedit() {
+        let mut state = TextInputState::default();
+        state.set_preedit("same".to_owned(), 4, 4);
+        assert_eq!(state.done(1).len(), 1);
+        state.set_preedit("same".to_owned(), 4, 4);
+        assert!(state.done(2).is_empty());
     }
 }
 

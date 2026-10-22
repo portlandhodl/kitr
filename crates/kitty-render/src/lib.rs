@@ -15,6 +15,10 @@
 //!   geometry, window/tab-bar borders, padding rects and rounded-corner
 //!   tessellation, ported from `kitty/decorations.c`, `kitty/borders.py` and
 //!   `kitty/tab_bar.py`;
+//! * [`overlays`] — selection ranges, hyperlink hover state, tab-bar
+//!   descriptions and overlay counters;
+//! * [`shaped`] — shaped-run requests, cluster sprites and stable run hashes;
+//! * [`font_rasterizer`] — optional `kitty-fonts` FreeType/HarfBuzz adapter;
 //! * [`RendererCore`] — the persistent object that owns an atlas and damage
 //!   tracker and produces [`Frame`]s.
 //!
@@ -49,6 +53,19 @@
 //! * Block, beam, underline and hollow cursor geometry.
 //! * Straight, double, curly, dotted and dashed underlines plus
 //!   strikethrough, with a separate decoration colour.
+//! * Multiple cell/word/line/block selection ranges with selection foreground
+//!   and background tinting, including scrollback range rows and the current
+//!   `Screen::scrolled_by` view offset.
+//! * OSC 8 hyperlink spans with a dotted underline, an optional whole-link
+//!   hover highlight and URL colour from [`ColorResolver`].
+//! * A top tab bar with per-tab inactive/active backgrounds, borders and title
+//!   glyphs rendered through the normal atlas path. [`TabBarSpec`] carries
+//!   titles, active index, colours and height; overflow is clipped, not
+//!   scrolled.
+//! * Shaped-run sprites: contiguous same-style cells are shaped through
+//!   [`GlyphRasterizer::shape_run`]; ligature and combining clusters become one
+//!   atlas sprite keyed by a stable run hash. The generator falls back to
+//!   per-cell glyphs when shaping is unavailable or fails.
 //! * Window borders with compensatory padding and rounded-corner geometry,
 //!   tab-bar blank/margin rectangles, padding rectangles.
 //! * Gray8 and RGBA8 atlas pages with deterministic shelf packing, UVs,
@@ -109,12 +126,24 @@
 //!   present. Background images survive a GPU resize, but the frame must be
 //!   regenerated with the new [`RenderConfig::viewport_width`] /
 //!   [`RenderConfig::viewport_height`] so the quad covers the new drawable.
-//! * Selection/hyperlink overlays, marks and URL underlines; the resolver
-//!   traits expose the colours needed to add them later.
+//! * Selection marks (mark/scrollbar ranges), URL hover *menus* and custom
+//!   selection shaders. Selections only tint cell backgrounds/foregrounds;
+//!   they do not alter text extraction.
+//! * Tab-bar scrolling, vertical tab bars, tab-bar margins/edge colours beyond
+//!   the simple [`TabBarSpec`] geometry, and tab icons/close buttons.
 //! * Custom user shaders and the full kitty shader pipeline.
-//! * Ligature/multicell shaping, shaped-run sprite caching and colour glyph
-//!   formats (COLR/CBDT/SVG). [`GlyphRasterizer`] is the insertion point for
-//!   `kitty-fonts` once rasterization exists there.
+//! * Shaped runs are limited to at most [`SHAPED_RUN_MAX_CELLS`] contiguous
+//!   single-width cells with the same style, foreground, background and
+//!   hyperlink, and to 24 codepoints per key. Selected/hovered runs, wide
+//!   cells and runs crossing row boundaries fall back to per-cell glyphs.
+//!   Shaping forces LTR and does not implement bidirectional reordering or
+//!   complex-script cell segmentation.
+//! * Colour glyph formats (COLR/CPAL layers, CBDT/CBLC and SVG-in-OpenType) in
+//!   the shaped-run compositor. [`FontRasterizer`] shapes and composites Gray8
+//!   clusters only and returns `None` for colour glyphs so the caller falls
+//!   back.
+//! * Multicell text-sizing (`TextSizing`/OSC 66) and ligature expansion beyond
+//!   the cells already present in the screen's text cache.
 //! * Blink animation (the flag is carried but not animated) and font-fallback
 //!   selection plus rendered-glyph disk caching.
 //!
@@ -129,9 +158,12 @@ pub mod colors;
 pub mod core;
 pub mod damage;
 pub mod decorations;
+pub mod font_rasterizer;
 pub mod geom;
 pub mod images;
 pub mod instances;
+pub mod overlays;
+pub mod shaped;
 pub mod trail;
 
 #[cfg(feature = "gl")]
@@ -163,6 +195,7 @@ pub use decorations::{
     vertical_edge, BorderColor, BorderRect, DecorationGeometry, DecorationMask, Edge,
     TabBarBlankRectConfig, Triangle, UnderlineStyle, Vertex, WindowGeometry,
 };
+pub use font_rasterizer::FontRasterizer;
 pub use geom::{CellMetrics, EdgeWidths, GridGeometry, Rect, Region};
 pub use images::{
     background_image, background_quad, clip_rect_uv, collect_protocol_images, fingerprint,
@@ -174,6 +207,13 @@ pub use instances::{
     BackgroundInstance, CursorGeometry, CursorInstance, DecorationInstance, DecorationKind, Frame,
     GlyphInstance, InstanceFlags, InstanceGenerator, RenderConfig, GLYPH_FLAG_BOLD,
     GLYPH_FLAG_COLOR, GLYPH_FLAG_ITALIC,
+};
+pub use overlays::{
+    interval_contains, selection_intervals, HyperlinkHover, OverlayStats, SelectionCell,
+    SelectionRange, TabBarColors, TabBarFrame, TabBarSpec, TabBarTab,
+};
+pub use shaped::{
+    shaped_run_hash, ShapedRunCluster, ShapedRunOutput, ShapedRunRequest, SHAPED_RUN_MAX_CELLS,
 };
 pub use trail::{CursorTrail, CursorTrailConfig, TrailInstance};
 

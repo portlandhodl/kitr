@@ -40,6 +40,8 @@ const DEFAULT_SCROLLBACK: u32 = 10_000;
 #[cfg(feature = "gui")]
 pub mod gui;
 
+pub mod remote_client;
+
 static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Parsed command line options.
@@ -63,6 +65,10 @@ pub struct Options {
     pub screenshot: Option<std::path::PathBuf>,
     /// True when `--scrollback` was given on the command line.
     pub scrollback_explicit: bool,
+    /// Load tabs/windows from this kitty session file.
+    pub session: Option<std::path::PathBuf>,
+    /// Remote-control socket (`unix:/path`, `unix:@abstract` or a path).
+    pub listen_on: Option<OsString>,
 }
 
 /// Frontend selection.
@@ -91,6 +97,8 @@ impl Default for Options {
             title: None,
             screenshot: None,
             scrollback_explicit: false,
+            session: None,
+            listen_on: None,
         }
     }
 }
@@ -176,13 +184,20 @@ Options:\n\
   --config PATH      Load configuration from PATH\n\
   --title TITLE      Set the window title\n\
   --screenshot FILE  Render a few frames, write FILE as PPM (P6), then exit\n\
+  --session FILE     Restore tabs/windows/layouts from a kitty session file\n\
+  --listen-on ADDR   Start remote control on unix:/path or unix:@abstract name\n\
   -h, --help         Show this help\n\
   -V, --version      Show the version\n\
 \n\
 The GUI is used by default when $DISPLAY is set. If no command is given,\n\
 $SHELL (or /bin/sh) is started. Everything after -e or -- is passed through\n\
 as argv without further option parsing. The shortcut `kitr -c 'script'`\n\
-runs the default shell with -c.\n";
+runs the default shell with -c.\n\
+\n\
+Remote control client:\n\
+  kitr @ --to=unix:/path get-text [--extent=screen|all|selection]\n\
+  kitr @ --to=unix:@name send-text 'text' | resize-window | close-window | screenshot\n\
+  The socket can also come from $KITTY_LISTEN_ON.\n";
 
 /// Parse `kitr` arguments.
 pub fn parse_args<I, S>(args: I) -> Result<CliAction, ArgError>
@@ -211,6 +226,14 @@ where
             "--screenshot" => {
                 let value = iter.next().ok_or(ArgError::MissingValue("--screenshot"))?;
                 options.screenshot = Some(std::path::PathBuf::from(value));
+            }
+            "--session" => {
+                let value = iter.next().ok_or(ArgError::MissingValue("--session"))?;
+                options.session = Some(std::path::PathBuf::from(value));
+            }
+            "--listen-on" => {
+                let value = iter.next().ok_or(ArgError::MissingValue("--listen-on"))?;
+                options.listen_on = Some(value);
             }
             "-e" | "--" => {
                 options.use_separator = true;
@@ -249,6 +272,12 @@ where
             }
             _ if text.starts_with("--screenshot=") => {
                 options.screenshot = Some(std::path::PathBuf::from(&text["--screenshot=".len()..]));
+            }
+            _ if text.starts_with("--session=") => {
+                options.session = Some(std::path::PathBuf::from(&text["--session=".len()..]));
+            }
+            _ if text.starts_with("--listen-on=") => {
+                options.listen_on = Some(OsString::from(&text["--listen-on=".len()..]));
             }
             _ if text.starts_with("--scrollback=") => {
                 options.scrollback = parse_u32("--scrollback", &text["--scrollback=".len()..])?;
@@ -316,7 +345,10 @@ fn use_gui(options: &Options) -> bool {
         GuiMode::Headless => false,
         GuiMode::Auto => {
             !options.dump_screen
-                && (options.screenshot.is_some() || std::env::var_os("DISPLAY").is_some())
+                && (options.screenshot.is_some()
+                    || options.session.is_some()
+                    || options.listen_on.is_some()
+                    || std::env::var_os("DISPLAY").is_some())
         }
     }
 }
@@ -327,6 +359,10 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if args.first().is_some_and(|arg| arg == OsStr::new("@")) {
+        return remote_client::run_client(&args[1..]);
+    }
     let action =
         parse_args(args).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     match action {
@@ -963,6 +999,24 @@ mod tests {
         );
         assert_eq!(options.scrollback, 42);
         assert!(options.scrollback_explicit);
+
+        let action = parse_args([
+            "--session=/tmp/test.session",
+            "--listen-on",
+            "unix:@kitr-test",
+        ])
+        .unwrap();
+        let CliAction::Run(options) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(
+            options.session.as_deref(),
+            Some(std::path::Path::new("/tmp/test.session"))
+        );
+        assert_eq!(
+            options.listen_on.as_deref(),
+            Some(OsStr::new("unix:@kitr-test"))
+        );
 
         let action = parse_args(["--headless"]).unwrap();
         let CliAction::Run(options) = action else {

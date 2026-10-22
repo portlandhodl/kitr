@@ -7,15 +7,16 @@
 //! cleanly when Xvfb, EGL or the system fonts are unavailable. Every loop is
 //! bounded so a broken event loop cannot hang the test suite.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
 use kitty::gui::GuiSession;
 use kitty::Input;
 use kitty_os::pty;
-use kitty_window::{keysym, probe_display, KeyAction, KeyInput, WindowEvent};
+use kitty_window::{keysym, probe_display, KeyAction, KeyInput, Modifiers, WindowEvent};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static REPORT_SKIP_ONCE: Once = Once::new();
@@ -351,6 +352,362 @@ fn wait_child_timeout(child: &mut Child, timeout: Duration) -> std::process::Exi
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn inject_key(session: &mut GuiSession, symbol: u32, control: bool, shift: bool, alt: bool) {
+    let mut modifiers = Modifiers {
+        control,
+        shift,
+        alt,
+        ..Modifiers::default()
+    };
+    // X11 key events carry modifiers in `state`; inject_event forwards that
+    // field verbatim rather than the boolean flags.
+    modifiers.raw_state = (u32::from(shift)) | (u32::from(control) << 2) | (u32::from(alt) << 3);
+    let press = KeyInput::new(symbol, KeyAction::Press).with_modifiers(modifiers);
+    session
+        .inject_event(&WindowEvent::Key(press))
+        .expect("inject key press");
+    let release = KeyInput::new(symbol, KeyAction::Release).with_modifiers(modifiers);
+    session
+        .inject_event(&WindowEvent::Key(release))
+        .expect("inject key release");
+}
+
+fn run_remote_while_stepping(session: &mut GuiSession, args: &[&str], timeout: Duration) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kitr"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kitr @");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("try_wait client").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("remote client did not finish within {timeout:?}");
+        }
+        let _ = session.step(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    child.wait_with_output().expect("client output")
+}
+
+#[test]
+fn tabs_create_switch_and_close() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let opts = options(&["/bin/sh", "-c", "printf 'tab-one'; sleep 20"], (40, 8));
+    let mut session = match GuiSession::open_on_display(&opts, Input::None, Some(&display.name)) {
+        Ok(session) => session,
+        Err(error) => {
+            skip(&format!("EGL/window unavailable: {error}"));
+            return;
+        }
+    };
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(5),
+        |session| { dump(session).contains("tab-one") }
+    ));
+    assert_eq!(session.tab_count(), 1);
+
+    inject_key(&mut session, b't' as u32, true, true, false);
+    assert!(
+        wait_until(&mut session, Duration::from_secs(5), |session| {
+            session.tab_count() == 2
+        }),
+        "Ctrl+Shift+T did not create a tab"
+    );
+
+    inject_key(&mut session, keysym::LEFT, true, true, false);
+    assert!(
+        wait_until(&mut session, Duration::from_secs(3), |session| {
+            session.active_tab_index() == 0 && dump(session).contains("tab-one")
+        }),
+        "Ctrl+Shift+Left did not activate the first tab"
+    );
+
+    inject_key(&mut session, keysym::RIGHT, true, true, false);
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(3),
+        |session| { session.active_tab_index() == 1 }
+    ));
+
+    inject_key(&mut session, b'w' as u32, true, true, false);
+    assert!(
+        wait_until(&mut session, Duration::from_secs(5), |session| {
+            session.tab_count() == 1 && session.active_tab_index() == 0
+        }),
+        "Ctrl+Shift+W did not close the active tab"
+    );
+    session.shutdown();
+}
+
+#[test]
+fn session_restore_opens_tabs_and_layouts() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!(
+        "kitr-session-{}-{}.session",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        "new_tab alpha\n\
+layout splits\n\
+enabled_layouts splits\n\
+launch --title=alpha /bin/sh -c \"printf alpha; sleep 20\"\n\
+new_tab beta\n\
+launch --title=beta /bin/sh -c \"printf beta; sleep 20\"\n\
+focus\n",
+    )
+    .expect("write session");
+    let opts = kitty::Options {
+        size: Some((50, 10)),
+        gui: kitty::GuiMode::Gui,
+        session: Some(path.clone()),
+        ..kitty::Options::default()
+    };
+    let mut session = match GuiSession::open_on_display(&opts, Input::None, Some(&display.name)) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            skip(&format!("EGL/window unavailable: {error}"));
+            return;
+        }
+    };
+    assert_eq!(session.tab_count(), 2, "session tabs were not restored");
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(5),
+        |session| { dump(session).contains("beta") }
+    ));
+    let titles = session.tab_titles();
+    assert!(
+        titles.iter().any(|title| title.contains("alpha")),
+        "{titles:?}"
+    );
+    assert!(
+        titles.iter().any(|title| title.contains("beta")),
+        "{titles:?}"
+    );
+
+    inject_key(&mut session, keysym::LEFT, true, true, false);
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(5),
+        |session| { dump(session).contains("alpha") }
+    ));
+
+    let bad = std::env::temp_dir().join(format!("kitr-bad-{}.session", std::process::id()));
+    std::fs::write(&bad, "not_a_session_command foo\n").unwrap();
+    let bad_opts = kitty::Options {
+        session: Some(bad.clone()),
+        ..opts.clone()
+    };
+    let error = match GuiSession::open_on_display(&bad_opts, Input::None, Some(&display.name)) {
+        Ok(mut session) => {
+            session.shutdown();
+            panic!("invalid session unexpectedly opened");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("session"), "unclear error: {error}");
+    let _ = std::fs::remove_file(&bad);
+    let _ = std::fs::remove_file(&path);
+    session.shutdown();
+}
+
+#[test]
+fn split_and_pane_focus() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let opts = options(&["/bin/cat"], (60, 12));
+    let mut session = match GuiSession::open_on_display(&opts, Input::None, Some(&display.name)) {
+        Ok(session) => session,
+        Err(error) => {
+            skip(&format!("EGL/window unavailable: {error}"));
+            return;
+        }
+    };
+    let _ = session.step(Duration::from_millis(100));
+    let first = session.active_window_id().expect("active window");
+    inject_key(&mut session, keysym::RETURN, true, true, false);
+    assert!(
+        wait_until(&mut session, Duration::from_secs(5), |session| {
+            session.pane_count() == 2
+        }),
+        "Ctrl+Shift+Enter did not split the tab"
+    );
+    let second = session.active_window_id().expect("active window");
+    assert_ne!(first, second);
+    let first_rect = session.pane_rect(first).expect("first pane rect");
+    let second_rect = session.pane_rect(second).expect("second pane rect");
+    assert!(first_rect.2 > 0 && first_rect.3 > 0);
+    assert!(second_rect.2 > 0 && second_rect.3 > 0);
+    assert!(
+        first_rect.2 < 60,
+        "existing pane was not relaid out: {first_rect:?}"
+    );
+    assert_ne!((first_rect.0, first_rect.1), (second_rect.0, second_rect.1));
+
+    inject_key(&mut session, keysym::LEFT, true, false, true);
+    assert!(
+        wait_until(&mut session, Duration::from_secs(3), |session| {
+            session.active_window_id() == Some(first)
+        }),
+        "Ctrl+Alt+Left did not focus the left pane"
+    );
+    session.render_now().expect("render split");
+    let (_, _, pixels) = session.capture_rgba().expect("framebuffer");
+    assert!(pixels.iter().any(|byte| *byte != 0));
+    session.shutdown();
+}
+
+#[test]
+fn remote_control_roundtrip_and_screenshot() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let socket = std::env::temp_dir().join(format!(
+        "kitr-rc-{}-{}.sock",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let screenshot = std::env::temp_dir().join(format!(
+        "kitr-rc-{}-{}.ppm",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let listen = OsString::from(format!("unix:{}", socket.display()));
+    let mut opts = options(&["/bin/sh", "-c", "printf 'remote-ok\n'; cat"], (40, 10));
+    opts.listen_on = Some(listen);
+    let mut session = match GuiSession::open_on_display(&opts, Input::None, Some(&display.name)) {
+        Ok(session) => session,
+        Err(error) => {
+            skip(&format!("EGL/window unavailable: {error}"));
+            return;
+        }
+    };
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(5),
+        |session| { dump(session).contains("remote-ok") }
+    ));
+
+    let target = format!("--to=unix:{}", socket.display());
+    let output = run_remote_while_stepping(
+        &mut session,
+        &["@", &target, "get-text"],
+        Duration::from_secs(10),
+    );
+    assert!(output.status.success(), "{:?}", output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("remote-ok"),
+        "get-text stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_remote_while_stepping(
+        &mut session,
+        &["@", &target, "send-text", "roundtrip\n"],
+        Duration::from_secs(10),
+    );
+    assert!(output.status.success(), "{:?}", output);
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(5),
+        |session| { dump(session).contains("roundtrip") }
+    ));
+
+    let shot_arg = format!("--output={}", screenshot.display());
+    let output = run_remote_while_stepping(
+        &mut session,
+        &["@", &target, "screenshot", "--format=ppm", &shot_arg],
+        Duration::from_secs(10),
+    );
+    assert!(output.status.success(), "{:?}", output);
+    let (width, height, lit) = ppm_stats(&screenshot).expect("remote PPM screenshot");
+    assert!(width > 0 && height > 0 && lit > 20);
+
+    inject_key(&mut session, keysym::RETURN, true, true, false);
+    assert!(
+        wait_until(&mut session, Duration::from_secs(5), |session| {
+            session.pane_count() == 2
+        }),
+        "split before remote resize failed"
+    );
+    let output = run_remote_while_stepping(
+        &mut session,
+        &[
+            "@",
+            &target,
+            "resize-window",
+            "--axis=horizontal",
+            "--increment=2",
+        ],
+        Duration::from_secs(10),
+    );
+    assert!(output.status.success(), "{:?}", output);
+
+    let _ = std::fs::remove_file(&screenshot);
+    let _ = std::fs::remove_file(&socket);
+    session.shutdown();
+}
+
+#[test]
+fn remote_control_abstract_socket() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let name = format!(
+        "kitr-test-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    );
+    let mut opts = options(
+        &["/bin/sh", "-c", "printf 'abstract-ok'; sleep 20"],
+        (30, 8),
+    );
+    opts.listen_on = Some(OsString::from(format!("unix:@{name}")));
+    let mut session = match GuiSession::open_on_display(&opts, Input::None, Some(&display.name)) {
+        Ok(session) => session,
+        Err(error) => {
+            skip(&format!("EGL/window unavailable: {error}"));
+            return;
+        }
+    };
+    assert!(wait_until(
+        &mut session,
+        Duration::from_secs(5),
+        |session| { dump(session).contains("abstract-ok") }
+    ));
+    let target = format!("--to=unix:@{name}");
+    let output = run_remote_while_stepping(
+        &mut session,
+        &["@", &target, "get-text"],
+        Duration::from_secs(10),
+    );
+    assert!(output.status.success(), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("abstract-ok"));
+    session.shutdown();
 }
 
 use std::os::fd::AsRawFd;

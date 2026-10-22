@@ -6,15 +6,19 @@
 //! deliberately uses raw FFI with no bindgen and no external crates.
 
 use std::collections::{HashSet, VecDeque};
-use std::ffi::{c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_void, CStr, CString};
+use std::ffi::{
+    c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ulong, c_ushort, c_void, CStr, CString,
+};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use crate::clipboard::{
-    ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken,
+    ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken, IncrReadState,
+    IncrWriteState, INCR_THRESHOLD,
 };
+use crate::dnd::{parse_uri_list, DragSession};
 use crate::types::{
     keysym, KeyAction, KeyInput, ModifierMasks, Modifiers, MouseButton, PointerShape, Selection,
     WindowConfig, WindowError, WindowEvent,
@@ -41,6 +45,11 @@ mod ffi {
     pub type Bool = c_int;
     pub type Status = c_int;
     pub type Visual = c_void;
+    #[allow(clippy::upper_case_acronyms)]
+    pub type XIM = c_void;
+    #[allow(clippy::upper_case_acronyms)]
+    pub type XIC = c_void;
+    pub type XIMStyle = c_ulong;
 
     pub const NONE: c_ulong = 0;
     pub const CURRENT_TIME: Time = 0;
@@ -64,6 +73,9 @@ mod ffi {
     pub const SELECTION_REQUEST: c_int = 30;
     pub const SELECTION_NOTIFY: c_int = 31;
     pub const CLIENT_MESSAGE: c_int = 33;
+
+    pub const PROPERTY_NEW_VALUE: c_int = 0;
+    pub const PROPERTY_DELETE: c_int = 1;
 
     pub const KEY_PRESS_MASK: c_long = 1 << 0;
     pub const KEY_RELEASE_MASK: c_long = 1 << 1;
@@ -247,6 +259,19 @@ mod ffi {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    pub struct XPropertyEvent {
+        pub type_: c_int,
+        pub serial: c_ulong,
+        pub send_event: Bool,
+        pub display: *mut Display,
+        pub window: Window,
+        pub atom: Atom,
+        pub time: Time,
+        pub state: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct XSelectionClearEvent {
         pub type_: c_int,
         pub serial: c_ulong,
@@ -351,6 +376,13 @@ mod ffi {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    pub struct XComposeStatus {
+        pub compose_ptr: *mut c_void,
+        pub chars_matched: c_ulong,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct XModifierKeymap {
         pub max_keypermod: c_int,
         pub modifiermap: *mut KeyCode,
@@ -372,8 +404,51 @@ mod ffi {
         pub xselectionclear: XSelectionClearEvent,
         pub xselectionrequest: XSelectionRequestEvent,
         pub xselection: XSelectionEvent,
+        pub xproperty: XPropertyEvent,
         pub pad: [c_long; 24],
     }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIMText {
+        pub length: c_ushort,
+        pub feedback: *mut c_ulong,
+        pub encoding_is_wchar: Bool,
+        pub string: XIMTextString,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub union XIMTextString {
+        pub multi_byte: *mut c_char,
+        pub wide_char: *mut u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIMPreeditDrawCallbackStruct {
+        pub caret: c_int,
+        pub chg_first: c_int,
+        pub chg_length: c_int,
+        pub text: *mut XIMText,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIMPreeditCaretCallbackStruct {
+        pub position: c_int,
+        pub direction: c_int,
+        pub style: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct XIMStyles {
+        pub count_styles: c_ushort,
+        pub supported_styles: *mut XIMStyle,
+    }
+
+    pub type XIMProc = Option<unsafe extern "C" fn(*mut XIC, *mut c_void, *mut c_void)>;
 
     pub type XErrorHandler = Option<unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int>;
 
@@ -524,6 +599,38 @@ mod ffi {
         pub fn XResourceManagerString(display: *mut Display) -> *mut c_char;
         pub fn XFree(data: *mut c_void) -> c_int;
         pub fn XSetErrorHandler(handler: XErrorHandler) -> XErrorHandler;
+        pub fn XTranslateCoordinates(
+            display: *mut Display,
+            src: Window,
+            dest: Window,
+            src_x: c_int,
+            src_y: c_int,
+            dest_x: *mut c_int,
+            dest_y: *mut c_int,
+            child: *mut Window,
+        ) -> Bool;
+        pub fn XFilterEvent(event: *mut XEvent, window: Window) -> Bool;
+        pub fn XOpenIM(
+            display: *mut Display,
+            db: *mut c_void,
+            res_name: *mut c_char,
+            res_class: *mut c_char,
+        ) -> *mut XIM;
+        pub fn XCloseIM(im: *mut XIM) -> Status;
+        pub fn XCreateIC(im: *mut XIM, ...) -> *mut XIC;
+        pub fn XDestroyIC(ic: *mut XIC);
+        pub fn XSetICFocus(ic: *mut XIC);
+        pub fn XUnsetICFocus(ic: *mut XIC);
+        pub fn XGetIMValues(im: *mut XIM, ...) -> *mut c_char;
+        pub fn XGetICValues(ic: *mut XIC, ...) -> *mut c_char;
+        pub fn XSetICValues(ic: *mut XIC, ...) -> *mut c_char;
+    }
+
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        pub fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        pub fn dlclose(handle: *mut c_void) -> c_int;
     }
 
     pub const POLLIN: c_short = 0x0001;
@@ -624,6 +731,15 @@ unsafe fn get_property(
     window: Window,
     property: Atom,
 ) -> Option<(Atom, c_int, Vec<u8>)> {
+    unsafe { get_property_with(display, window, property, 1) }
+}
+
+unsafe fn get_property_with(
+    display: *mut Display,
+    window: Window,
+    property: Atom,
+    delete: Bool,
+) -> Option<(Atom, c_int, Vec<u8>)> {
     let mut actual_type: Atom = NONE;
     let mut actual_format: c_int = 0;
     let mut nitems: c_ulong = 0;
@@ -636,7 +752,7 @@ unsafe fn get_property(
             property,
             0,
             0x1fff_ffff,
-            1,
+            delete,
             ANY_PROPERTY_TYPE,
             &mut actual_type,
             &mut actual_format,
@@ -668,6 +784,507 @@ unsafe fn get_property(
 }
 
 // }}}
+// {{{ Input methods, cursor themes and transfer state
+
+const XIM_PREEDIT_CALLBACKS: XIMStyle = 1 << 1;
+const XIM_PREEDIT_NOTHING: XIMStyle = 1 << 3;
+const XIM_STATUS_NOTHING: XIMStyle = 1 << 7;
+const XIM_STATUS_NONE: XIMStyle = 1 << 8;
+
+const XN_QUERY_INPUT_STYLE: &[u8] = b"queryInputStyle\0";
+const XN_INPUT_STYLE: &[u8] = b"inputStyle\0";
+const XN_CLIENT_WINDOW: &[u8] = b"clientWindow\0";
+const XN_FOCUS_WINDOW: &[u8] = b"focusWindow\0";
+const XN_FILTER_EVENTS: &[u8] = b"filterEvents\0";
+const XN_COMMIT: &[u8] = b"commit\0";
+const XN_PREEDIT_START: &[u8] = b"preeditStart\0";
+const XN_PREEDIT_DONE: &[u8] = b"preeditDone\0";
+const XN_PREEDIT_DRAW: &[u8] = b"preeditDraw\0";
+const XN_PREEDIT_CARET: &[u8] = b"preeditCaret\0";
+
+fn xn(name: &'static [u8]) -> *const c_char {
+    name.as_ptr().cast()
+}
+
+fn clamp_byte_boundary(text: &str, index: i32) -> usize {
+    let mut index = index.max(0) as usize;
+    if index > text.len() {
+        index = text.len();
+    }
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn char_index(text: &str, byte_index: usize) -> usize {
+    text[..clamp_byte_boundary(text, byte_index as i32)]
+        .chars()
+        .count()
+}
+
+/// Pure pre-edit state machine used by the XIM callbacks.
+///
+/// Keeping the state independent of Xlib makes callback parsing testable on
+/// machines where no input method is installed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ImeState {
+    text: String,
+    cursor: Option<(usize, usize)>,
+    events: VecDeque<WindowEvent>,
+}
+
+impl ImeState {
+    fn emit_preedit(&mut self) {
+        self.events.push_back(WindowEvent::Preedit {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        });
+    }
+
+    pub(crate) fn draw(
+        &mut self,
+        chg_first: i32,
+        chg_length: i32,
+        replacement: Option<&str>,
+        caret: i32,
+    ) {
+        let start = clamp_byte_boundary(&self.text, chg_first);
+        let end =
+            clamp_byte_boundary(&self.text, chg_first.saturating_add(chg_length.max(0))).max(start);
+        let replacement = replacement.unwrap_or("");
+        self.text.replace_range(start..end, replacement);
+        let caret = clamp_byte_boundary(&self.text, caret);
+        let index = self.text[..caret].chars().count();
+        self.cursor = Some((index, index));
+        self.emit_preedit();
+    }
+
+    pub(crate) fn set_caret(&mut self, position: i32) {
+        let index = char_index(&self.text, clamp_byte_boundary(&self.text, position));
+        self.cursor = Some((index, index));
+        self.emit_preedit();
+    }
+
+    pub(crate) fn commit(&mut self, text: &str) {
+        if !text.is_empty() {
+            if !self.text.is_empty() {
+                self.text.clear();
+                self.cursor = None;
+                self.emit_preedit();
+            }
+            self.events.push_back(WindowEvent::Commit {
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let had_preedit = !self.text.is_empty() || self.cursor.is_some();
+        self.text.clear();
+        self.cursor = None;
+        if had_preedit {
+            self.emit_preedit();
+        }
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<WindowEvent> {
+        self.events.drain(..).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor(&self) -> Option<(usize, usize)> {
+        self.cursor
+    }
+}
+
+unsafe fn decode_xim_text(text: *const XIMText) -> Option<String> {
+    if text.is_null() {
+        return None;
+    }
+    let text = unsafe { &*text };
+    if text.length == 0 {
+        return Some(String::new());
+    }
+    if text.encoding_is_wchar != 0 {
+        let pointer = unsafe { text.string.wide_char };
+        if pointer.is_null() {
+            return None;
+        }
+        let units = unsafe { std::slice::from_raw_parts(pointer, text.length as usize) };
+        Some(
+            units
+                .iter()
+                .filter_map(|unit| char::from_u32(*unit))
+                .collect(),
+        )
+    } else {
+        let pointer = unsafe { text.string.multi_byte };
+        if pointer.is_null() {
+            return None;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), text.length as usize) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+struct ImeContext {
+    im: *mut XIM,
+    ic: *mut XIC,
+    state: Arc<std::sync::Mutex<ImeState>>,
+    callbacks: bool,
+}
+
+impl ImeContext {
+    unsafe fn destroy(&mut self) {
+        unsafe {
+            if !self.ic.is_null() {
+                XDestroyIC(self.ic);
+                self.ic = ptr::null_mut();
+            }
+            if !self.im.is_null() {
+                XCloseIM(self.im);
+                self.im = ptr::null_mut();
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn ime_preedit_draw(
+    _ic: *mut XIC,
+    client_data: *mut c_void,
+    call_data: *mut c_void,
+) {
+    if client_data.is_null() || call_data.is_null() {
+        return;
+    }
+    let state = unsafe { &*(client_data as *const std::sync::Mutex<ImeState>) };
+    let draw = unsafe { &*(call_data as *const XIMPreeditDrawCallbackStruct) };
+    let replacement = unsafe { decode_xim_text(draw.text) };
+    if let Ok(mut state) = state.lock() {
+        state.draw(
+            draw.chg_first,
+            draw.chg_length,
+            replacement.as_deref(),
+            draw.caret,
+        );
+    }
+}
+
+unsafe extern "C" fn ime_preedit_caret(
+    _ic: *mut XIC,
+    client_data: *mut c_void,
+    call_data: *mut c_void,
+) {
+    if client_data.is_null() || call_data.is_null() {
+        return;
+    }
+    let state = unsafe { &*(client_data as *const std::sync::Mutex<ImeState>) };
+    let caret = unsafe { &*(call_data as *const XIMPreeditCaretCallbackStruct) };
+    if let Ok(mut state) = state.lock() {
+        state.set_caret(caret.position);
+    }
+}
+
+unsafe extern "C" fn ime_preedit_done(
+    _ic: *mut XIC,
+    client_data: *mut c_void,
+    _call_data: *mut c_void,
+) {
+    if client_data.is_null() {
+        return;
+    }
+    let state = unsafe { &*(client_data as *const std::sync::Mutex<ImeState>) };
+    if let Ok(mut state) = state.lock() {
+        state.reset();
+    }
+}
+
+unsafe extern "C" fn ime_preedit_start(
+    _ic: *mut XIC,
+    _client_data: *mut c_void,
+    _call_data: *mut c_void,
+) {
+}
+
+unsafe extern "C" fn ime_commit(_ic: *mut XIC, client_data: *mut c_void, call_data: *mut c_void) {
+    if client_data.is_null() {
+        return;
+    }
+    let state = unsafe { &*(client_data as *const std::sync::Mutex<ImeState>) };
+    let text = unsafe { decode_xim_text(call_data as *const XIMText) }.unwrap_or_default();
+    if let Ok(mut state) = state.lock() {
+        state.commit(&text);
+    }
+}
+
+fn choose_input_style(styles: &[XIMStyle]) -> Option<(XIMStyle, bool)> {
+    let callback_style = styles.iter().copied().find(|style| {
+        style & XIM_PREEDIT_CALLBACKS != 0 && style & (XIM_STATUS_NOTHING | XIM_STATUS_NONE) != 0
+    });
+    if let Some(style) = callback_style {
+        return Some((style, true));
+    }
+    if let Some(style) = styles
+        .iter()
+        .copied()
+        .find(|style| style & XIM_PREEDIT_CALLBACKS != 0)
+    {
+        return Some((style, true));
+    }
+    styles
+        .iter()
+        .copied()
+        .find(|style| style & XIM_PREEDIT_NOTHING != 0)
+        .map(|style| (style, false))
+        .or_else(|| styles.first().copied().map(|style| (style, false)))
+}
+
+unsafe fn open_input_context(
+    display: *mut Display,
+    window: Window,
+) -> Option<(ImeContext, c_long)> {
+    let im = unsafe { XOpenIM(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
+    if im.is_null() {
+        return None;
+    }
+    let mut styles: *mut XIMStyles = ptr::null_mut();
+    unsafe {
+        XGetIMValues(
+            im,
+            xn(XN_QUERY_INPUT_STYLE),
+            &mut styles,
+            ptr::null::<c_char>(),
+        );
+    }
+    let supported: Vec<XIMStyle> = if styles.is_null() {
+        Vec::new()
+    } else {
+        let count = unsafe { (*styles).count_styles as usize };
+        let pointer = unsafe { (*styles).supported_styles };
+        if pointer.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(pointer, count) }.to_vec()
+        }
+    };
+    if !styles.is_null() {
+        unsafe {
+            XFree(styles.cast());
+        }
+    }
+    let (style, callbacks) =
+        choose_input_style(&supported).unwrap_or((XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING, false));
+    let state = Arc::new(std::sync::Mutex::new(ImeState::default()));
+    let client_data = Arc::as_ptr(&state) as *mut c_void;
+    let ic = unsafe {
+        XCreateIC(
+            im,
+            xn(XN_INPUT_STYLE),
+            style,
+            xn(XN_CLIENT_WINDOW),
+            window,
+            xn(XN_FOCUS_WINDOW),
+            window,
+            ptr::null::<c_char>(),
+        )
+    };
+    if ic.is_null() {
+        unsafe {
+            XCloseIM(im);
+        }
+        return None;
+    }
+    if callbacks {
+        unsafe {
+            XSetICValues(
+                ic,
+                xn(XN_COMMIT),
+                Some(ime_commit),
+                client_data,
+                xn(XN_PREEDIT_START),
+                Some(ime_preedit_start),
+                client_data,
+                xn(XN_PREEDIT_DONE),
+                Some(ime_preedit_done),
+                client_data,
+                xn(XN_PREEDIT_DRAW),
+                Some(ime_preedit_draw),
+                client_data,
+                xn(XN_PREEDIT_CARET),
+                Some(ime_preedit_caret),
+                client_data,
+                ptr::null::<c_char>(),
+            );
+        }
+    }
+    let mut filter_events: c_long = 0;
+    unsafe {
+        XGetICValues(
+            ic,
+            xn(XN_FILTER_EVENTS),
+            &mut filter_events,
+            ptr::null::<c_char>(),
+        );
+    }
+    Some((
+        ImeContext {
+            im,
+            ic,
+            state,
+            callbacks,
+        },
+        filter_events,
+    ))
+}
+
+type XcursorLoadCursor = unsafe extern "C" fn(*mut Display, *const c_char) -> c_ulong;
+
+struct XcursorLoader {
+    handle: *mut c_void,
+    load_cursor: XcursorLoadCursor,
+}
+
+impl XcursorLoader {
+    fn new() -> Option<Self> {
+        const NAMES: [&[u8]; 3] = [
+            b"libXcursor.so.1\0",
+            b"libXcursor.so\0",
+            b"libXcursor.so.1.0.2\0",
+        ];
+        for name in NAMES {
+            let handle = unsafe { dlopen(name.as_ptr().cast(), 1) };
+            if handle.is_null() {
+                continue;
+            }
+            let symbol = unsafe { dlsym(handle, c"XcursorLibraryLoadCursor".as_ptr()) };
+            if symbol.is_null() {
+                unsafe {
+                    dlclose(handle);
+                }
+                continue;
+            }
+            let load_cursor: XcursorLoadCursor = unsafe { std::mem::transmute(symbol) };
+            return Some(Self {
+                handle,
+                load_cursor,
+            });
+        }
+        None
+    }
+
+    fn load(&self, display: *mut Display, name: &str) -> c_ulong {
+        let Ok(name) = CString::new(name) else {
+            return 0;
+        };
+        unsafe { (self.load_cursor)(display, name.as_ptr()) }
+    }
+}
+
+impl Drop for XcursorLoader {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                dlclose(self.handle);
+            }
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
+fn xcursor_name(shape: PointerShape) -> Option<&'static str> {
+    Some(match shape {
+        PointerShape::Default => "left_ptr",
+        PointerShape::Text => "xterm",
+        PointerShape::Pointer => "hand2",
+        PointerShape::Crosshair => "crosshair",
+        PointerShape::Move => "fleur",
+        PointerShape::Wait => "watch",
+        PointerShape::Progress => "left_ptr_watch",
+        PointerShape::ResizeN => "top_side",
+        PointerShape::ResizeS => "bottom_side",
+        PointerShape::ResizeE => "right_side",
+        PointerShape::ResizeW => "left_side",
+        PointerShape::ResizeNE => "top_right_corner",
+        PointerShape::ResizeNW => "top_left_corner",
+        PointerShape::ResizeSE => "bottom_right_corner",
+        PointerShape::ResizeSW => "bottom_left_corner",
+        PointerShape::NotAllowed => "not-allowed",
+        PointerShape::Help => "question_arrow",
+        PointerShape::Cell => "dotbox",
+        PointerShape::VerticalText => "sb_v_double_arrow",
+        PointerShape::ZoomIn => "zoom-in",
+        PointerShape::ZoomOut => "zoom-out",
+        PointerShape::ContextMenu => "context-menu",
+    })
+}
+
+#[derive(Clone, Debug)]
+enum IncrPurpose {
+    Clipboard {
+        token: ClipboardToken,
+        selection: Selection,
+        target: String,
+    },
+    Drag {
+        drop: PendingDragDrop,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct IncrRead {
+    property: Atom,
+    state: IncrReadState,
+    purpose: IncrPurpose,
+    deadline: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct IncrWrite {
+    requestor: Window,
+    property: Atom,
+    type_atom: Atom,
+    state: IncrWriteState,
+    deadline: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingDragDrop {
+    x: f64,
+    y: f64,
+    target: String,
+}
+
+#[derive(Clone, Debug)]
+struct DragState {
+    session: DragSession,
+    source: Window,
+    version: i32,
+    property: Atom,
+    pending_drop: Option<PendingDragDrop>,
+    deadline: Option<Instant>,
+}
+
+impl Default for DragState {
+    fn default() -> Self {
+        Self {
+            session: DragSession::default(),
+            source: NONE,
+            version: 0,
+            property: NONE,
+            pending_drop: None,
+            deadline: None,
+        }
+    }
+}
+
+// }}}
 // {{{ Window state
 
 #[derive(Clone, Debug)]
@@ -683,6 +1300,18 @@ struct Atoms {
     net_wm_state_maximized_vert: Atom,
     net_wm_state_maximized_horz: Atom,
     net_supporting_wm_check: Atom,
+    incr: Atom,
+    xdnd_aware: Atom,
+    xdnd_enter: Atom,
+    xdnd_position: Atom,
+    xdnd_status: Atom,
+    xdnd_drop: Atom,
+    xdnd_leave: Atom,
+    xdnd_finished: Atom,
+    xdnd_selection: Atom,
+    xdnd_type_list: Atom,
+    xdnd_action_copy: Atom,
+    xdnd_action_none: Atom,
 }
 
 impl Atoms {
@@ -703,6 +1332,18 @@ impl Atoms {
             net_wm_state_maximized_vert: intern("_NET_WM_STATE_MAXIMIZED_VERT"),
             net_wm_state_maximized_horz: intern("_NET_WM_STATE_MAXIMIZED_HORZ"),
             net_supporting_wm_check: intern("_NET_SUPPORTING_WM_CHECK"),
+            incr: intern("INCR"),
+            xdnd_aware: intern("XdndAware"),
+            xdnd_enter: intern("XdndEnter"),
+            xdnd_position: intern("XdndPosition"),
+            xdnd_status: intern("XdndStatus"),
+            xdnd_drop: intern("XdndDrop"),
+            xdnd_leave: intern("XdndLeave"),
+            xdnd_finished: intern("XdndFinished"),
+            xdnd_selection: intern("XdndSelection"),
+            xdnd_type_list: intern("XdndTypeList"),
+            xdnd_action_copy: intern("XdndActionCopy"),
+            xdnd_action_none: intern("XdndActionNone"),
         }
     }
 }
@@ -754,9 +1395,17 @@ pub struct X11Window {
     inbox: VecDeque<WindowEvent>,
     clipboard: ClipboardState,
     clipboard_property_seq: u64,
+    incr_reads: Vec<IncrRead>,
+    incr_writes: Vec<IncrWrite>,
+    drag: DragState,
+    ime: Option<ImeContext>,
+    ime_enabled: bool,
+    focused: bool,
+    cursor_loader: Option<XcursorLoader>,
     pressed_keys: HashSet<u8>,
     pressed_modifier_keys: [HashSet<u8>; 5],
     mod_masks: ModifierMasks,
+    compose_status: XComposeStatus,
     detectable_autorepeat: bool,
     width: u32,
     height: u32,
@@ -859,9 +1508,17 @@ impl X11Window {
             inbox: VecDeque::new(),
             clipboard: ClipboardState::default(),
             clipboard_property_seq: 0,
+            incr_reads: Vec::new(),
+            incr_writes: Vec::new(),
+            drag: DragState::default(),
+            ime: None,
+            ime_enabled: true,
+            focused: false,
+            cursor_loader: XcursorLoader::new(),
             pressed_keys: HashSet::new(),
             pressed_modifier_keys: std::array::from_fn(|_| HashSet::new()),
             mod_masks,
+            compose_status: unsafe { std::mem::zeroed() },
             detectable_autorepeat: supported != 0,
             width: config.width.max(1),
             height: config.height.max(1),
@@ -900,6 +1557,24 @@ impl X11Window {
             XSetWMProtocols(display, window, protocols.as_mut_ptr(), 1);
             this.apply_size_hints();
 
+            let xdnd_version: c_long = 5;
+            XChangeProperty(
+                display,
+                window,
+                this.atoms.xdnd_aware,
+                XA_ATOM,
+                32,
+                PROP_MODE_REPLACE,
+                (&xdnd_version as *const c_long).cast(),
+                1,
+            );
+
+            let mut filter_events = 0;
+            if let Some((context, extra)) = open_input_context(display, window) {
+                this.ime = Some(context);
+                filter_events = extra;
+            }
+
             let mask = KEY_PRESS_MASK
                 | KEY_RELEASE_MASK
                 | BUTTON_PRESS_MASK
@@ -910,7 +1585,8 @@ impl X11Window {
                 | EXPOSURE_MASK
                 | STRUCTURE_NOTIFY_MASK
                 | FOCUS_CHANGE_MASK
-                | PROPERTY_CHANGE_MASK;
+                | PROPERTY_CHANGE_MASK
+                | filter_events;
             XSelectInput(display, window, mask);
 
             if config.visible {
@@ -1130,6 +1806,44 @@ impl X11Window {
         }
     }
 
+    /// Enable or disable input-method processing.
+    ///
+    /// Disabling releases the input context focus and clears any pre-edit text;
+    /// key events are then delivered directly by the backend.
+    pub fn set_ime_enabled(&mut self, enabled: bool) {
+        if enabled == self.ime_enabled {
+            return;
+        }
+        self.ime_enabled = enabled;
+        if let Some(ime) = &self.ime {
+            if !ime.ic.is_null() {
+                unsafe {
+                    if enabled && self.focused {
+                        XSetICFocus(ime.ic);
+                    } else {
+                        XUnsetICFocus(ime.ic);
+                    }
+                }
+            }
+            if !enabled {
+                if let Ok(mut state) = ime.state.lock() {
+                    state.reset();
+                }
+            }
+        }
+        let mut events = Vec::new();
+        self.drain_ime_events(&mut events);
+        self.inbox.extend(events);
+    }
+
+    pub fn ime_enabled(&self) -> bool {
+        self.ime_enabled
+    }
+
+    pub fn has_input_method(&self) -> bool {
+        self.ime.as_ref().is_some_and(|ime| ime.callbacks)
+    }
+
     pub fn set_pointer_shape(&mut self, shape: PointerShape) {
         if shape == self.cursor_shape && self.cursor != 0 {
             return;
@@ -1155,7 +1869,16 @@ impl X11Window {
             PointerShape::VerticalText => 116,                    // XC_sb_v_double_arrow
             PointerShape::ZoomIn | PointerShape::ZoomOut => 34,
         };
-        let cursor = unsafe { XCreateFontCursor(self.display, xc) };
+        let mut cursor = xcursor_name(shape)
+            .and_then(|name| {
+                self.cursor_loader
+                    .as_ref()
+                    .map(|loader| loader.load(self.display, name))
+            })
+            .unwrap_or(0);
+        if cursor == 0 {
+            cursor = unsafe { XCreateFontCursor(self.display, xc) };
+        }
         if cursor == 0 {
             return;
         }
@@ -1172,6 +1895,36 @@ impl X11Window {
 
     pub fn pointer_shape(&self) -> PointerShape {
         self.cursor_shape
+    }
+
+    /// Accept the current drag, optionally forcing a MIME target.
+    ///
+    /// Returns the selected target when one was available. Calling this after
+    /// `DragEnter` sends an XDND status message to the source immediately.
+    pub fn drag_accept(&mut self, target: Option<&str>) -> Result<Option<String>, WindowError> {
+        if !self.drag.session.is_active() {
+            return Ok(None);
+        }
+        let chosen = self.drag.session.accept(target);
+        self.send_drag_status(chosen.is_some());
+        Ok(chosen)
+    }
+
+    /// Reject the current drag. The source is told that no action is possible.
+    pub fn drag_reject(&mut self) {
+        if !self.drag.session.is_active() {
+            return;
+        }
+        self.drag.session.reject();
+        self.send_drag_status(false);
+    }
+
+    pub fn is_drag_active(&self) -> bool {
+        self.drag.session.is_active()
+    }
+
+    pub fn drag_target(&self) -> Option<&str> {
+        self.drag.session.chosen_target()
     }
 
     pub fn bell(&mut self) {
@@ -1403,10 +2156,31 @@ impl X11Window {
             unsafe {
                 XNextEvent(self.display, &mut event);
             }
+            if self.ime_enabled
+                && self.ime.as_ref().is_some_and(|ime| !ime.ic.is_null())
+                && unsafe { XFilterEvent(&mut event, self.window) } != 0
+            {
+                self.drain_ime_events(&mut events);
+                continue;
+            }
             self.process_event(&event, &mut events);
+            self.drain_ime_events(&mut events);
         }
+        self.expire_drag(&mut events);
+        let now = Instant::now();
+        self.incr_writes.retain(|write| write.deadline > now);
         coalesce_events(&mut events);
         self.inbox.extend(events);
+    }
+
+    fn drain_ime_events(&mut self, out: &mut Vec<WindowEvent>) {
+        let Some(ime) = &self.ime else {
+            return;
+        };
+        let Ok(mut state) = ime.state.lock() else {
+            return;
+        };
+        out.extend(state.drain());
     }
 
     fn process_event(&mut self, event: &XEvent, out: &mut Vec<WindowEvent>) {
@@ -1450,13 +2224,32 @@ impl X11Window {
             FOCUS_IN | FOCUS_OUT => {
                 let focus = unsafe { event.xfocus };
                 let focused = event_type == FOCUS_IN;
+                self.focused = focused;
+                if let Some(ime) = &self.ime {
+                    if !ime.ic.is_null() {
+                        unsafe {
+                            if focused && self.ime_enabled {
+                                XSetICFocus(ime.ic);
+                            } else {
+                                XUnsetICFocus(ime.ic);
+                            }
+                        }
+                    }
+                    if !focused {
+                        if let Ok(mut state) = ime.state.lock() {
+                            state.reset();
+                        }
+                    }
+                }
                 if !focused {
                     self.pressed_keys.clear();
+                    self.compose_status = unsafe { std::mem::zeroed() };
                     for set in &mut self.pressed_modifier_keys {
                         set.clear();
                     }
                 }
                 let _ = focus;
+                self.drain_ime_events(out);
                 out.push(WindowEvent::Focus { focused });
             }
             CONFIGURE_NOTIFY => {
@@ -1490,10 +2283,19 @@ impl X11Window {
             }
             CLIENT_MESSAGE => {
                 let client = unsafe { event.xclient };
-                if client.format == 32 && client.data[0] as Atom == self.atoms.wm_delete_window {
+                if client.format != 32 {
+                    return;
+                }
+                if client.data[0] as Atom == self.atoms.wm_delete_window {
                     self.should_close = true;
                     out.push(WindowEvent::CloseRequested);
+                } else {
+                    self.handle_drag_message(&client, out);
                 }
+            }
+            PROPERTY_NOTIFY => {
+                let property = unsafe { event.xproperty };
+                self.handle_property_notify(&property, out);
             }
             MAP_NOTIFY => {
                 self.mapped = true;
@@ -1520,7 +2322,9 @@ impl X11Window {
             }
             SELECTION_NOTIFY => {
                 let notify = unsafe { event.xselection };
-                if let Some(event) = self.handle_selection_notify(&notify) {
+                if notify.selection == self.atoms.xdnd_selection {
+                    self.handle_drag_selection_notify(&notify, out);
+                } else if let Some(event) = self.handle_selection_notify(&notify) {
                     out.push(event);
                 }
             }
@@ -1568,7 +2372,7 @@ impl X11Window {
                 buffer.as_mut_ptr(),
                 buffer.len() as c_int,
                 &mut symbol,
-                ptr::null_mut(),
+                (&mut self.compose_status as *mut XComposeStatus).cast(),
             )
         };
         let mut base_symbol = unsafe { XLookupKeysym(&mut xkey, 0) };
@@ -1844,6 +2648,12 @@ impl X11Window {
             let now = Instant::now();
             if now >= deadline {
                 self.clipboard.forget(token);
+                self.incr_reads.retain(|read| {
+                    !matches!(
+                        read.purpose,
+                        IncrPurpose::Clipboard { token: pending, .. } if pending == token
+                    )
+                });
                 return Err(ClipboardError::Timeout);
             }
             let remaining = deadline - now;
@@ -1895,17 +2705,43 @@ impl X11Window {
             } else {
                 request.target
             };
-            unsafe {
-                XChangeProperty(
-                    self.display,
-                    request.requestor,
+            if data.len() > INCR_THRESHOLD {
+                let expected = data.len() as c_long;
+                unsafe {
+                    // The owner must watch the requestor window for the
+                    // PropertyDelete notifications that pace INCR chunks.
+                    XSelectInput(self.display, request.requestor, PROPERTY_CHANGE_MASK);
+                    XChangeProperty(
+                        self.display,
+                        request.requestor,
+                        property,
+                        self.atoms.incr,
+                        32,
+                        PROP_MODE_REPLACE,
+                        (&expected as *const c_long).cast(),
+                        1,
+                    );
+                }
+                self.incr_writes.push(IncrWrite {
+                    requestor: request.requestor,
                     property,
                     type_atom,
-                    8,
-                    PROP_MODE_REPLACE,
-                    data.as_ptr(),
-                    data.len().min(c_int::MAX as usize) as c_int,
-                );
+                    state: IncrWriteState::new(data.to_vec()),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                });
+            } else {
+                unsafe {
+                    XChangeProperty(
+                        self.display,
+                        request.requestor,
+                        property,
+                        type_atom,
+                        8,
+                        PROP_MODE_REPLACE,
+                        data.as_ptr(),
+                        data.len().min(c_int::MAX as usize) as c_int,
+                    );
+                }
             }
             success = true;
         }
@@ -1933,13 +2769,40 @@ impl X11Window {
         let selection = self.selection_for_atom(notify.selection)?;
         let target = unsafe { atom_name(self.display, notify.target) }.unwrap_or_default();
         let succeeded = notify.property != NONE;
-        let reply = if succeeded {
-            read_selection_property(self.display, self.window, notify.property)
-        } else {
-            Err(ClipboardError::ConversionFailed)
-        };
         if notify.property != NONE {
-            self.clipboard.complete(notify.property, reply);
+            if let Some((actual_type, format, data)) =
+                unsafe { get_property(self.display, self.window, notify.property) }
+            {
+                if actual_type == self.atoms.incr {
+                    if let Some(token) = self.clipboard.token_for_property(notify.property) {
+                        let expected = expected_size(&data, format);
+                        self.incr_reads.push(IncrRead {
+                            property: notify.property,
+                            state: IncrReadState::new(expected),
+                            purpose: IncrPurpose::Clipboard {
+                                token,
+                                selection,
+                                target: target.clone(),
+                            },
+                            deadline: Instant::now() + Duration::from_secs(30),
+                        });
+                        return Some(WindowEvent::SelectionNotify {
+                            selection,
+                            target,
+                            succeeded: true,
+                        });
+                    }
+                }
+                let reply = selection_reply(self.display, actual_type, format, data);
+                self.clipboard.complete(notify.property, reply);
+            } else {
+                self.clipboard.complete(
+                    notify.property,
+                    Err(ClipboardError::BadReply(
+                        "selection property is missing".to_owned(),
+                    )),
+                );
+            }
         } else {
             let _ = self.clipboard.complete_matching(
                 selection,
@@ -1952,6 +2815,435 @@ impl X11Window {
             target,
             succeeded,
         })
+    }
+
+    fn next_property_atom(&mut self, prefix: &str) -> Atom {
+        self.clipboard_property_seq = self.clipboard_property_seq.wrapping_add(1);
+        let name = CString::new(format!("{prefix}_{}", self.clipboard_property_seq))
+            .expect("generated property name is valid");
+        unsafe { XInternAtom(self.display, name.as_ptr(), 0) }
+    }
+
+    fn send_drag_status(&self, accepted: bool) {
+        if self.drag.source == NONE {
+            return;
+        }
+        let action = if accepted {
+            self.atoms.xdnd_action_copy
+        } else {
+            self.atoms.xdnd_action_none
+        };
+        let mut event: XEvent = unsafe { std::mem::zeroed() };
+        event.xclient = XClientMessageEvent {
+            type_: CLIENT_MESSAGE,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            window: self.drag.source,
+            message_type: self.atoms.xdnd_status,
+            format: 32,
+            data: [
+                self.window as c_long,
+                i64::from(accepted) as c_long,
+                0,
+                0,
+                action as c_long,
+            ],
+        };
+        unsafe {
+            XSendEvent(self.display, self.drag.source, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+    }
+
+    fn send_drag_finished(&self, accepted: bool) {
+        if self.drag.source == NONE || self.drag.version < 5 {
+            return;
+        }
+        let action = if accepted {
+            self.atoms.xdnd_action_copy
+        } else {
+            self.atoms.xdnd_action_none
+        };
+        let mut event: XEvent = unsafe { std::mem::zeroed() };
+        event.xclient = XClientMessageEvent {
+            type_: CLIENT_MESSAGE,
+            serial: 0,
+            send_event: 1,
+            display: self.display,
+            window: self.drag.source,
+            message_type: self.atoms.xdnd_finished,
+            format: 32,
+            data: [
+                self.window as c_long,
+                i64::from(accepted) as c_long,
+                action as c_long,
+                0,
+                0,
+            ],
+        };
+        unsafe {
+            XSendEvent(self.display, self.drag.source, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+    }
+
+    fn handle_drag_message(&mut self, client: &XClientMessageEvent, out: &mut Vec<WindowEvent>) {
+        let message = client.message_type;
+        if message == self.atoms.xdnd_enter {
+            self.handle_drag_enter(client, out);
+        } else if message == self.atoms.xdnd_position {
+            self.handle_drag_position(client, out);
+        } else if message == self.atoms.xdnd_drop {
+            self.handle_drag_drop(client, out);
+        } else if message == self.atoms.xdnd_leave {
+            if self.drag.session.leave() {
+                out.push(WindowEvent::DragLeave);
+            }
+            self.drag.source = NONE;
+            self.drag.pending_drop = None;
+            self.drag.deadline = None;
+        }
+    }
+
+    fn handle_drag_enter(&mut self, client: &XClientMessageEvent, out: &mut Vec<WindowEvent>) {
+        let source = client.data[0] as Window;
+        if source == NONE {
+            return;
+        }
+        let version = ((client.data[1] >> 24) & 0xff) as i32;
+        let flags = client.data[1] & 0xff;
+        let mut atoms = Vec::new();
+        if flags & 1 != 0 {
+            if let Some((_, format, data)) =
+                unsafe { get_property_with(self.display, source, self.atoms.xdnd_type_list, 0) }
+            {
+                if format == 32 {
+                    let size = std::mem::size_of::<c_long>();
+                    for chunk in data.chunks_exact(size) {
+                        let mut raw = [0u8; std::mem::size_of::<c_long>()];
+                        raw.copy_from_slice(chunk);
+                        let atom = c_long::from_ne_bytes(raw) as Atom;
+                        if atom != NONE {
+                            atoms.push(atom);
+                        }
+                    }
+                }
+            }
+        } else {
+            for index in 2..5 {
+                let atom = client.data[index] as Atom;
+                if atom != NONE {
+                    atoms.push(atom);
+                }
+            }
+        }
+        let targets: Vec<String> = atoms
+            .iter()
+            .filter_map(|atom| unsafe { atom_name(self.display, *atom) })
+            .collect();
+        let mut session = DragSession::default();
+        session.begin(targets.clone());
+        self.drag = DragState {
+            session,
+            source,
+            version,
+            property: NONE,
+            pending_drop: None,
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+        };
+        out.push(WindowEvent::DragEnter {
+            x: 0.0,
+            y: 0.0,
+            targets,
+        });
+    }
+
+    fn handle_drag_position(&mut self, client: &XClientMessageEvent, out: &mut Vec<WindowEvent>) {
+        if client.data[0] as Window != self.drag.source || !self.drag.session.is_active() {
+            return;
+        }
+        let packed = client.data[2] as c_ulong;
+        let root_x = (packed & 0xffff) as u16 as i16 as c_int;
+        let root_y = ((packed >> 16) & 0xffff) as u16 as i16 as c_int;
+        let mut x: c_int = 0;
+        let mut y: c_int = 0;
+        let mut child: Window = NONE;
+        unsafe {
+            XTranslateCoordinates(
+                self.display,
+                self.root,
+                self.window,
+                root_x,
+                root_y,
+                &mut x,
+                &mut y,
+                &mut child,
+            );
+        }
+        self.drag.session.set_position(x as f64, y as f64);
+        self.drag.deadline = Some(Instant::now() + Duration::from_secs(10));
+        let targets = self.drag.session.targets().to_vec();
+        out.push(WindowEvent::DragMotion {
+            x: x as f64,
+            y: y as f64,
+            targets,
+        });
+        self.send_drag_status(self.drag.session.is_accepted());
+    }
+
+    fn handle_drag_drop(&mut self, client: &XClientMessageEvent, out: &mut Vec<WindowEvent>) {
+        if client.data[0] as Window != self.drag.source || !self.drag.session.is_active() {
+            return;
+        }
+        let Some(target) = self.drag.session.chosen_target().map(str::to_owned) else {
+            self.send_drag_finished(false);
+            self.drag.session.leave();
+            self.drag.source = NONE;
+            self.drag.deadline = None;
+            out.push(WindowEvent::DragLeave);
+            return;
+        };
+        let (x, y) = self.drag.session.position();
+        let timestamp = client.data[2] as Time;
+        let property = self.next_property_atom("KITTY_WINDOW_DND");
+        let target_c = match CString::new(target.as_str()) {
+            Ok(target) => target,
+            Err(_) => {
+                self.send_drag_finished(false);
+                self.drag.session.leave();
+                self.drag.source = NONE;
+                out.push(WindowEvent::DragLeave);
+                return;
+            }
+        };
+        let target_atom = unsafe { XInternAtom(self.display, target_c.as_ptr(), 0) };
+        self.drag.property = property;
+        self.drag.pending_drop = Some(PendingDragDrop { x, y, target });
+        self.drag.deadline = Some(Instant::now() + Duration::from_secs(10));
+        unsafe {
+            XConvertSelection(
+                self.display,
+                self.atoms.xdnd_selection,
+                target_atom,
+                property,
+                self.window,
+                timestamp,
+            );
+            XFlush(self.display);
+        }
+    }
+
+    fn handle_drag_selection_notify(
+        &mut self,
+        notify: &XSelectionEvent,
+        out: &mut Vec<WindowEvent>,
+    ) {
+        let Some(drop) = self.drag.pending_drop.clone() else {
+            return;
+        };
+        if notify.property == NONE {
+            self.send_drag_finished(false);
+            self.drag.session.leave();
+            self.drag.pending_drop = None;
+            self.drag.source = NONE;
+            out.push(WindowEvent::DragLeave);
+            return;
+        }
+        let Some((actual_type, format, data)) =
+            (unsafe { get_property(self.display, self.window, notify.property) })
+        else {
+            self.send_drag_finished(false);
+            self.drag.session.leave();
+            self.drag.pending_drop = None;
+            self.drag.source = NONE;
+            out.push(WindowEvent::DragLeave);
+            return;
+        };
+        if actual_type == self.atoms.incr {
+            let expected = expected_size(&data, format);
+            self.incr_reads.push(IncrRead {
+                property: notify.property,
+                state: IncrReadState::new(expected),
+                purpose: IncrPurpose::Drag { drop },
+                deadline: Instant::now() + Duration::from_secs(10),
+            });
+            return;
+        }
+        self.deliver_drag_data(drop, data, out);
+    }
+
+    fn deliver_drag_data(
+        &mut self,
+        drop: PendingDragDrop,
+        data: Vec<u8>,
+        out: &mut Vec<WindowEvent>,
+    ) {
+        let is_uri_list = drop.target.eq_ignore_ascii_case("text/uri-list");
+        let (paths, text) = if is_uri_list {
+            let payload = String::from_utf8_lossy(&data);
+            (parse_uri_list(&payload), None)
+        } else {
+            (
+                Vec::new(),
+                Some(String::from_utf8_lossy(&data).into_owned()),
+            )
+        };
+        out.push(WindowEvent::DragDrop {
+            x: drop.x,
+            y: drop.y,
+            paths,
+            text,
+            target: Some(drop.target),
+        });
+        self.send_drag_finished(true);
+        self.drag.session.leave();
+        self.drag.pending_drop = None;
+        self.drag.property = NONE;
+        self.drag.source = NONE;
+        self.drag.deadline = None;
+    }
+
+    fn expire_drag(&mut self, out: &mut Vec<WindowEvent>) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        let mut expired_clipboard = Vec::new();
+        let mut index = 0;
+        while index < self.incr_reads.len() {
+            if self.incr_reads[index].deadline <= now {
+                let read = self.incr_reads.remove(index);
+                match read.purpose {
+                    IncrPurpose::Drag { drop } => expired.push(drop),
+                    IncrPurpose::Clipboard {
+                        token: _,
+                        selection,
+                        target,
+                    } => {
+                        self.clipboard
+                            .complete(read.property, Err(ClipboardError::Timeout));
+                        expired_clipboard.push((selection, target));
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+        for (selection, target) in expired_clipboard {
+            out.push(WindowEvent::SelectionNotify {
+                selection,
+                target,
+                succeeded: false,
+            });
+        }
+        if !expired.is_empty() {
+            self.send_drag_finished(false);
+            self.drag.session.leave();
+            self.drag.pending_drop = None;
+            self.drag.source = NONE;
+            self.drag.deadline = None;
+            out.push(WindowEvent::DragLeave);
+        }
+        if self.drag.session.is_active()
+            && self.drag.pending_drop.is_none()
+            && self.drag.deadline.is_some_and(|deadline| deadline <= now)
+        {
+            self.drag.session.leave();
+            self.drag.source = NONE;
+            self.drag.deadline = None;
+            out.push(WindowEvent::DragLeave);
+        }
+    }
+
+    fn handle_property_notify(&mut self, event: &XPropertyEvent, out: &mut Vec<WindowEvent>) {
+        match event.state {
+            // Delete notifications arrive on the requestor window, which is not
+            // our own when we are the selection owner.
+            PROPERTY_DELETE => self.advance_incr_write(event.atom),
+            PROPERTY_NEW_VALUE if event.window == self.window => {
+                self.read_incr_chunk(event.atom, out)
+            }
+            _ => {}
+        }
+    }
+
+    fn advance_incr_write(&mut self, property: Atom) {
+        let Some(index) = self
+            .incr_writes
+            .iter()
+            .position(|write| write.property == property)
+        else {
+            return;
+        };
+        self.incr_writes[index].deadline = Instant::now() + Duration::from_secs(30);
+        let chunk = self.incr_writes[index]
+            .state
+            .next_chunk()
+            .map(<[u8]>::to_vec);
+        let finished = self.incr_writes[index].state.is_finished();
+        if let Some(chunk) = chunk {
+            let write = &self.incr_writes[index];
+            unsafe {
+                XChangeProperty(
+                    self.display,
+                    write.requestor,
+                    write.property,
+                    write.type_atom,
+                    8,
+                    PROP_MODE_REPLACE,
+                    chunk.as_ptr(),
+                    chunk.len() as c_int,
+                );
+                XFlush(self.display);
+            }
+        }
+        if finished {
+            self.incr_writes.remove(index);
+        }
+    }
+
+    fn read_incr_chunk(&mut self, property: Atom, out: &mut Vec<WindowEvent>) {
+        let Some(index) = self
+            .incr_reads
+            .iter()
+            .position(|read| read.property == property)
+        else {
+            return;
+        };
+        let Some((_, _, data)) = (unsafe { get_property(self.display, self.window, property) })
+        else {
+            return;
+        };
+        let finished = self.incr_reads[index].state.push(&data);
+        if !finished {
+            return;
+        }
+        let read = self.incr_reads.remove(index);
+        let property = read.property;
+        match read.purpose {
+            IncrPurpose::Clipboard {
+                token: _,
+                selection,
+                target,
+            } => {
+                let data = read.state.into_data();
+                let reply = match String::from_utf8(data.clone()) {
+                    Ok(text) => ClipboardReply::Text(text),
+                    Err(_) => ClipboardReply::Data {
+                        target: target.clone(),
+                        data,
+                    },
+                };
+                self.clipboard.complete(property, Ok(reply));
+                out.push(WindowEvent::SelectionNotify {
+                    selection,
+                    target,
+                    succeeded: true,
+                });
+            }
+            IncrPurpose::Drag { drop } => {
+                self.deliver_drag_data(drop, read.state.into_data(), out);
+            }
+        }
     }
 
     // }}}
@@ -2150,6 +3442,9 @@ impl X11Window {
 impl Drop for X11Window {
     fn drop(&mut self) {
         unsafe {
+            if let Some(mut ime) = self.ime.take() {
+                ime.destroy();
+            }
             if self.cursor != 0 {
                 XFreeCursor(self.display, self.cursor);
                 self.cursor = 0;
@@ -2311,17 +3606,21 @@ fn keysym_char(symbol: u32) -> Option<char> {
     char::from_u32(code)
 }
 
-fn read_selection_property(
+fn expected_size(data: &[u8], format: c_int) -> usize {
+    if format != 32 || data.len() < std::mem::size_of::<c_long>() {
+        return 0;
+    }
+    let mut raw = [0u8; std::mem::size_of::<c_long>()];
+    raw.copy_from_slice(&data[..std::mem::size_of::<c_long>()]);
+    c_long::from_ne_bytes(raw).max(0) as usize
+}
+
+fn selection_reply(
     display: *mut Display,
-    window: Window,
-    property: Atom,
+    actual_type: Atom,
+    format: c_int,
+    data: Vec<u8>,
 ) -> Result<ClipboardReply, ClipboardError> {
-    let Some((actual_type, format, data)) = (unsafe { get_property(display, window, property) })
-    else {
-        return Err(ClipboardError::BadReply(
-            "selection property is missing".to_owned(),
-        ));
-    };
     if actual_type == XA_ATOM && format == 32 {
         let item_size = std::mem::size_of::<c_long>();
         let mut targets = Vec::with_capacity(data.len() / item_size);
@@ -2424,5 +3723,149 @@ mod tests {
                 }
             ]
         );
+    }
+    #[test]
+    fn ime_draw_replaces_deletes_and_tracks_caret() {
+        let mut state = ImeState::default();
+        state.draw(0, 0, Some("abc"), 3);
+        let events = state.drain();
+        assert_eq!(
+            events,
+            vec![WindowEvent::Preedit {
+                text: "abc".to_owned(),
+                cursor: Some((3, 3))
+            }]
+        );
+        assert_eq!(state.text(), "abc");
+
+        state.draw(1, 1, Some("X"), 2);
+        assert_eq!(state.text(), "aXc");
+        assert_eq!(state.cursor(), Some((2, 2)));
+
+        state.draw(1, 1, None, 1);
+        assert_eq!(state.text(), "ac");
+        assert_eq!(state.cursor(), Some((1, 1)));
+        assert_eq!(state.drain().len(), 2);
+    }
+
+    #[test]
+    fn ime_caret_uses_character_offsets_for_utf8() {
+        let mut state = ImeState::default();
+        state.draw(0, 0, Some("café"), 5);
+        state.drain();
+        state.set_caret(4);
+        assert_eq!(state.cursor(), Some((3, 3)));
+        state.set_caret(100);
+        assert_eq!(state.cursor(), Some((4, 4)));
+        assert_eq!(state.drain().len(), 2);
+    }
+
+    #[test]
+    fn ime_commit_clears_preedit_and_emits_commit() {
+        let mut state = ImeState::default();
+        state.draw(0, 0, Some("に"), 3);
+        state.drain();
+        state.commit("日本");
+        let events = state.drain();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            WindowEvent::Preedit {
+                text: String::new(),
+                cursor: None
+            }
+        );
+        assert_eq!(
+            events[1],
+            WindowEvent::Commit {
+                text: "日本".to_owned()
+            }
+        );
+        assert_eq!(state.text(), "");
+        assert_eq!(state.cursor(), None);
+    }
+
+    #[test]
+    fn ime_reset_only_emits_when_preedit_was_visible() {
+        let mut state = ImeState::default();
+        state.reset();
+        assert!(state.drain().is_empty());
+        state.draw(0, 0, Some("x"), 1);
+        state.drain();
+        state.reset();
+        assert_eq!(
+            state.drain(),
+            vec![WindowEvent::Preedit {
+                text: String::new(),
+                cursor: None
+            }]
+        );
+    }
+
+    #[test]
+    fn xim_text_decoding_handles_multibyte_and_wide_strings() {
+        let bytes = b"hello";
+        let text = XIMText {
+            length: bytes.len() as c_ushort,
+            feedback: ptr::null_mut(),
+            encoding_is_wchar: 0,
+            string: XIMTextString {
+                multi_byte: bytes.as_ptr() as *mut c_char,
+            },
+        };
+        assert_eq!(unsafe { decode_xim_text(&text) }, Some("hello".to_owned()));
+
+        let units = [0x61_u32, 0x1f600];
+        let text = XIMText {
+            length: units.len() as c_ushort,
+            feedback: ptr::null_mut(),
+            encoding_is_wchar: 1,
+            string: XIMTextString {
+                wide_char: units.as_ptr() as *mut u32,
+            },
+        };
+        assert_eq!(unsafe { decode_xim_text(&text) }, Some("a😀".to_owned()));
+        assert_eq!(unsafe { decode_xim_text(ptr::null()) }, None);
+    }
+
+    #[test]
+    fn input_style_prefers_preedit_callbacks() {
+        let styles = [
+            XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING,
+            XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING,
+        ];
+        assert_eq!(
+            choose_input_style(&styles),
+            Some((XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING, true))
+        );
+        assert_eq!(
+            choose_input_style(&[XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING]),
+            Some((XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING, false))
+        );
+        assert_eq!(choose_input_style(&[]), None);
+    }
+
+    #[test]
+    fn xcursor_names_cover_pointer_shapes() {
+        assert_eq!(xcursor_name(PointerShape::Default), Some("left_ptr"));
+        assert_eq!(xcursor_name(PointerShape::Text), Some("xterm"));
+        assert_eq!(
+            xcursor_name(PointerShape::ResizeSE),
+            Some("bottom_right_corner")
+        );
+        assert_eq!(xcursor_name(PointerShape::ZoomIn), Some("zoom-in"));
+        assert_eq!(
+            xcursor_name(PointerShape::ContextMenu),
+            Some("context-menu")
+        );
+    }
+
+    #[test]
+    fn incr_expected_size_reads_a_32_bit_property() {
+        let value: c_long = 300 * 1024;
+        let bytes = value.to_ne_bytes();
+        assert_eq!(expected_size(&bytes, 32), 300 * 1024);
+        assert_eq!(expected_size(&bytes, 8), 0);
+        assert_eq!(expected_size(&[], 32), 0);
     }
 }

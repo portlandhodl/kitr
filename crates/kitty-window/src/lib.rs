@@ -16,13 +16,21 @@
 //!   repeat handling (`repeat_info` on Wayland, detectable auto-repeat on X11);
 //! * mouse motion, buttons, wheel axes, enter/leave, focus, resize, move,
 //!   expose, close and clipboard selection events;
+//! * X11 input methods (XIM) with pre-edit/commit callbacks and dead-key
+//!   composition, plus `zwp_text_input_v3` on Wayland, exposed as
+//!   [`WindowEvent::Preedit`], [`WindowEvent::Commit`] and
+//!   [`WindowEvent::DeleteSurrounding`];
+//! * XDND drag and drop on X11 (URI lists and UTF-8 text, with `INCR` for large
+//!   payloads) and `wl_data_device` drag targets on Wayland, exposed as
+//!   [`WindowEvent::DragEnter`], [`WindowEvent::DragMotion`],
+//!   [`WindowEvent::DragDrop`] and [`WindowEvent::DragLeave`];
 //! * a `poll()`-based event pump with EINTR handling, configure/expose
 //!   coalescing and a pipe-based wakeup handle that another thread can use;
 //! * clipboard get/set with an async request state machine and blocking
 //!   convenience methods. Wayland uses `wl_data_device` with
 //!   `text/plain;charset=utf-8`, `text/plain`, `UTF8_STRING`, `STRING` and
 //!   synthesised `TARGETS`; X11 uses `CLIPBOARD`/`PRIMARY` selections and X
-//!   atoms;
+//!   atoms, with chunked `INCR` transfers for payloads above 256 KiB;
 //! * fullscreen, maximize, hide/show, title, size and pointer-shape state;
 //! * HiDPI scale factors: `Xft.dpi` on X11, `wl_output.scale`,
 //!   `wl_surface.preferred_buffer_scale` and `fractional-scale-v1` on Wayland;
@@ -37,13 +45,14 @@
 //!
 //! # Intentional gaps
 //!
-//! macOS/Cocoa, IME/preedit, drag-and-drop, touch gestures, tablet input and
-//! cursor themes are not implemented. Wayland currently implements the
-//! `CLIPBOARD` selection but not the `PRIMARY` selection; X11 still supports
-//! both. Wayland window position is compositor-owned, so `position` is only
-//! bookkeeping. X11 clipboard transfers do not implement `INCR` yet, so very
-//! large payloads are not supported. Fractional scaling falls back to the
-//! integer output scale when `viewporter` is unavailable.
+//! macOS/Cocoa, touch gestures and tablet input are not implemented. X11 cursor
+//! themes use `XcursorLibraryLoadCursor` when libXcursor is present and fall
+//! back to the cursor font otherwise. Wayland implements the `CLIPBOARD`
+//! selection and a drag target through `wl_data_device`, but not the `PRIMARY`
+//! selection or drag sources. Wayland window position is compositor-owned, so
+//! `position` is only bookkeeping. Fractional scaling falls back to the integer
+//! output scale when `viewporter` is unavailable. The X11 input-method tests
+//! exercise callback state directly because `Xvfb` usually has no XIM server.
 //!
 //! # Example
 //!
@@ -72,6 +81,7 @@
 
 mod backend;
 pub mod clipboard;
+pub mod dnd;
 pub mod egl;
 pub mod types;
 mod wakeup;

@@ -566,6 +566,46 @@ fn clipboard_roundtrip_between_two_windows() {
 }
 
 #[test]
+fn clipboard_incr_roundtrip_for_large_payload() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let mut owner = display.open(&WindowConfig::new("incr-owner", 100, 100));
+    let mut reader = display.open(&WindowConfig::new("incr-reader", 100, 100));
+    drain(&mut owner);
+    drain(&mut reader);
+
+    let payload = "0123456789abcdef".repeat(20_000);
+    assert!(payload.len() > 256 * 1024);
+    owner
+        .set_clipboard_text(Selection::Clipboard, &payload)
+        .expect("offer large clipboard payload");
+    let text = roundtrip_text(&mut owner, &mut reader, Selection::Clipboard);
+    assert_eq!(text.len(), payload.len());
+    assert_eq!(text, payload);
+}
+
+#[test]
+fn ime_toggle_is_safe_without_an_input_method() {
+    let _guard = test_lock();
+    let Some(display) = TestDisplay::new() else {
+        return;
+    };
+    let mut window = display.open(&WindowConfig::new("ime", 120, 80));
+    drain(&mut window);
+    assert!(window.ime_enabled());
+    window.set_ime_enabled(false);
+    assert!(!window.ime_enabled());
+    window.set_ime_enabled(true);
+    assert!(window.ime_enabled());
+    // Xvfb rarely has an input method configured. The unit tests exercise the
+    // callback state machine; this test only guarantees the public toggle is
+    // safe when XOpenIM returns nothing.
+    let _ = window.has_input_method();
+}
+
+#[test]
 fn wakeup_latency_and_timeout() {
     let _guard = test_lock();
     let Some(display) = TestDisplay::new() else {

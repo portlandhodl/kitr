@@ -1781,6 +1781,20 @@ impl GlBackend {
             config.metrics.cell_height
         };
         let origin_y = frame.geometry.origin_y;
+        // Partial frames belong to one viewport (a GUI pane or tab strip).
+        // Restrict the clear/draw rectangle to that viewport instead of the
+        // whole window, otherwise drawing a second pane would erase the first.
+        let origin_x = frame.geometry.origin_x.floor().max(0.0) as i32;
+        let viewport_width = if config.viewport_width > 0.0 {
+            config.viewport_width
+        } else {
+            frame.geometry.width_px()
+        };
+        let x0 = origin_x.min(width);
+        let x1 = (origin_x + viewport_width.ceil() as i32).max(x0).min(width);
+        if x1 <= x0 {
+            return Vec::new();
+        }
         let mut ans = Vec::new();
         let mut push_rows = |start: u32, end: u32| {
             if end <= start || cell_height <= 0.0 {
@@ -1792,9 +1806,9 @@ impl GlBackend {
             let y1 = bottom.ceil().min(height as f32) as i32;
             if y1 > y0 {
                 ans.push(ScissorRect {
-                    x: 0,
+                    x: x0,
                     y: y0,
-                    width,
+                    width: x1 - x0,
                     height: y1 - y0,
                 });
             }
