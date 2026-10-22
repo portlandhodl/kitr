@@ -51,7 +51,8 @@ cargo run --release -p kitty-screen --example bench
 cargo run --release -p kitty-input --example bench
 ```
 
-The C sources are not included in this repository. Ported files carry an SPDX
+See [BENCHMARKS.md](BENCHMARKS.md) for measured C-vs-Rust numbers and the
+methodology. The C sources are not included in this repository. Ported files carry an SPDX
 identifier and a "ported from" notice naming the original kitty file and its
 copyright holder.
 
