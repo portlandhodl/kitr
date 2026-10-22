@@ -1,0 +1,9 @@
+[package]
+name = "kitty-simd"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+license.workspace = true
+description = "SIMD and scalar primitives ported 1:1 from kitty's simd-string.c"
+
+[dependencies]

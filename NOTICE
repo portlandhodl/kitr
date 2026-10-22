@@ -1,0 +1,28 @@
+kitr
+Copyright (C) 2026 kitr contributors
+
+This product is a derivative work of kitty.
+
+kitty
+Copyright (C) 2016-2026 Kovid Goyal and kitty contributors
+Upstream: https://github.com/kovidgoyal/kitty
+License: GNU General Public License, version 3 or later (GPL-3.0-or-later)
+
+kitr is a translation and modification of portions of kitty's C and Python
+sources into Rust. It is not kitty, is not endorsed by the kitty authors, and
+may contain behavior that differs from upstream. Files that contain ported
+code retain the upstream copyright notice and carry a header of the form:
+
+    SPDX-License-Identifier: GPL-3.0-or-later
+    Ported from kitty/<file>, Copyright (C) <year(s)> Kovid Goyal <kovid at kovidgoyal.net>
+
+The complete corresponding source for kitr is this repository. If you
+redistribute kitr or a modified version, you must comply with GPL-3.0-or-later,
+including making the complete corresponding source available and retaining all
+copyright, license and modification notices.
+
+Third-party components and data are listed in THIRD_PARTY_NOTICES.md.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See LICENSE for details.

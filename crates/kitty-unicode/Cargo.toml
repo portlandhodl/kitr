@@ -1,0 +1,10 @@
+[package]
+name = "kitty-unicode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Unicode character properties and wcswidth ported 1:1 from kitty"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }

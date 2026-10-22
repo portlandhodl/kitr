@@ -1,0 +1,10 @@
+[package]
+name = "kitty-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Keyboard, key encoding and mouse handling ported from kitty"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }

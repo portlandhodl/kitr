@@ -1,0 +1,13 @@
+[package]
+name = "kitty-screen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Screen state, cursor, scrollback integration, lineops and ANSI serialization ported from kitty"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }
+kitty-vt = { path = "../kitty-vt" }
+kitty-simd = { path = "../kitty-simd" }
+kitty-unicode = { path = "../kitty-unicode" }
