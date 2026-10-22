@@ -259,6 +259,48 @@ impl GraphicsCommand {
     pub fn is_transient(&self) -> bool {
         self.usage_hints & GRAPHICS_USAGE_HINT_TRANSIENT != 0
     }
+
+    /// Frame number for `a=f`/`a=a`/`a=c` (`r=`).
+    pub const fn frame_number(&self) -> u32 {
+        self.num_lines
+    }
+
+    /// Other frame number (`c=`), used as the frame source for `a=f` and
+    /// `a=c` and as the selected frame for `a=a`.
+    pub const fn other_frame_number(&self) -> u32 {
+        self.num_cells
+    }
+
+    /// Frame gap in milliseconds (`z=`), signed.
+    pub const fn gap(&self) -> i32 {
+        self.z_index
+    }
+
+    /// Background colour for a frame canvas (`Y=`), packed RGBA.
+    pub const fn bgcolor(&self) -> u32 {
+        self.cell_y_offset
+    }
+
+    /// Frame blend mode (`X=`): `1` replaces, anything else alpha blends.
+    pub const fn blend_mode(&self) -> u32 {
+        self.cell_x_offset
+    }
+
+    /// Animation run state (`s=`) for `a=a`: `1` stopped, `2` loading,
+    /// `3` running.
+    pub const fn animation_state(&self) -> u32 {
+        self.data_width
+    }
+
+    /// Animation loop count (`v=`) for `a=a`.
+    pub const fn loop_count(&self) -> u32 {
+        self.data_height
+    }
+
+    /// Composition operation (`C=`) for `a=c`: `1` replaces, `0` alpha blends.
+    pub const fn compose_mode(&self) -> u32 {
+        self.cursor_movement
+    }
 }
 
 /// Parser error. The `Display` strings match kitty's parser where practical.

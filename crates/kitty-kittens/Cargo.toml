@@ -4,13 +4,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Kitten discovery, launching and protocol helpers"
+description = "Kitten discovery, launching, protocol helpers and native kittens"
 
 [dependencies]
 kitty-core = { path = "../kitty-core" }
 kitty-config = { path = "../kitty-config" }
 kitty-remote = { path = "../kitty-remote" }
+kitty-graphics = { path = "../kitty-graphics" }
+
+[[bin]]
+name = "kitten"
+path = "src/bin/kitten.rs"
 
 [[bench]]
 name = "kittens"
+harness = false
+
+[[bench]]
+name = "icat"
+path = "benches/icat_bench.rs"
 harness = false

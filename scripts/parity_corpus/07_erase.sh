@@ -1,0 +1,15 @@
+#!/bin/sh
+printf '\033[2J\033[H'
+printf 'erase operations\n'
+printf 'ABCDEFGHIJKLMNOPQRSTUVWXYZ\n'
+printf '\033[3;1H\033[31mred line will be partly erased\033[0m'
+printf '\033[3;9H\033[K'
+printf '\033[5;1Hbackground fill: \033[44m        \033[0m end'
+printf '\033[6;1H\033[45m  erase-to-left test  \033[0m'
+printf '\033[6;12H\033[1K'
+printf '\033[8;1Hline eight stays'
+printf '\033[9;1Hline nine stays'
+printf '\033[10;1H\033[J'
+printf '\033[12;1Ha\033[42m    \033[0mb'
+printf '\033[14;1Hend marker'
+sleep 30

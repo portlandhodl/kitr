@@ -17,15 +17,17 @@
 //! * window logos with the nine kitty anchor positions, opacity and optional
 //!   percentage scaling.
 //!
-//! Parent/child placements, unicode placeholder expansion, animations and
-//! indexed-colour images without RGBA data are not turned into quads; they are
-//! skipped (see the crate-level documentation).
+//! Parent/child relative placements and indexed-colour images without RGBA
+//! data are not turned into quads. Unicode placeholder runs and animation
+//! frames are expanded here; the current animation frame takes precedence over
+//! the root image stored on the screen.
 
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use kitty_graphics::{decode_png, Image, MAX_IMAGE_DIMENSION};
+use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
+use kitty_graphics::{decode_png, AnimationManager, Image, MAX_IMAGE_DIMENSION};
 use kitty_screen::Screen;
 
 use crate::atlas::UvRect;
@@ -662,24 +664,305 @@ pub fn window_logo(
     Some((instance, upload))
 }
 
-/// Expand a protocol image's placement into an instance and upload.
+/// Decode one of the row/column diacritics used by Unicode placeholders.
+///
+/// The table matches `kitty/rowcolumn-diacritics.c` (Unicode 17 combining
+/// marks of class 230 without decompositions).
+pub fn diacritic_to_num(code: u32) -> u32 {
+    match code {
+        0x305..=0x306 => code - 0x305 + 1,
+        0x30d..=0x30f => code - 0x30d + 2,
+        0x310..=0x311 => code - 0x310 + 4,
+        0x312..=0x313 => code - 0x312 + 5,
+        0x33d..=0x340 => code - 0x33d + 6,
+        0x346..=0x347 => code - 0x346 + 9,
+        0x34a..=0x34d => code - 0x34a + 10,
+        0x350..=0x353 => code - 0x350 + 13,
+        0x357..=0x358 => code - 0x357 + 16,
+        0x35b..=0x35c => code - 0x35b + 17,
+        0x363..=0x370 => code - 0x363 + 18,
+        0x483..=0x488 => code - 0x483 + 31,
+        0x592..=0x596 => code - 0x592 + 36,
+        0x597..=0x59a => code - 0x597 + 40,
+        0x59c..=0x5a2 => code - 0x59c + 43,
+        0x5a8..=0x5aa => code - 0x5a8 + 49,
+        0x5ab..=0x5ad => code - 0x5ab + 51,
+        0x5af..=0x5b0 => code - 0x5af + 53,
+        0x5c4..=0x5c5 => code - 0x5c4 + 54,
+        0x610..=0x618 => code - 0x610 + 55,
+        0x657..=0x65c => code - 0x657 + 63,
+        0x65d..=0x65f => code - 0x65d + 68,
+        0x6d6..=0x6dd => code - 0x6d6 + 70,
+        0x6df..=0x6e3 => code - 0x6df + 77,
+        0x6e4..=0x6e5 => code - 0x6e4 + 81,
+        0x6e7..=0x6e9 => code - 0x6e7 + 82,
+        0x6eb..=0x6ed => code - 0x6eb + 84,
+        0x730..=0x731 => code - 0x730 + 86,
+        0x732..=0x734 => code - 0x732 + 87,
+        0x735..=0x737 => code - 0x735 + 89,
+        0x73a..=0x73b => code - 0x73a + 91,
+        0x73d..=0x73e => code - 0x73d + 92,
+        0x73f..=0x742 => code - 0x73f + 93,
+        0x743..=0x744 => code - 0x743 + 96,
+        0x745..=0x746 => code - 0x745 + 97,
+        0x747..=0x748 => code - 0x747 + 98,
+        0x749..=0x74b => code - 0x749 + 99,
+        0x7eb..=0x7f2 => code - 0x7eb + 101,
+        0x7f3..=0x7f4 => code - 0x7f3 + 108,
+        0x816..=0x81a => code - 0x816 + 109,
+        0x81b..=0x824 => code - 0x81b + 113,
+        0x825..=0x828 => code - 0x825 + 122,
+        0x829..=0x82e => code - 0x829 + 125,
+        0x951..=0x952 => code - 0x951 + 130,
+        0x953..=0x955 => code - 0x953 + 131,
+        0xf82..=0xf84 => code - 0xf82 + 133,
+        0xf86..=0xf88 => code - 0xf86 + 135,
+        0x135d..=0x1360 => code - 0x135d + 137,
+        0x17dd..=0x17de => code - 0x17dd + 140,
+        0x193a..=0x193b => code - 0x193a + 141,
+        0x1a17..=0x1a18 => code - 0x1a17 + 142,
+        0x1a75..=0x1a7d => code - 0x1a75 + 143,
+        0x1b6b..=0x1b6c => code - 0x1b6b + 151,
+        0x1b6d..=0x1b74 => code - 0x1b6d + 152,
+        0x1cd0..=0x1cd3 => code - 0x1cd0 + 159,
+        0x1cda..=0x1cdc => code - 0x1cda + 162,
+        0x1ce0..=0x1ce1 => code - 0x1ce0 + 164,
+        0x1dc0..=0x1dc2 => code - 0x1dc0 + 165,
+        0x1dc3..=0x1dca => code - 0x1dc3 + 167,
+        0x1dcb..=0x1dcd => code - 0x1dcb + 174,
+        0x1dd1..=0x1de7 => code - 0x1dd1 + 176,
+        0x1dfe..=0x1dff => code - 0x1dfe + 198,
+        0x20d0..=0x20d2 => code - 0x20d0 + 199,
+        0x20d4..=0x20d8 => code - 0x20d4 + 201,
+        0x20db..=0x20dd => code - 0x20db + 205,
+        0x20e1..=0x20e2 => code - 0x20e1 + 207,
+        0x20e7..=0x20e8 => code - 0x20e7 + 208,
+        0x20e9..=0x20ea => code - 0x20e9 + 209,
+        0x20f0..=0x20f1 => code - 0x20f0 + 210,
+        0x2cef..=0x2cf2 => code - 0x2cef + 211,
+        0x2de0..=0x2e00 => code - 0x2de0 + 214,
+        0xa66f..=0xa670 => code - 0xa66f + 246,
+        0xa67c..=0xa67e => code - 0xa67c + 247,
+        0xa6f0..=0xa6f2 => code - 0xa6f0 + 249,
+        0xa8e0..=0xa8f2 => code - 0xa8e0 + 251,
+        0xaab0..=0xaab1 => code - 0xaab0 + 269,
+        0xaab2..=0xaab4 => code - 0xaab2 + 270,
+        0xaab7..=0xaab9 => code - 0xaab7 + 272,
+        0xaabe..=0xaac0 => code - 0xaabe + 274,
+        0xaac1..=0xaac2 => code - 0xaac1 + 276,
+        0xfe20..=0xfe27 => code - 0xfe20 + 277,
+        0x10a0f..=0x10a10 => code - 0x10a0f + 284,
+        0x10a38..=0x10a39 => code - 0x10a38 + 285,
+        0x1d185..=0x1d18a => code - 0x1d185 + 286,
+        0x1d1aa..=0x1d1ae => code - 0x1d1aa + 291,
+        0x1d242..=0x1d245 => code - 0x1d242 + 295,
+        _ => 0,
+    }
+}
+
+/// Extract the low 24 image-id bits from a packed cell colour.
+#[inline]
+pub fn color_to_image_id(color: u32) -> u32 {
+    (color >> 8) & 0x00ff_ffff
+}
+
+/// One horizontal run of `U+10EEEE` placeholder cells.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaceholderRun {
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub image_row: u32,
+    pub image_column: u32,
+    pub screen_x: u32,
+    pub screen_y: u32,
+    /// Number of placeholder cells (image-grid columns).
+    pub columns: u32,
+    /// Screen columns covered, including wide/multicell cells.
+    pub screen_columns: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_placeholder_run(
+    runs: &mut Vec<PlaceholderRun>,
+    lower: u32,
+    placement_id: u32,
+    higher: u32,
+    row: u32,
+    column: u32,
+    start_x: u32,
+    screen_y: u32,
+    run_len: u32,
+    run_width: u32,
+) {
+    if run_len == 0 {
+        return;
+    }
+    let higher = higher.max(1);
+    let image_id = lower | ((higher - 1) << 24);
+    runs.push(PlaceholderRun {
+        image_id,
+        placement_id,
+        image_row: row.max(1) - 1,
+        image_column: column.saturating_sub(run_len),
+        screen_x: start_x,
+        screen_y,
+        columns: run_len,
+        screen_columns: run_width.max(1),
+    });
+}
+
+/// Expand all Unicode placeholder cells into image-space runs.
+pub fn expand_unicode_placeholders(screen: &Screen) -> Vec<PlaceholderRun> {
+    let mut runs = Vec::new();
+    let tc = screen.text_cache().borrow();
+    for y in 0..screen.lines {
+        let mut run_len = 0u32;
+        let mut run_width = 0u32;
+        let mut run_start = 0u32;
+        let mut prev_lower = 0u32;
+        let mut prev_placement = 0u32;
+        let mut prev_higher = 0u32;
+        let mut prev_row = 0u32;
+        let mut prev_col = 0u32;
+        for x in 0..screen.columns {
+            let cpu = screen.cpu_cell(x, y);
+            let mut single = [0u32; 1];
+            let text: &[u32] = if cpu.ch_is_idx() {
+                tc.chars_at(cpu.ch())
+            } else if cpu.ch() != 0 {
+                single[0] = cpu.ch();
+                &single[..1]
+            } else {
+                &[]
+            };
+            let is_placeholder = text.first().copied() == Some(IMAGE_PLACEHOLDER_CHAR);
+            let mut lower = 0u32;
+            let mut placement = 0u32;
+            let mut higher = 0u32;
+            let mut row = 0u32;
+            let mut column = 0u32;
+            if is_placeholder {
+                let gpu = screen.gpu_cell(x, y);
+                lower = color_to_image_id(gpu.fg);
+                placement = color_to_image_id(gpu.decoration_fg);
+                if text.len() > 1 && text[1] != 0 {
+                    row = diacritic_to_num(text[1]);
+                }
+                if text.len() > 2 && text[2] != 0 {
+                    column = diacritic_to_num(text[2]);
+                }
+                if text.len() > 3 && text[3] != 0 {
+                    higher = diacritic_to_num(text[3]);
+                }
+            }
+            let span = if cpu.is_multicell() && cpu.width() > 0 {
+                cpu.mcd_x_limit().max(1).min(screen.columns - x)
+            } else {
+                1
+            };
+            let continues = run_len > 0
+                && is_placeholder
+                && lower == prev_lower
+                && placement == prev_placement
+                && (row == 0 || row == prev_row)
+                && (column == 0 || column == prev_col + 1)
+                && (higher == 0 || higher == prev_higher);
+            if continues {
+                run_len += 1;
+                run_width += span;
+                row = prev_row.max(1);
+                column = prev_col + 1;
+                higher = prev_higher.max(1);
+            } else {
+                if run_len > 0 {
+                    push_placeholder_run(
+                        &mut runs,
+                        prev_lower,
+                        prev_placement,
+                        prev_higher,
+                        prev_row,
+                        prev_col,
+                        run_start,
+                        y,
+                        run_len,
+                        run_width,
+                    );
+                }
+                if is_placeholder {
+                    run_len = 1;
+                    run_width = span;
+                    run_start = x;
+                    if column == 0 {
+                        column = 1;
+                    }
+                    if row == 0 {
+                        row = 1;
+                    }
+                    if higher == 0 {
+                        higher = 1;
+                    }
+                } else {
+                    run_len = 0;
+                    run_width = 0;
+                }
+            }
+            prev_lower = lower;
+            prev_placement = placement;
+            prev_higher = higher;
+            prev_row = row;
+            prev_col = column;
+        }
+        if run_len > 0 {
+            push_placeholder_run(
+                &mut runs,
+                prev_lower,
+                prev_placement,
+                prev_higher,
+                prev_row,
+                prev_col,
+                run_start,
+                y,
+                run_len,
+                run_width,
+            );
+        }
+    }
+    runs
+}
+
+fn image_pixels(
+    image: &Image,
+    image_id: u32,
+    animations: Option<&AnimationManager>,
+) -> Option<(ImageData, u32, u32)> {
+    if let Some(animated) = animations.and_then(|manager| manager.image(image_id)) {
+        return Some((animated.current_data(), animated.width, animated.height));
+    }
+    if image.width == 0 || image.height == 0 {
+        return None;
+    }
+    image
+        .rgba
+        .as_ref()
+        .map(|rgba| (Arc::new(rgba.clone()), image.width, image.height))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn protocol_placement(
     placement: &kitty_screen::ImagePlacement,
-    image: &Image,
+    data: ImageData,
+    image_width: u32,
+    image_height: u32,
     geometry: &GridGeometry,
     viewport_width: f32,
     viewport_height: f32,
     filter: ImageFilter,
 ) -> Option<(ImageInstance, ImageUpload)> {
-    let rgba = image.rgba.as_ref()?;
-    if image.width == 0 || image.height == 0 {
-        return None;
-    }
     let p = &placement.placement;
     let cell_w = geometry.cell_width;
     let cell_h = geometry.cell_height;
-    let iw = image.width as f32;
-    let ih = image.height as f32;
+    let iw = image_width as f32;
+    let ih = image_height as f32;
 
     let explicit_width = p.width > 0;
     let explicit_height = p.height > 0;
@@ -698,7 +981,6 @@ fn protocol_placement(
         ih
     };
 
-    // If only one dimension was constrained, preserve the aspect ratio.
     if !explicit_width && p.num_cols == 0 && (explicit_height || p.num_rows > 0) {
         width = height * iw / ih;
     } else if !explicit_height && p.num_rows == 0 && (explicit_width || p.num_cols > 0) {
@@ -730,9 +1012,9 @@ fn protocol_placement(
     let key = ImageKey::Protocol(placement.image_id);
     let upload = ImageUpload::new(
         key,
-        image.width,
-        image.height,
-        Arc::new(rgba.clone()),
+        image_width,
+        image_height,
+        data,
         filter,
         ImageWrap::Clamp,
     );
@@ -742,13 +1024,126 @@ fn protocol_placement(
     Some((instance, upload))
 }
 
-/// Collect visible protocol placements from `screen`.
+fn placeholder_quad(
+    run: &PlaceholderRun,
+    virtual_placement: &kitty_screen::ImagePlacement,
+    image_width: u32,
+    image_height: u32,
+    geometry: &GridGeometry,
+) -> Option<(Rect, UvRect)> {
+    let cell_w = geometry.cell_width;
+    let cell_h = geometry.cell_height;
+    let iw = image_width as f32;
+    let ih = image_height as f32;
+    if iw <= 0.0 || ih <= 0.0 || cell_w <= 0.0 || cell_h <= 0.0 {
+        return None;
+    }
+    let mut box_cols = virtual_placement.placement.num_cols;
+    let mut box_rows = virtual_placement.placement.num_rows;
+    if box_cols == 0 {
+        box_cols = ((image_width as f32 + cell_w - 1.0) / cell_w).max(1.0) as u32;
+    }
+    if box_rows == 0 {
+        box_rows = ((image_height as f32 + cell_h - 1.0) / cell_h).max(1.0) as u32;
+    }
+    let (x_scale, x_offset, y_scale, y_offset) =
+        if iw * box_rows as f32 * cell_h > ih * box_cols as f32 * cell_w {
+            let scale = (box_cols as f32 * cell_w) / iw.max(1.0);
+            (
+                scale,
+                0.0,
+                scale,
+                (box_rows as f32 * cell_h - ih * scale) / 2.0,
+            )
+        } else {
+            let scale = (box_rows as f32 * cell_h) / ih.max(1.0);
+            (
+                scale,
+                (box_cols as f32 * cell_w - iw * scale) / 2.0,
+                scale,
+                0.0,
+            )
+        };
+    let mut start_col = run.screen_x;
+    let mut start_row = run.screen_y;
+    let mut columns = run.screen_columns.max(1) as f32;
+    let mut rows = 1.0f32;
+    let mut cell_x_offset = 0.0f32;
+    let mut cell_y_offset = 0.0f32;
+    let mut src_x = (run.image_column as f32 * cell_w - x_offset) / x_scale;
+    let mut src_y = (run.image_row as f32 * cell_h - y_offset) / y_scale;
+    let mut src_w = columns * cell_w / x_scale;
+    let mut src_h = rows * cell_h / y_scale;
+    if src_x < 0.0 {
+        src_w += src_x;
+        cell_x_offset = -src_x * x_scale;
+        src_x = 0.0;
+        let col_offset = (cell_x_offset / cell_w) as u32;
+        start_col = start_col.saturating_add(col_offset);
+        if columns <= col_offset as f32 {
+            return None;
+        }
+        columns -= col_offset as f32;
+        cell_x_offset %= cell_w;
+    }
+    if src_y < 0.0 {
+        src_h += src_y;
+        cell_y_offset = -src_y * y_scale;
+        src_y = 0.0;
+        let row_offset = (cell_y_offset / cell_h) as u32;
+        start_row = start_row.saturating_add(row_offset);
+        if rows <= row_offset as f32 {
+            return None;
+        }
+        rows -= row_offset as f32;
+        cell_y_offset %= cell_h;
+    }
+    if src_x + src_w > iw {
+        let redundant = (src_x + src_w - iw) * x_scale / cell_w;
+        let redundant = redundant as u32;
+        if columns <= redundant as f32 {
+            return None;
+        }
+        src_w -= redundant as f32 * cell_w / x_scale;
+        columns -= redundant as f32;
+    }
+    if src_y + src_h > ih {
+        let redundant = (src_y + src_h - ih) * y_scale / cell_h;
+        let redundant = redundant as u32;
+        if rows <= redundant as f32 {
+            return None;
+        }
+        src_h -= redundant as f32 * cell_h / y_scale;
+        rows -= redundant as f32;
+    }
+    if src_w <= 0.0 || src_h <= 0.0 || columns <= 0.0 || rows <= 0.0 {
+        return None;
+    }
+    let rect = Rect::new(
+        geometry.origin_x + start_col as f32 * cell_w + cell_x_offset,
+        geometry.origin_y + start_row as f32 * cell_h + cell_y_offset,
+        columns * cell_w,
+        rows * cell_h,
+    );
+    let uv = UvRect {
+        u0: (src_x / iw).clamp(0.0, 1.0),
+        v0: (src_y / ih).clamp(0.0, 1.0),
+        u1: ((src_x + src_w) / iw).clamp(0.0, 1.0),
+        v1: ((src_y + src_h) / ih).clamp(0.0, 1.0),
+    };
+    Some((rect, uv))
+}
+
+/// Collect visible protocol placements and Unicode placeholder runs.
 ///
 /// Placements are sorted by `(z-index, image id, placement id)`, matching
 /// kitty's draw order. Duplicate textures for the same image are uploaded only
-/// once per frame.
-pub fn collect_protocol_images(
+/// once per frame. When `animations` contains an image, its current frame is
+/// used instead of the root image stored on the screen.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_protocol_images_with_animations(
     screen: &Screen,
+    animations: Option<&AnimationManager>,
     geometry: &GridGeometry,
     viewport_width: f32,
     viewport_height: f32,
@@ -757,15 +1152,25 @@ pub fn collect_protocol_images(
     uploads: &mut Vec<ImageUpload>,
 ) {
     let mut seen_uploads: Vec<ImageKey> = Vec::new();
-    let mut collected: Vec<(i32, u32, u32, ImageInstance, Option<ImageUpload>)> = Vec::new();
+    let mut collected: Vec<(i32, u32, u32, u32, ImageInstance, Option<ImageUpload>)> = Vec::new();
+    let mut order = 0u32;
 
     for placement in screen.placements() {
+        if placement.placement.unicode_placement {
+            continue;
+        }
         let Some(image) = screen.image(placement.image_id) else {
+            continue;
+        };
+        let Some((data, width, height)) = image_pixels(image, placement.image_id, animations)
+        else {
             continue;
         };
         let Some((instance, upload)) = protocol_placement(
             placement,
-            image,
+            data,
+            width,
+            height,
             geometry,
             viewport_width,
             viewport_height,
@@ -783,13 +1188,61 @@ pub fn collect_protocol_images(
             instance.z_index,
             placement.image_id,
             placement.placement_id,
+            order,
             instance,
             upload,
         ));
+        order = order.wrapping_add(1);
     }
 
-    collected.sort_by_key(|(z, image_id, placement_id, _, _)| (*z, *image_id, *placement_id));
-    for (_, _, _, instance, upload) in collected {
+    for run in expand_unicode_placeholders(screen) {
+        let Some(image) = screen.image(run.image_id) else {
+            continue;
+        };
+        let Some(virtual_placement) = screen.placements().iter().find(|placement| {
+            placement.image_id == run.image_id
+                && placement.placement.unicode_placement
+                && (run.placement_id == 0 || placement.placement_id == run.placement_id)
+        }) else {
+            continue;
+        };
+        let Some((data, width, height)) = image_pixels(image, run.image_id, animations) else {
+            continue;
+        };
+        let Some((rect, uv)) = placeholder_quad(&run, virtual_placement, width, height, geometry)
+        else {
+            continue;
+        };
+        let key = ImageKey::Protocol(run.image_id);
+        let upload = if seen_uploads.contains(&key) {
+            None
+        } else {
+            seen_uploads.push(key);
+            Some(ImageUpload::new(
+                key,
+                width,
+                height,
+                data,
+                filter,
+                ImageWrap::Clamp,
+            ))
+        };
+        let instance = ImageInstance::new(key, rect).with_uv(uv).with_z_index(-1);
+        collected.push((
+            -1,
+            run.image_id,
+            virtual_placement.placement_id,
+            order,
+            instance,
+            upload,
+        ));
+        order = order.wrapping_add(1);
+    }
+
+    collected.sort_by_key(|(z, image_id, placement_id, order, _, _)| {
+        (*z, *image_id, *placement_id, *order)
+    });
+    for (_, _, _, _, instance, upload) in collected {
         instances.push(instance);
         if let Some(upload) = upload {
             uploads.push(upload);
@@ -797,9 +1250,35 @@ pub fn collect_protocol_images(
     }
 }
 
+/// Collect visible protocol placements from `screen` without animation state.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_protocol_images(
+    screen: &Screen,
+    geometry: &GridGeometry,
+    viewport_width: f32,
+    viewport_height: f32,
+    filter: ImageFilter,
+    instances: &mut Vec<ImageInstance>,
+    uploads: &mut Vec<ImageUpload>,
+) {
+    collect_protocol_images_with_animations(
+        screen,
+        None,
+        geometry,
+        viewport_width,
+        viewport_height,
+        filter,
+        instances,
+        uploads,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atlas::GlyphAtlas;
+    use crate::geom::CellMetrics;
+    use crate::instances::RenderConfig;
     use kitty_graphics::png::encode_png_rgba;
 
     fn asset_2x2() -> ImageAsset {
@@ -938,5 +1417,278 @@ mod tests {
         let (rect, _) = window_logo_quad(&logo, 32.0, 16.0).unwrap();
         assert_eq!(rect, Rect::new(0.0, 0.0, 8.0, 8.0));
         let _ = std::fs::remove_file(path);
+    }
+    fn placeholder_screen(id: u32, rows: u32, columns: u32) -> Screen {
+        let mut screen = Screen::builder(columns + 1, rows + 1)
+            .scrollback(8)
+            .build()
+            .unwrap();
+        let mut image =
+            kitty_graphics::parse_raw(format!("a=t,f=32,s=1,v=1,i={id}").as_bytes()).unwrap();
+        image.payload = vec![9, 8, 7, 255];
+        screen.handle_graphics_command(image).unwrap();
+        let mut virtual_placement =
+            kitty_graphics::parse_raw(format!("a=p,U=1,i={id},c={columns},r={rows}").as_bytes())
+                .unwrap();
+        virtual_placement.payload.clear();
+        screen.handle_graphics_command(virtual_placement).unwrap();
+        screen.cursor.sgr.fg = (id << 8) | 1;
+        screen.cursor.sgr.decoration_fg = 0;
+        for row in 0..rows {
+            let mut text = Vec::new();
+            for column in 0..columns {
+                text.push(IMAGE_PLACEHOLDER_CHAR);
+                text.push(if row == 0 { 0x305 } else { 0x30d + row - 1 });
+                text.push(if column == 0 {
+                    0x305
+                } else {
+                    0x30d + column - 1
+                });
+            }
+            screen.cursor_position(row + 1, 1);
+            screen.draw_text(&text);
+        }
+        screen
+    }
+
+    #[test]
+    fn placeholder_diacritic_table_is_one_based() {
+        assert_eq!(diacritic_to_num(0x305), 1);
+        assert_eq!(diacritic_to_num(0x30d), 2);
+        assert_eq!(diacritic_to_num(0x30e), 3);
+        assert_eq!(diacritic_to_num(0x1d245), 298);
+        assert_eq!(diacritic_to_num(0x41), 0);
+        assert_eq!(color_to_image_id((42 << 8) | 1), 42);
+        assert_eq!(
+            color_to_image_id((0x12 << 24) | (0x34 << 16) | (0x56 << 8) | 2),
+            0x123456
+        );
+    }
+
+    #[test]
+    fn placeholder_runs_decode_rows_and_columns() {
+        let screen = placeholder_screen(42, 2, 2);
+        let runs = expand_unicode_placeholders(&screen);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].image_id, 42);
+        assert_eq!((runs[0].image_row, runs[0].image_column), (0, 0));
+        assert_eq!((runs[0].screen_x, runs[0].screen_y), (0, 0));
+        assert_eq!((runs[0].columns, runs[0].screen_columns), (2, 2));
+        assert_eq!((runs[1].image_row, runs[1].image_column), (1, 0));
+        assert_eq!((runs[1].screen_x, runs[1].screen_y), (0, 1));
+    }
+
+    #[test]
+    fn placeholder_runs_inherit_columns_to_the_right() {
+        let mut screen = Screen::builder(4, 2).scrollback(8).build().unwrap();
+        screen.cursor.sgr.fg = (7 << 8) | 1;
+        screen.draw_text(&[IMAGE_PLACEHOLDER_CHAR, 0x305]);
+        screen.draw_text(&[IMAGE_PLACEHOLDER_CHAR, 0x305]);
+        let runs = expand_unicode_placeholders(&screen);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].image_id, 7);
+        assert_eq!((runs[0].image_row, runs[0].image_column), (0, 0));
+        assert_eq!(runs[0].columns, 2);
+    }
+
+    #[test]
+    fn placeholder_high_id_byte_is_decoded() {
+        let mut screen = Screen::builder(4, 1).scrollback(8).build().unwrap();
+        screen.cursor.sgr.fg = (42 << 8) | 1;
+        screen.draw_text(&[IMAGE_PLACEHOLDER_CHAR, 0x305, 0x305, 0x30e]);
+        let runs = expand_unicode_placeholders(&screen);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].image_id, 42 + (2 << 24));
+        assert_eq!(runs[0].placement_id, 0);
+    }
+
+    #[test]
+    fn placeholder_quad_uses_screen_columns_for_wide_cells() {
+        let mut screen = Screen::builder(4, 2).scrollback(8).build().unwrap();
+        let mut image = kitty_graphics::parse_raw(b"a=t,f=32,s=1,v=1,i=9").unwrap();
+        image.payload = vec![1, 2, 3, 255];
+        screen.handle_graphics_command(image).unwrap();
+        let mut virtual_placement = kitty_graphics::parse_raw(b"a=p,U=1,i=9,c=2,r=1").unwrap();
+        virtual_placement.payload.clear();
+        screen.handle_graphics_command(virtual_placement).unwrap();
+        let run = PlaceholderRun {
+            image_id: 9,
+            placement_id: 0,
+            image_row: 0,
+            image_column: 0,
+            screen_x: 0,
+            screen_y: 0,
+            columns: 1,
+            screen_columns: 2,
+        };
+        let geometry = GridGeometry::new(4, 2, CellMetrics::default());
+        let placement = screen
+            .placements()
+            .iter()
+            .find(|p| p.placement.unicode_placement)
+            .unwrap();
+        let (rect, _) = placeholder_quad(&run, placement, 1, 1, &geometry).unwrap();
+        assert_eq!(rect.width, geometry.cell_width * 2.0);
+    }
+
+    #[test]
+    fn missing_placeholder_image_suppresses_the_glyph() {
+        use crate::atlas::{AtlasConfig, GlyphBitmap, GlyphKey};
+        use crate::colors::BasicColorResolver;
+        use crate::instances::InstanceGenerator;
+
+        let mut screen = Screen::builder(4, 2).scrollback(8).build().unwrap();
+        screen.cursor.sgr.fg = (99 << 8) | 1;
+        screen.draw_text(&[IMAGE_PLACEHOLDER_CHAR, 0x305, 0x305]);
+        let generator = InstanceGenerator::new(RenderConfig::default());
+        let mut atlas = GlyphAtlas::new(AtlasConfig::default());
+        let mut rasterizer = |_key: &GlyphKey| GlyphBitmap::gray(8, 12, vec![0xff; 96]).ok();
+        let resolver = BasicColorResolver::default();
+        let mut frame = crate::instances::Frame::default();
+        generator.generate(&screen, &mut atlas, &mut rasterizer, &resolver, &mut frame);
+        assert!(frame.glyphs.is_empty());
+        assert!(frame.images.is_empty());
+    }
+
+    fn protocol_screen(id: u32, pixels: Vec<u8>) -> Screen {
+        let mut screen = Screen::builder(4, 3).scrollback(8).build().unwrap();
+        let mut image =
+            kitty_graphics::parse_raw(format!("a=t,f=32,s=1,v=1,i={id}").as_bytes()).unwrap();
+        image.payload = pixels;
+        screen.handle_graphics_command(image).unwrap();
+        let mut placement =
+            kitty_graphics::parse_raw(format!("a=p,i={id},p=1,c=1,r=1,z=0").as_bytes()).unwrap();
+        placement.payload.clear();
+        screen.handle_graphics_command(placement).unwrap();
+        screen
+    }
+
+    fn animated_frame(id: u32, color: [u8; 4]) -> kitty_graphics::GraphicsCommand {
+        let mut command =
+            kitty_graphics::parse_raw(format!("a=f,i={id},r=2,s=1,v=1").as_bytes()).unwrap();
+        command.payload = color.to_vec();
+        command
+    }
+
+    #[test]
+    fn animation_current_frame_is_used_for_uploads() {
+        use kitty_graphics::{AnimationManager, AnimationState, ImageLimits};
+
+        let screen = protocol_screen(5, vec![255, 0, 0, 255]);
+        let mut manager = AnimationManager::new();
+        manager.insert_root(screen.image(5).unwrap()).unwrap();
+        manager
+            .feed(
+                &animated_frame(5, [0, 255, 0, 255]),
+                &ImageLimits::default(),
+                0,
+            )
+            .unwrap();
+        manager.set_gap(5, 1, 10);
+        manager.set_gap(5, 2, 10);
+        let geometry = GridGeometry::new(4, 3, CellMetrics::default());
+        let mut instances = Vec::new();
+        let mut uploads = Vec::new();
+        collect_protocol_images_with_animations(
+            &screen,
+            Some(&manager),
+            &geometry,
+            40.0,
+            60.0,
+            ImageFilter::Nearest,
+            &mut instances,
+            &mut uploads,
+        );
+        assert_eq!(instances.len(), 1);
+        assert_eq!(uploads[0].data.as_slice(), &[255, 0, 0, 255]);
+
+        manager.set_state(5, AnimationState::Running, 0);
+        assert_eq!(manager.tick(10).redraw, vec![5]);
+        instances.clear();
+        uploads.clear();
+        collect_protocol_images_with_animations(
+            &screen,
+            Some(&manager),
+            &geometry,
+            40.0,
+            60.0,
+            ImageFilter::Nearest,
+            &mut instances,
+            &mut uploads,
+        );
+        assert_eq!(uploads[0].data.as_slice(), &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn deleted_animation_frame_falls_back_to_root() {
+        use kitty_graphics::{AnimationManager, ImageLimits};
+
+        let screen = protocol_screen(6, vec![1, 2, 3, 255]);
+        let mut manager = AnimationManager::new();
+        manager.insert_root(screen.image(6).unwrap()).unwrap();
+        manager
+            .feed(
+                &animated_frame(6, [4, 5, 6, 255]),
+                &ImageLimits::default(),
+                0,
+            )
+            .unwrap();
+        assert!(manager.select_frame(6, 2, 0));
+        assert!(manager.delete_frame(6, 2));
+        let geometry = GridGeometry::new(4, 3, CellMetrics::default());
+        let mut instances = Vec::new();
+        let mut uploads = Vec::new();
+        collect_protocol_images_with_animations(
+            &screen,
+            Some(&manager),
+            &geometry,
+            40.0,
+            60.0,
+            ImageFilter::Nearest,
+            &mut instances,
+            &mut uploads,
+        );
+        assert_eq!(uploads[0].data.as_slice(), &[1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn animation_preserves_z_order() {
+        use kitty_graphics::{AnimationManager, ImageLimits};
+
+        let mut screen = protocol_screen(7, vec![1, 1, 1, 255]);
+        let mut second = kitty_graphics::parse_raw(b"a=t,f=32,s=1,v=1,i=8").unwrap();
+        second.payload = vec![2, 2, 2, 255];
+        screen.handle_graphics_command(second).unwrap();
+        let mut under = kitty_graphics::parse_raw(b"a=p,i=7,p=1,z=-1").unwrap();
+        under.payload.clear();
+        screen.handle_graphics_command(under).unwrap();
+        let mut over = kitty_graphics::parse_raw(b"a=p,i=8,p=1,z=3").unwrap();
+        over.payload.clear();
+        screen.handle_graphics_command(over).unwrap();
+
+        let mut manager = AnimationManager::new();
+        manager.insert_root(screen.image(7).unwrap()).unwrap();
+        manager
+            .feed(
+                &animated_frame(7, [9, 9, 9, 255]),
+                &ImageLimits::default(),
+                0,
+            )
+            .unwrap();
+        let geometry = GridGeometry::new(4, 3, CellMetrics::default());
+        let mut instances = Vec::new();
+        let mut uploads = Vec::new();
+        collect_protocol_images_with_animations(
+            &screen,
+            Some(&manager),
+            &geometry,
+            40.0,
+            60.0,
+            ImageFilter::Nearest,
+            &mut instances,
+            &mut uploads,
+        );
+        let z: Vec<i32> = instances.iter().map(|i| i.z_index).collect();
+        assert_eq!(z, vec![-1, 3]);
     }
 }

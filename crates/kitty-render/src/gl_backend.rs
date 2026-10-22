@@ -66,10 +66,10 @@
 //!
 //! # Not supported yet
 //!
-//! Image animation/composition and placeholder expansion, transforms beyond
-//! source-rectangle scaling, per-window background image lists, the full
-//! cursor-trail corner animation, selection/hyperlink overlays, custom user
-//! shaders, shaped-run sprite caches and multi-format colour glyphs
+//! Image transforms beyond source-rectangle scaling, per-window background
+//! image lists, the full cursor-trail corner animation, selection/hyperlink
+//! overlays, custom user shaders, shaped-run sprite caches and multi-format
+//! colour glyphs
 //! (COLR/CBDT/SVG). Blink and strikethrough style flags are carried by the CPU
 //! instances but blinking is not animated here; dim is implemented as a 50%
 //! alpha reduction.

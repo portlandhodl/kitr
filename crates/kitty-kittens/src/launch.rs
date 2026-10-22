@@ -102,13 +102,15 @@ impl Default for BootstrapEnv {
 
 impl BootstrapEnv {
     /// Read the bootstrap variables from the current process environment.
+    ///
+    /// The `KITTY_KITTEN_*` spelling used by launched kittens takes precedence
+    /// over the plain kitty variables, and window ids accept the `id:17` form.
     pub fn from_process_env() -> Self {
+        let environment = crate::env::KittenEnvironment::from_process_env();
         Self {
-            window_id: std::env::var("KITTY_WINDOW_ID")
-                .ok()
-                .and_then(|value| value.parse().ok()),
-            listen_on: std::env::var("KITTY_LISTEN_ON").ok(),
-            public_key: std::env::var("KITTY_PUBLIC_KEY").ok(),
+            window_id: environment.window_id,
+            listen_on: environment.listen_on,
+            public_key: environment.public_key,
             pid: std::env::var("KITTY_PID")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -210,6 +212,8 @@ pub struct LaunchOptions {
     /// Set `KITTY_KITTEN_PASSTHROUGH` only when an explicit `--` separator was
     /// used by the command parser. This is metadata for compatibility runners.
     pub explicit_separator: bool,
+    /// Spawn without waiting. The binary uses [`LaunchPlan::spawn_detached`].
+    pub detach: bool,
 }
 
 impl Default for LaunchOptions {
@@ -224,6 +228,7 @@ impl Default for LaunchOptions {
             bootstrap: BootstrapEnv::default(),
             python: PythonInterpreter::default(),
             explicit_separator: false,
+            detach: false,
         }
     }
 }
@@ -253,6 +258,8 @@ pub struct LaunchPlan {
     pub kind: KittenKind,
     pub kitten_name: String,
     pub invoked_name: String,
+    /// Whether the caller should not wait for the process.
+    pub detach: bool,
 }
 
 impl LaunchPlan {
@@ -280,6 +287,12 @@ impl LaunchPlan {
 
     /// Spawn the kitten.
     pub fn spawn(&self) -> io::Result<Child> {
+        self.command().spawn()
+    }
+
+    /// Spawn the kitten and return immediately. The child is not reaped by
+    /// this process; the caller owns the [`Child`] handle.
+    pub fn spawn_detached(&self) -> io::Result<Child> {
         self.command().spawn()
     }
 
@@ -381,6 +394,7 @@ pub fn build_launch(
         kind: entry.kind,
         kitten_name: entry.name.clone(),
         invoked_name: invoked_name.to_owned(),
+        detach: options.detach,
     })
 }
 

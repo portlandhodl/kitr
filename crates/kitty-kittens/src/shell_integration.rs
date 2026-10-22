@@ -29,6 +29,9 @@ pub enum Shell {
 }
 
 impl Shell {
+    /// Every supported shell, in documentation order.
+    pub const ALL: [Self; 3] = [Self::Bash, Self::Zsh, Self::Fish];
+
     /// Stable lowercase name.
     pub fn name(self) -> &'static str {
         match self {
@@ -424,6 +427,55 @@ fn setup_bash(
     }
 }
 
+/// The command users add to their shell startup file for `--shell-integration`.
+///
+/// The snippets only source the resource directory and define the `icat`
+/// alias. They are returned as text; nothing in this crate writes to a user's
+/// startup files.
+pub fn shell_integration_snippet(shell: Shell, directory: &Path) -> String {
+    let quote = |path: PathBuf| match shell {
+        Shell::Fish => as_fish_str_literal(&path.to_string_lossy()),
+        Shell::Bash | Shell::Zsh => as_str_literal(&path.to_string_lossy()),
+    };
+    match shell {
+        Shell::Bash => format!(
+            "# kitty shell integration for bash (add to ~/.bashrc)\n\
+             builtin export KITTY_SHELL_INTEGRATION=\"${{KITTY_SHELL_INTEGRATION:-enabled}}\"\n\
+             builtin source {}\n\
+             alias icat='kitten icat'",
+            quote(directory.join("bash/kitty.bash"))
+        ),
+        Shell::Zsh => format!(
+            "# kitty shell integration for zsh (add to ~/.zshrc)\n\
+             builtin export KITTY_SHELL_INTEGRATION=\"${{KITTY_SHELL_INTEGRATION:-enabled}}\"\n\
+             builtin source {}\n\
+             alias icat='kitten icat'",
+            quote(directory.join("zsh/kitty.zsh"))
+        ),
+        Shell::Fish => format!(
+            "# kitty shell integration for fish (add to ~/.config/fish/config.fish)\n\
+             set -gx KITTY_SHELL_INTEGRATION (set -q KITTY_SHELL_INTEGRATION; and echo $KITTY_SHELL_INTEGRATION; or echo enabled)\n\
+             source {}\n\
+             alias icat 'kitten icat'",
+            quote(directory.join("fish/vendor_conf.d/kitty-shell-integration.fish"))
+        ),
+    }
+}
+
+/// Generate install snippets for one shell, or for every shell when `shell` is
+/// `None`.
+pub fn install_snippets(directory: &Path, shell: Option<Shell>) -> String {
+    let mut snippets = Vec::new();
+    let shells = match shell {
+        Some(shell) => vec![shell],
+        None => Shell::ALL.to_vec(),
+    };
+    for shell in shells {
+        snippets.push(shell_integration_snippet(shell, directory));
+    }
+    snippets.join("\n\n")
+}
+
 /// Serialize an environment as bash/zsh/fish commands.
 pub fn serialize_env(shell: Shell, env: &BTreeMap<String, String>) -> String {
     let mut lines = Vec::with_capacity(env.len());
@@ -768,5 +820,31 @@ mod tests {
         assert!(fish.contains("set -gx 'B' 'two\\'three'"));
         assert!(serialize_env_for_path(Path::new("/bin/zsh"), &env).is_ok());
         assert!(serialize_env_for_path(Path::new("/bin/sh"), &env).is_err());
+    }
+
+    #[test]
+    fn install_snippets_target_each_shell() {
+        let dir = Path::new("/opt/kitty/shell-integration");
+        let bash = install_snippets(dir, Some(Shell::Bash));
+        assert!(bash.contains("source '/opt/kitty/shell-integration/bash/kitty.bash'"));
+        assert!(bash.contains("alias icat='kitten icat'"));
+        let zsh = install_snippets(dir, Some(Shell::Zsh));
+        assert!(zsh.contains("source '/opt/kitty/shell-integration/zsh/kitty.zsh'"));
+        let fish = install_snippets(dir, Some(Shell::Fish));
+        assert!(fish.contains(
+            "source '/opt/kitty/shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish'"
+        ));
+        assert!(fish.contains("set -gx KITTY_SHELL_INTEGRATION"));
+    }
+
+    #[test]
+    fn install_snippets_can_target_all_shells_without_writing_files() {
+        let dir = Path::new("/usr/share/kitty/shell-integration");
+        let all = install_snippets(dir, None);
+        assert_eq!(all.matches("# kitty shell integration for").count(), 3);
+        assert!(all.contains("bash/kitty.bash"));
+        assert!(all.contains("zsh/kitty.zsh"));
+        assert!(all.contains("fish/vendor_conf.d"));
+        assert!(shell_integration_snippet(Shell::Bash, dir).contains("~/.bashrc"));
     }
 }

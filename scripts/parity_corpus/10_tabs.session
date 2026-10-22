@@ -1,0 +1,4 @@
+new_tab first
+launch --title first /bin/sh -c "printf 'tab one content\n'; sleep 30"
+new_tab second
+launch --title second /bin/sh -c "printf 'tab two content\n'; sleep 30"

@@ -14,8 +14,12 @@
 //! Continuation cells (`CPUCell::x() != 0`) are skipped, as are blank cells
 //! with the default background.
 
+use std::cell::RefCell;
+
+use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
 use kitty_core::cell::{CpuCell, GpuCell};
 use kitty_fonts::FontCellMetrics;
+use kitty_graphics::{AnimationManager, AnimationTick};
 use kitty_screen::{CursorShape, HyperlinkSpan, Screen};
 
 use crate::atlas::{AtlasEvent, GlyphAtlas, GlyphKey, GlyphRasterizer, GlyphSlot, GlyphText};
@@ -741,11 +745,35 @@ fn emit_tab_bar(
 #[derive(Clone, Debug, Default)]
 pub struct InstanceGenerator {
     pub config: RenderConfig,
+    /// Animation state used for timed frame swaps and placeholder images.
+    pub animations: RefCell<AnimationManager>,
 }
 
 impl InstanceGenerator {
     pub fn new(config: RenderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            animations: RefCell::new(AnimationManager::new()),
+        }
+    }
+
+    /// Replace the animation manager.
+    pub fn with_animations(mut self, animations: AnimationManager) -> Self {
+        self.animations = RefCell::new(animations);
+        self
+    }
+
+    /// Add screen images as animation roots when they are not tracked yet.
+    pub fn ensure_animation_roots(&self, screen: &Screen) {
+        let mut animations = self.animations.borrow_mut();
+        for image in screen.images().values() {
+            animations.ensure_root(image);
+        }
+    }
+
+    /// Advance running animations and report which images need a redraw.
+    pub fn tick_animations(&self, now_ms: u64) -> AnimationTick {
+        self.animations.borrow_mut().tick(now_ms)
     }
 
     /// Generate instances into `frame`, clearing its instance vectors first.
@@ -759,6 +787,7 @@ impl InstanceGenerator {
         frame: &mut Frame,
     ) {
         frame.clear_instances();
+        self.ensure_animation_roots(screen);
         frame.geometry = self.config.grid_for(screen);
         frame.default_fg = resolver.default_fg();
         frame.default_bg = resolver.default_bg();
@@ -825,11 +854,18 @@ impl InstanceGenerator {
                     };
                     let mut single = [0u32; 1];
                     let text = cell_text(&tc, cpu, &mut single);
+                    let placeholder = text.first().copied() == Some(IMAGE_PLACEHOLDER_CHAR);
                     let blank = is_blank_text(text);
                     let selected = interval_contains(&intervals, px);
                     let hovered = hover_id != 0 && cpu.hyperlink_id() == hover_id;
                     let cursor_here = cursor_visible && cursor_x == px && cursor_y == y;
-                    if blank || width_cells != 1 || cursor_here || selected || hovered {
+                    if blank
+                        || placeholder
+                        || width_cells != 1
+                        || cursor_here
+                        || selected
+                        || hovered
+                    {
                         px += width_cells.max(1);
                         continue;
                     }
@@ -859,6 +895,7 @@ impl InstanceGenerator {
                         let mut single2 = [0u32; 1];
                         let t2 = cell_text(&tc, c2, &mut single2);
                         if is_blank_text(t2)
+                            || t2.first().copied() == Some(IMAGE_PLACEHOLDER_CHAR)
                             || interval_contains(&intervals, xx)
                             || (hover_id != 0 && c2.hyperlink_id() == hover_id)
                             || (cursor_visible && cursor_x == xx && cursor_y == y)
@@ -986,7 +1023,8 @@ impl InstanceGenerator {
                 }
                 let mut single = [0u32; 1];
                 let text = cell_text(&tc, cpu, &mut single);
-                let blank = is_blank_text(text);
+                let placeholder = text.first().copied() == Some(IMAGE_PLACEHOLDER_CHAR);
+                let blank = is_blank_text(text) || placeholder;
                 let width_cells = if cpu.is_multicell() && cpu.width() > 0 {
                     cpu.mcd_x_limit().max(1).min(screen.columns - x)
                 } else {
@@ -1045,8 +1083,10 @@ impl InstanceGenerator {
             emit_tab_bar(spec, &self.config, frame, atlas, rasterizer, viewport_width);
         }
 
-        images::collect_protocol_images(
+        let animations = self.animations.borrow();
+        images::collect_protocol_images_with_animations(
             screen,
+            Some(&animations),
             &frame.geometry,
             viewport_width,
             viewport_height,

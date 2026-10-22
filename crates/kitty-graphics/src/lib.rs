@@ -28,20 +28,17 @@
 //! transmission media and the `o=z` compression flag.
 //!
 //! The image pipeline implements `a=t`, `a=T`, `a=q`, chunking (`m=`), direct
-//! data, regular files (`t=f`), temporary files (`t=t`), formats `f=8/16/24/32`
-//! and `f=100` (PNG), and zlib compression.
+//! data, regular files (`t=f`), temporary files (`t=t`), POSIX shared memory
+//! (`t=s`), formats `f=8/16/24/32` and `f=100` (PNG), and zlib compression.
+//! [`animation::AnimationManager`] implements frame transmission (`a=f`),
+//! animation control/timing (`a=a`) and frame composition (`a=c`).
 //!
 //! # Unsupported / deferred
 //!
 //! * Screen/GPU integration, image/placement storage and z-index layer
 //!   management are intentionally out of scope. Use [`image::GraphicsSink`].
-//! * Animation frames (`a=a`, `a=f`), composition (`a=c`) and the full
-//!   placement/parent/unicode-placeholder semantics are parsed but not
-//!   executed by the loader; they are reported through
-//!   [`GraphicsSink::on_unsupported`](image::GraphicsSink::on_unsupported).
-//! * POSIX shared memory transmission (`t=s`) is parsed, but loading it is
-//!   deferred to terminal integration (it needs platform shm lifecycle and
-//!   kitty's boss/path policy). `t=f`/`t=t` read regular files only.
+//! * Unicode placeholder expansion is performed by the renderer, not by the
+//!   image loader. Parent/child placement offsets are still parsed only.
 //! * Temporary file deletion and the boss/path access policy are not applied
 //!   by this library; [`image::read_image_file`] only enforces regular-file
 //!   and size limits.
@@ -59,12 +56,18 @@
 //! kitty-compatible response code via [`GraphicsError::code`](image::GraphicsError::code)
 //! (`EINVAL`, `ENODATA`, `EBADPNG`, `EFBIG`, `EBADF`, `EILSEQ`, ...).
 
+pub mod animation;
 pub mod base64;
 pub mod command;
 pub mod image;
 pub mod mime;
 pub mod png;
+pub mod shm;
 
+pub use animation::{
+    AnimatedImage, AnimationFrame, AnimationManager, AnimationOutcome, AnimationState,
+    AnimationTick, DEFAULT_FRAME_GAP_MS,
+};
 pub use base64::{
     decode_lenient, decode_strict, encode as encode_base64, Base64Error, StreamingDecoder,
 };
@@ -78,3 +81,5 @@ pub use image::{
 };
 pub use mime::{is_image_mime, mime_type_aliases, mime_type_for_data, mime_type_for_filename};
 pub use png::{decode_png, DecodedPng, PngError};
+#[cfg(unix)]
+pub use shm::{create_shared_memory, read_shared_memory, unlink_shared_memory};

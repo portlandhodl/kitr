@@ -1,0 +1,7 @@
+{
+  "size": "80x24",
+  "tab_bar_style": "powerline",
+  "tags": ["tabs"],
+  "settle": 2.0,
+  "threshold": 8.0
+}

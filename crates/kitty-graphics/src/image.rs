@@ -240,6 +240,11 @@ pub enum GraphicsError {
     Io(String),
     NoPendingTransfer,
     Parse(ParseError),
+    /// Animation/composition protocol error with a kitty response code.
+    Animation {
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl GraphicsError {
@@ -257,6 +262,7 @@ impl GraphicsError {
             Self::BadFile(_) | Self::Io(_) => "EBADF",
             Self::NoPendingTransfer => "EILSEQ",
             Self::Parse(_) => "EINVAL",
+            Self::Animation { code, .. } => code,
         }
     }
 }
@@ -304,6 +310,7 @@ impl core::fmt::Display for GraphicsError {
                 f.write_str("More payload loading refers to non-existent image")
             }
             Self::Parse(e) => write!(f, "{e}"),
+            Self::Animation { message, .. } => f.write_str(message),
         }
     }
 }
@@ -547,7 +554,17 @@ pub fn decode_image(
             )?
         }
         TransmissionType::SharedMemory => {
-            return Err(GraphicsError::UnsupportedTransmission(transmission))
+            let max_to_read = if command.compressed.is_some() || format.is_png() {
+                limits.max_data_size
+            } else {
+                expected_pixels.unwrap_or(limits.max_data_size)
+            };
+            crate::shm::read_shared_memory(
+                payload,
+                command.data_offset,
+                command.data_sz,
+                max_to_read,
+            )?
         }
     };
 
@@ -611,6 +628,14 @@ pub fn decode_image(
                 });
             }
             if data.len() < expected {
+                if matches!(
+                    transmission,
+                    TransmissionType::File
+                        | TransmissionType::TempFile
+                        | TransmissionType::SharedMemory
+                ) {
+                    return Err(GraphicsError::BadFile("Failed to read image file".into()));
+                }
                 return Err(GraphicsError::InsufficientData {
                     expected,
                     actual: data.len(),
@@ -1119,17 +1144,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_directories_and_shared_memory() {
+    fn rejects_directories_and_missing_shared_memory() {
         let dir = std::env::temp_dir();
         let err = read_image_file(&dir, 0, 0, 1024).unwrap_err();
         assert_eq!(err.code(), "EBADF");
 
         let mut c = cmd(b"a=t,f=32,t=s,s=1,v=1");
-        c.payload = b"/some-shm".to_vec();
-        assert!(matches!(
-            decode_image(&c, &c.payload, &ImageLimits::default()).unwrap_err(),
-            GraphicsError::UnsupportedTransmission(TransmissionType::SharedMemory)
-        ));
+        c.payload =
+            format!("/kitty-graphics-missing-{}-{}", std::process::id(), line!()).into_bytes();
+        let err = decode_image(&c, &c.payload, &ImageLimits::default()).unwrap_err();
+        assert_eq!(err.code(), "EBADF");
     }
 
     #[test]

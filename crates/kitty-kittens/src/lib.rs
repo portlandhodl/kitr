@@ -15,18 +15,26 @@
 //!   remote-print and `@kitty-cmd` remote-control payloads, plus the
 //!   [`protocol::KittenHost`] callback trait.
 //! * [`shell_integration`]: discovery of the shell-integration resource
-//!   directory and generation of the bash/zsh/fish handoff environment.
-//! * [`cli`]: the library-only `kitten run/list/help/manifest` command parser
-//!   and the `kitten @` passthrough hook.
+//!   directory, generation of the bash/zsh/fish handoff environment, and
+//!   `--shell-integration` install snippets.
+//! * [`cli`]: the `kitten run/list/help/manifest/shell-integration` command
+//!   parser, `run --detach`/stdio options and the `kitten @` passthrough hook.
+//! * [`icat`]: the Rust-native image kitten (`a=T,f=100`, RGB/RGBA, chunking,
+//!   placement, scaling, clear and stdin).
+//! * [`remote`]: the `kitten @` client built on [`kitty_remote::Client`].
+//! * [`env`]: shared `KITTY_WINDOW_ID`/`KITTY_LISTEN_ON`/`KITTY_PUBLIC_KEY`
+//!   and `KITTY_KITTEN_*` environment parsing.
 //!
 //! # Explicit non-goals
 //!
 //! * No Python runtime is embedded. Python kittens are launched with an
 //!   external interpreter (or directly through their shebang).
 //! * No remote-control socket server is started. `kitten @` arguments are
-//!   returned verbatim for the caller's client layer.
+//!   returned verbatim by [`cli`]; [`remote`] connects to an existing kitty
+//!   socket. The controlling-terminal fallback is not implemented.
 //! * Shell integration does not inject code into a running shell; it only
-//!   computes the handoff environment and serialized environment commands.
+//!   computes the handoff environment, serialized environment commands and
+//!   install snippets.
 //!
 //! # Example
 //!
@@ -44,21 +52,30 @@
 
 pub mod cli;
 pub mod discovery;
+pub mod env;
 pub mod error;
+pub mod icat;
 pub mod launch;
 pub mod manifest;
 pub mod protocol;
+pub mod remote;
 pub mod shell_integration;
 
 pub use cli::{
     execute_args, execute_command, parse_kitten_command, AtInvocation, CommandAction,
-    KittenCommand, USAGE,
+    KittenCommand, RunOptions, USAGE,
 };
 pub use discovery::{
     validate_name, BuiltinKitten, DiscoveryConfig, DiscoveryDiagnostic, KittenEntry,
     KittenRegistry, KittenSource, SearchRoot, BUILTIN_KITTENS,
 };
+pub use env::{parse_window_id, KittenEnvironment};
 pub use error::{Error, Result};
+pub use icat::{
+    clear_frames, encode_png, encode_png_frames, parse_icat_args, run_icat, Align, FitMode,
+    IcatArgs, IcatError, IcatOptions, OutputFormat, Place, Scale, StdinMode, WindowSize,
+    DEFAULT_CHUNK_SIZE, FALLBACK_WINDOW, ICAT_USAGE,
+};
 pub use launch::{
     build_launch, BootstrapEnv, LaunchOptions, LaunchPlan, PythonInterpreter, StdioMode,
 };
@@ -70,8 +87,12 @@ pub use protocol::{
     CMD_PREFIX, DCS_START, KITTEN_RESULT_PREFIX, OVERLAY_PREFIX, OVERLAY_READY_PREFIX,
     PRINT_PREFIX, TITLE_PREFIX,
 };
+pub use remote::{
+    build_request, parse_remote_args, run_remote, run_remote_options, RemoteError, RemoteOptions,
+    REMOTE_USAGE,
+};
 pub use shell_integration::{
     as_fish_str_literal, as_str_literal, discover_shell_integration_dir,
-    discover_shell_integration_dir_from, serialize_env, serialize_env_for_path, Shell,
-    ShellHandoff, ShellIntegration, ShellIntegrationOptions,
+    discover_shell_integration_dir_from, install_snippets, serialize_env, serialize_env_for_path,
+    shell_integration_snippet, Shell, ShellHandoff, ShellIntegration, ShellIntegrationOptions,
 };

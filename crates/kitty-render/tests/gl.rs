@@ -15,8 +15,8 @@ use kitty_render::{
     AtlasConfig, BackgroundImageConfig, BackgroundInstance, BackgroundLayout, BasicColorResolver,
     CellMetrics, ContextConfig, CursorInstance, Damage, Frame, FullRedrawReason, GlyphAtlas,
     GlyphBitmap, GlyphInstance, GlyphKey, GridGeometry, ImageAsset, ImageFilter, ImageInstance,
-    ImageKey, ImageUpload, ImageWrap, InstanceFlags, LineRange, Rect, RenderConfig, RendererCore,
-    Rgba8, TrailInstance,
+    ImageKey, ImageUpload, ImageWrap, InstanceFlags, InstanceGenerator, LineRange, Rect,
+    RenderConfig, RendererCore, Rgba8, TrailInstance,
 };
 use kitty_screen::{CursorShape, Screen};
 
@@ -917,4 +917,139 @@ fn background_opacity_and_tint() {
         1,
         "tinted blue",
     );
+}
+
+#[test]
+fn placeholder_quads_render_pixels() {
+    let _guard = lock();
+    let mut screen = Screen::builder(3, 3).scrollback(8).build().expect("screen");
+    let mut image = kitty_graphics::parse_raw(b"a=t,f=32,s=2,v=2,i=7").unwrap();
+    image.payload = vec![
+        255, 0, 0, 255, // top-left red
+        0, 255, 0, 255, // top-right green
+        0, 0, 255, 255, // bottom-left blue
+        255, 255, 255, 255, // bottom-right white
+    ];
+    screen.handle_graphics_command(image).unwrap();
+    let mut virtual_placement = kitty_graphics::parse_raw(b"a=p,U=1,i=7,c=2,r=2").unwrap();
+    virtual_placement.payload.clear();
+    screen.handle_graphics_command(virtual_placement).unwrap();
+    screen.cursor.sgr.fg = (7 << 8) | 1;
+    screen.cursor.sgr.decoration_fg = 0;
+    for row in 0..2u32 {
+        let mut text = Vec::new();
+        for column in 0..2u32 {
+            text.push(kitty_core::cell::IMAGE_PLACEHOLDER_CHAR);
+            text.push(if row == 0 { 0x305 } else { 0x30d + row - 1 });
+            text.push(if column == 0 {
+                0x305
+            } else {
+                0x30d + column - 1
+            });
+        }
+        screen.cursor_position(row + 1, 1);
+        screen.draw_text(&text);
+    }
+
+    let config = RenderConfig {
+        metrics: CellMetrics {
+            cell_width: 16.0,
+            cell_height: 16.0,
+            ..CellMetrics::default()
+        },
+        viewport_width: 64.0,
+        viewport_height: 32.0,
+        shaped_runs: false,
+        ..RenderConfig::default()
+    };
+    let generator = InstanceGenerator::new(config.clone());
+    let mut atlas = GlyphAtlas::new(AtlasConfig::default());
+    let mut rasterizer = |_key: &GlyphKey| GlyphBitmap::gray(8, 12, vec![0; 96]).ok();
+    let resolver = BasicColorResolver::default();
+    let mut frame = Frame::default();
+    generator.generate(&screen, &mut atlas, &mut rasterizer, &resolver, &mut frame);
+    frame.damage.full_redraw = true;
+    assert_eq!(frame.images.len(), 2);
+    assert!(
+        frame.glyphs.is_empty(),
+        "placeholder cells must not draw glyphs"
+    );
+
+    let mut backend = try_backend!(64, 32);
+    backend.sync_images(&frame).expect("placeholder upload");
+    backend
+        .render(&frame, &config)
+        .expect("render placeholders");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 64, 8, 8), [255, 0, 0, 255], 1, "top-left");
+    assert_pixel(pixel(&pixels, 64, 24, 8), [0, 255, 0, 255], 1, "top-right");
+    assert_pixel(
+        pixel(&pixels, 64, 8, 24),
+        [0, 0, 255, 255],
+        1,
+        "bottom-left",
+    );
+    assert_pixel(
+        pixel(&pixels, 64, 24, 24),
+        [255, 255, 255, 255],
+        1,
+        "bottom-right",
+    );
+}
+
+#[test]
+fn animated_image_swap_renders_new_frame_pixels() {
+    let _guard = lock();
+    let mut screen = Screen::builder(3, 2).scrollback(8).build().expect("screen");
+    let mut image = kitty_graphics::parse_raw(b"a=t,f=32,s=1,v=1,i=11").unwrap();
+    image.payload = vec![255, 0, 0, 255];
+    screen.handle_graphics_command(image).unwrap();
+    let mut placement = kitty_graphics::parse_raw(b"a=p,i=11,p=1,c=1,r=1,z=0").unwrap();
+    placement.payload.clear();
+    screen.handle_graphics_command(placement).unwrap();
+
+    let mut manager = kitty_graphics::AnimationManager::new();
+    manager.insert_root(screen.image(11).unwrap()).unwrap();
+    let mut frame_command = kitty_graphics::parse_raw(b"a=f,i=11,r=2,s=1,v=1").unwrap();
+    frame_command.payload = vec![0, 255, 0, 255];
+    manager
+        .feed(&frame_command, &kitty_graphics::ImageLimits::default(), 0)
+        .unwrap();
+    manager.set_gap(11, 1, 10);
+    manager.set_gap(11, 2, 10);
+    manager.set_state(11, kitty_graphics::AnimationState::Running, 0);
+
+    let config = RenderConfig {
+        metrics: CellMetrics {
+            cell_width: 16.0,
+            cell_height: 16.0,
+            ..CellMetrics::default()
+        },
+        viewport_width: 32.0,
+        viewport_height: 32.0,
+        ..RenderConfig::default()
+    };
+    let generator = InstanceGenerator::new(config.clone()).with_animations(manager);
+    let mut atlas = GlyphAtlas::new(AtlasConfig::default());
+    let mut rasterizer = |_key: &GlyphKey| GlyphBitmap::gray(8, 12, vec![0; 96]).ok();
+    let resolver = BasicColorResolver::default();
+
+    let mut frame = Frame::default();
+    generator.generate(&screen, &mut atlas, &mut rasterizer, &resolver, &mut frame);
+    frame.damage.full_redraw = true;
+    let mut backend = try_backend!(32, 32);
+    backend.sync_images(&frame).expect("root upload");
+    backend.render(&frame, &config).expect("render root");
+    let pixels = backend.read_pixels().expect("readback root");
+    assert_pixel(pixel(&pixels, 32, 8, 8), [255, 0, 0, 255], 1, "root red");
+
+    let tick = generator.tick_animations(10);
+    assert_eq!(tick.redraw, vec![11]);
+    let mut frame = Frame::default();
+    generator.generate(&screen, &mut atlas, &mut rasterizer, &resolver, &mut frame);
+    frame.damage.full_redraw = true;
+    backend.sync_images(&frame).expect("frame upload");
+    backend.render(&frame, &config).expect("render frame");
+    let pixels = backend.read_pixels().expect("readback frame");
+    assert_pixel(pixel(&pixels, 32, 8, 8), [0, 255, 0, 255], 1, "frame green");
 }

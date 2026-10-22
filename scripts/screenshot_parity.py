@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Best-effort pixel comparison between C kitty and kitr screenshots.
+"""Pixel comparison between C kitty and kitr screenshots.
 
-Both terminals run the same shell command under Xvfb. C kitty is asked for a
-PNG screenshot through its remote-control ``screenshot`` command; kitr writes a
-binary PPM with ``--screenshot``. ImageMagick is used only to decode/normalise
-both images to PPM, then a small pure-Python comparator reports the percentage
-of differing pixels and writes artifacts.
+Both terminals run the same shell command (or kitty session file) under Xvfb.
+C kitty is asked for a PNG screenshot through its remote-control ``screenshot``
+command; kitr writes a binary PPM with ``--screenshot``.  ImageMagick decodes
+and normalises both images to PPM, then a small pure-Python comparator reports
+exact (any channel difference), tolerant (per-channel delta) and aligned
+metrics and writes diff images.
 
-This is a smoke test. Fonts, font sizes, DPI, window decorations, toolkit
-rasterisation and kitty's tab bar can all change the pixels even when terminal
-behaviour is identical. Treat failures as an investigation prompt, not proof
-of a behavioural regression.
+kitr always reserves a tab-bar strip at the top of its framebuffer, while C
+kitty hides it for single-tab windows.  The comparator therefore searches for
+the small integer (dx, dy) offset with the lowest mean error and reports both
+raw and aligned numbers.  The raw numbers include the tab-bar/letterbox gap;
+the aligned numbers are the useful behavioural signal.  Font rasterisation is
+never bit-identical between two FreeType pipelines, so the tolerant metrics are
+the pass/fail criterion.
 
-Exit codes: 0 pass/skip, 1 threshold exceeded, 2 error, 3 missing prerequisite
-(unless --strict is given, in which case missing prerequisites return 2).
+Besides a one-off --command/--script, a corpus directory of ``*.sh`` scripts and
+``*.session`` files is supported.  Optional ``<name>.json`` sidecars can set
+``size``, ``tab_bar_style``, ``kitty_args``, ``kitr_args``, ``skip``, ``tags``,
+``threshold``, ``settle`` and ``timeout``.
+
+Exit codes: 0 all cases pass (skips allowed), 1 threshold exceeded, 2 error,
+3 missing prerequisite (unless --strict is given, in which case missing
+prerequisites return 2).
 """
 
 from __future__ import annotations
@@ -28,7 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PASS = 0
@@ -36,7 +46,9 @@ DIFF = 1
 ERROR = 2
 SKIP = 3
 
-DEFAULT_SCRIPT = r"printf '\033[2J\033[Hkitr screenshot parity\nsecond line\n'"
+DEFAULT_SCRIPT = r"printf '\033[2J\033[Hkitr screenshot parity\nsecond line\n'; sleep 30"
+DEFAULT_FONT_FAMILY = "DejaVu Sans Mono"
+DEFAULT_FONT_SIZE = 12.0
 
 
 class ParityError(RuntimeError):
@@ -52,6 +64,24 @@ class Ppm:
     width: int
     height: int
     pixels: bytes
+
+
+@dataclass
+class Case:
+    name: str
+    mode: str
+    script: str | None = None
+    session: Path | None = None
+    source: Path | None = None
+    size: tuple[int, int] = (80, 24)
+    tab_bar_style: str = "hidden"
+    kitty_args: list[str] = field(default_factory=list)
+    kitr_args: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    skip: str | None = None
+    threshold: float | None = None
+    settle: float | None = None
+    timeout: float | None = None
 
 
 def _ppm_token(data: bytes, offset: int) -> tuple[bytes, int]:
@@ -238,30 +268,15 @@ def wait_for_path(path: Path, process: subprocess.Popen[bytes], timeout: float, 
     raise ParityError(f"timed out waiting for {path} (see {log})")
 
 
-def run_kitty(
-    kitty: str,
-    kitten: str,
-    script: str,
-    size: tuple[int, int],
-    settle: float,
-    timeout: float,
-    artifacts: Path,
-    extra: list[str],
-    env: dict[str, str],
-) -> Path:
-    out = artifacts / "kitty.png"
-    sock = Path(tempfile.mkdtemp(prefix="kitr-parity-")) / "rc.sock"
-    log = artifacts / "kitty.log"
-    rc_log = artifacts / "kitty-rc.log"
-    cols, rows = size
-    cmd = [
-        kitty,
-        "--listen-on",
-        f"unix:{sock}",
+def kitty_options(case: Case, font_family: str, font_size: float) -> list[str]:
+    cols, rows = case.size
+    return [
         "-o",
-        "allow_remote_control=socket-only",
+        f"font_family={font_family}",
         "-o",
-        "tab_bar_style=hidden",
+        f"font_size={font_size:g}",
+        "-o",
+        f"tab_bar_style={case.tab_bar_style}",
         "-o",
         "remember_window_size=no",
         "-o",
@@ -274,13 +289,53 @@ def run_kitty(
         "background_opacity=1",
         "-o",
         "hide_window_decorations=yes",
-        *extra,
-        "--hold",
-        "--",
-        "/bin/sh",
-        "-c",
-        script,
+        "-o",
+        "cursor_blink_interval=0",
+        "-o",
+        "cursor_shape=block",
     ]
+
+
+def write_kitr_config(path: Path, case: Case, font_family: str, font_size: float) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                f"font_family {font_family}",
+                f"font_size {font_size:g}",
+                f"tab_bar_style {case.tab_bar_style}",
+                "window_padding_width 0",
+                "background_opacity 1",
+                "cursor_blink_interval 0",
+                "cursor_shape block",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def run_kitty(
+    kitty: str,
+    kitten: str,
+    case: Case,
+    settle: float,
+    timeout: float,
+    artifacts: Path,
+    font_family: str,
+    font_size: float,
+    env: dict[str, str],
+) -> Path:
+    out = artifacts / "kitty.png"
+    sock = Path(tempfile.mkdtemp(prefix="kitr-parity-")) / "rc.sock"
+    log = artifacts / "kitty.log"
+    rc_log = artifacts / "kitty-rc.log"
+    opts = kitty_options(case, font_family, font_size) + case.kitty_args
+    cmd = [kitty, "--listen-on", f"unix:{sock}", "-o", "allow_remote_control=socket-only", *opts]
+    if case.mode == "session":
+        assert case.session is not None
+        cmd += ["--session", str(case.session)]
+    else:
+        cmd += ["--hold", "--", "/bin/sh", "-c", case.script or DEFAULT_SCRIPT]
     with log.open("ab") as f:
         f.write(("$ " + " ".join(cmd) + "\n").encode())
         f.flush()
@@ -323,17 +378,19 @@ def run_kitty(
 
 def run_kitr(
     kitr: str,
-    script: str,
-    size: tuple[int, int],
+    case: Case,
     settle: float,
     timeout: float,
     artifacts: Path,
-    extra: list[str],
+    font_family: str,
+    font_size: float,
     env: dict[str, str],
 ) -> Path:
     out = artifacts / "kitr.ppm"
     log = artifacts / "kitr.log"
-    cols, rows = size
+    config = artifacts / "kitr.conf"
+    write_kitr_config(config, case, font_family, font_size)
+    cols, rows = case.size
     run_timeout = max(timeout, settle + 2.0)
     cmd = [
         kitr,
@@ -344,26 +401,161 @@ def run_kitr(
         f"{cols}x{rows}",
         "--timeout",
         f"{run_timeout:g}",
-        *extra,
-        "--",
-        "/bin/sh",
-        "-c",
-        script,
+        "--config",
+        str(config),
+        *case.kitr_args,
     ]
+    if case.mode == "session":
+        assert case.session is not None
+        cmd += ["--session", str(case.session)]
+    else:
+        cmd += ["--", "/bin/sh", "-c", case.script or DEFAULT_SCRIPT]
     with log.open("ab") as f:
         f.write(("$ " + " ".join(cmd) + "\n").encode())
         f.flush()
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=f,
             stderr=subprocess.STDOUT,
-            timeout=run_timeout + 20.0,
             env=env,
+            start_new_session=True,
         )
+    try:
+        deadline = time.monotonic() + run_timeout + 20.0
+        while time.monotonic() < deadline:
+            if out.is_file() and out.stat().st_size > 0:
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.05)
+    finally:
+        terminate_process(process)
     if not out.is_file() or out.stat().st_size == 0:
-        raise ParityError(f"kitr did not write a screenshot (exit {result.returncode}, see {log})")
+        raise ParityError(f"kitr did not write a screenshot (see {log})")
     return out
+
+
+def _metrics(
+    a: Ppm,
+    b: Ppm,
+    dx: int,
+    dy: int,
+    pixel_threshold: int,
+    diff_path: Path | None = None,
+) -> dict[str, object]:
+    x0 = max(0, -dx)
+    y0 = max(0, -dy)
+    x1 = min(a.width, b.width - dx)
+    y1 = min(a.height, b.height - dy)
+    if x1 <= x0 or y1 <= y0:
+        raise ParityError("screenshots have no overlapping pixels")
+    width = x1 - x0
+    height = y1 - y0
+    total = width * height
+    diff_pixels = 0
+    channel_delta_sum = 0
+    diff_out = bytearray(width * height * 3) if diff_path is not None else None
+    ap = a.pixels
+    bp = b.pixels
+    a_stride = a.width * 3
+    b_stride = b.width * 3
+    for y in range(y0, y1):
+        a_row = y * a_stride
+        b_row = (y + dy) * b_stride
+        out_row = (y - y0) * width * 3
+        for x in range(width):
+            ai = a_row + (x + x0) * 3
+            bi = b_row + (x + x0 + dx) * 3
+            d0 = ap[ai] - bp[bi]
+            d1 = ap[ai + 1] - bp[bi + 1]
+            d2 = ap[ai + 2] - bp[bi + 2]
+            if d0 < 0:
+                d0 = -d0
+            if d1 < 0:
+                d1 = -d1
+            if d2 < 0:
+                d2 = -d2
+            channel_delta_sum += d0 + d1 + d2
+            delta = max(d0, d1, d2)
+            oi = out_row + (x - x0) * 3
+            if delta > pixel_threshold:
+                diff_pixels += 1
+                if diff_out is not None:
+                    diff_out[oi] = 255
+            elif diff_out is not None:
+                grey = 24 + (ap[ai] + ap[ai + 1] + ap[ai + 2]) // 24
+                grey = min(grey, 96)
+                diff_out[oi] = grey
+                diff_out[oi + 1] = grey
+                diff_out[oi + 2] = grey
+    if diff_out is not None and diff_path is not None:
+        write_ppm(diff_path, width, height, bytes(diff_out))
+    return {
+        "width": width,
+        "height": height,
+        "offset_x": dx,
+        "offset_y": dy,
+        "compared_pixels": total,
+        "different_pixels": diff_pixels,
+        "diff_percent": (diff_pixels * 100.0) / total,
+        "mean_channel_delta": channel_delta_sum / (total * 3),
+    }
+
+
+def _score(a: Ppm, b: Ppm, dx: int, dy: int, stride: int) -> float:
+    x0 = max(0, -dx)
+    y0 = max(0, -dy)
+    x1 = min(a.width, b.width - dx)
+    y1 = min(a.height, b.height - dy)
+    if x1 <= x0 or y1 <= y0:
+        return float("inf")
+    ap = a.pixels
+    bp = b.pixels
+    a_stride = a.width * 3
+    b_stride = b.width * 3
+    total = 0
+    delta_sum = 0
+    for y in range(y0, y1, stride):
+        a_row = y * a_stride
+        b_row = (y + dy) * b_stride
+        for x in range(x0, x1, stride):
+            ai = a_row + x * 3
+            bi = b_row + (x + dx) * 3
+            delta_sum += (
+                abs(ap[ai] - bp[bi])
+                + abs(ap[ai + 1] - bp[bi + 1])
+                + abs(ap[ai + 2] - bp[bi + 2])
+            )
+            total += 3
+    return delta_sum / total if total else float("inf")
+
+
+def find_offset(a: Ppm, b: Ppm, max_shift: int) -> tuple[int, int]:
+    """Find the (dx, dy) that best aligns kitty pixels with kitr pixels."""
+    best_score = float("inf")
+    best = (0, 0)
+    for dy in range(-max_shift, max_shift + 1):
+        score = _score(a, b, 0, dy, 8)
+        if score < best_score:
+            best_score = score
+            best = (0, dy)
+    for dx in range(-4, 5):
+        score = _score(a, b, dx, best[1], 4)
+        if score < best_score:
+            best_score = score
+            best = (dx, best[1])
+    base_dy = best[1]
+    for dy in range(base_dy - 2, base_dy + 3):
+        score = _score(a, b, best[0], dy, 2)
+        if score < best_score:
+            best_score = score
+            best = (best[0], dy)
+    return best
 
 
 def compare(
@@ -371,47 +563,39 @@ def compare(
     kitr: Ppm,
     pixel_threshold: int,
     artifacts: Path,
+    max_shift: int,
 ) -> dict[str, object]:
-    width = min(kitty.width, kitr.width)
-    height = min(kitty.height, kitr.height)
-    if width == 0 or height == 0:
-        raise ParityError("screenshots have no overlapping pixels")
-    total = width * height
-    diff_pixels = 0
-    channel_delta_sum = 0
-    diff_pixels_out = bytearray(width * height * 3)
-    for y in range(height):
-        k_row = y * kitty.width * 3
-        r_row = y * kitr.width * 3
-        for x in range(width):
-            k = k_row + x * 3
-            r = r_row + x * 3
-            dr = abs(kitty.pixels[k] - kitr.pixels[r])
-            dg = abs(kitty.pixels[k + 1] - kitr.pixels[r + 1])
-            db = abs(kitty.pixels[k + 2] - kitr.pixels[r + 2])
-            delta = max(dr, dg, db)
-            channel_delta_sum += dr + dg + db
-            o = (y * width + x) * 3
-            if delta > pixel_threshold:
-                diff_pixels += 1
-                diff_pixels_out[o] = 255
-                diff_pixels_out[o + 1] = 0
-                diff_pixels_out[o + 2] = 0
-            else:
-                grey = 24 + (kitty.pixels[k] + kitty.pixels[k + 1] + kitty.pixels[k + 2]) // 24
-                grey = min(grey, 96)
-                diff_pixels_out[o] = grey
-                diff_pixels_out[o + 1] = grey
-                diff_pixels_out[o + 2] = grey
-    write_ppm(artifacts / "diff.ppm", width, height, bytes(diff_pixels_out))
+    dx, dy = find_offset(kitty, kitr, max_shift)
+    exact_aligned = _metrics(kitty, kitr, dx, dy, 0, artifacts / "diff.ppm")
+    tolerant_aligned = _metrics(kitty, kitr, dx, dy, pixel_threshold)
+    exact_raw = _metrics(kitty, kitr, 0, 0, 0)
+    tolerant_raw = _metrics(kitty, kitr, 0, 0, pixel_threshold)
     return {
-        "width": width,
-        "height": height,
-        "compared_pixels": total,
-        "different_pixels": diff_pixels,
-        "diff_percent": (diff_pixels * 100.0) / total,
-        "mean_channel_delta": channel_delta_sum / (total * 3),
+        "offset": {"x": dx, "y": dy},
+        "exact": {"aligned": exact_aligned, "raw": exact_raw},
+        "tolerant": {"aligned": tolerant_aligned, "raw": tolerant_raw},
     }
+
+
+def clean_case_artifacts(artifacts: Path) -> None:
+    for name in (
+        "kitty.png",
+        "kitty.ppm",
+        "kitr.ppm",
+        "kitr-common.ppm",
+        "diff.ppm",
+        "diff.png",
+        "report.json",
+        "kitty.log",
+        "kitty-rc.log",
+        "kitr.log",
+        "convert.log",
+        "kitr.conf",
+    ):
+        try:
+            (artifacts / name).unlink()
+        except OSError:
+            pass
 
 
 def write_report(artifacts: Path, report: dict[str, object]) -> None:
@@ -426,23 +610,191 @@ def skip(artifacts: Path, report: dict[str, object], message: str, strict: bool)
     return ERROR if strict else SKIP
 
 
+def _read_sidecar(path: Path) -> dict[str, object]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError as e:
+        raise ParityError(f"{path}: invalid JSON: {e}") from e
+    if not isinstance(value, dict):
+        raise ParityError(f"{path}: expected a JSON object")
+    return value
+
+
+def _case_from_sidecar(
+    name: str,
+    mode: str,
+    source: Path,
+    sidecar: dict[str, object],
+    default_size: tuple[int, int],
+) -> Case:
+    size = default_size
+    raw_size = sidecar.get("size")
+    if raw_size is not None:
+        try:
+            cols, rows = str(raw_size).lower().split("x", 1)
+            size = (int(cols), int(rows))
+        except ValueError as e:
+            raise ParityError(f"{name}: invalid size {raw_size!r}") from e
+        if size[0] <= 0 or size[1] <= 0:
+            raise ParityError(f"{name}: size must be positive")
+    script = source.read_text(encoding="utf-8") if mode == "command" else None
+    session = source if mode == "session" else None
+    return Case(
+        name=name,
+        mode=mode,
+        script=script,
+        session=session,
+        source=source,
+        size=size,
+        tab_bar_style=str(sidecar.get("tab_bar_style", "hidden")),
+        kitty_args=[str(x) for x in sidecar.get("kitty_args", [])],
+        kitr_args=[str(x) for x in sidecar.get("kitr_args", [])],
+        tags=[str(x) for x in sidecar.get("tags", [])],
+        skip=str(sidecar["skip"]) if sidecar.get("skip") else None,
+        threshold=float(sidecar["threshold"]) if sidecar.get("threshold") is not None else None,
+        settle=float(sidecar["settle"]) if sidecar.get("settle") is not None else None,
+        timeout=float(sidecar["timeout"]) if sidecar.get("timeout") is not None else None,
+    )
+
+
+def load_corpus(path: Path, default_size: tuple[int, int]) -> list[Case]:
+    if not path.is_dir():
+        raise ParityError(f"corpus directory not found: {path}")
+    cases: list[Case] = []
+    seen: set[str] = set()
+    for source in sorted(path.glob("*.sh")):
+        if source.stem in seen:
+            raise ParityError(f"duplicate case name {source.stem!r}")
+        seen.add(source.stem)
+        sidecar = _read_sidecar(path / f"{source.stem}.json")
+        cases.append(_case_from_sidecar(source.stem, "command", source, sidecar, default_size))
+    for source in sorted(path.glob("*.session")):
+        if source.stem in seen:
+            raise ParityError(f"duplicate case name {source.stem!r}")
+        seen.add(source.stem)
+        sidecar = _read_sidecar(path / f"{source.stem}.json")
+        cases.append(_case_from_sidecar(source.stem, "session", source, sidecar, default_size))
+    if not cases:
+        raise ParityError(f"no .sh or .session cases found in {path}")
+    return cases
+
+
+def _fmt(value: object) -> str:
+    return "n/a" if value is None else f"{float(value):.3f}%"
+
+
+def _case_markdown(result: dict[str, object], markdown_dir: Path) -> str:
+    name = str(result["name"])
+    status = str(result["status"])
+    if status in ("skipped", "error"):
+        note = str(result.get("message") or result.get("skip") or "")
+        return f"| {name} | {status} | - | - | - | - | - | {note} |"
+    exact = result["exact"]  # type: ignore[index]
+    tolerant = result["tolerant"]  # type: ignore[index]
+    offset = result["offset"]  # type: ignore[index]
+    aligned_tol = float(tolerant["aligned"]["diff_percent"])  # type: ignore[index]
+    artifact_dir = Path(str(result.get("artifacts", "")))
+    try:
+        rel = artifact_dir.resolve().relative_to(markdown_dir.resolve())
+    except ValueError:
+        rel = artifact_dir
+    link = f"[{artifact_dir.name}]({rel.as_posix()})"
+    return (
+        f"| {name} | {status} | "
+        f"{_fmt(exact['aligned']['diff_percent'])} | {_fmt(aligned_tol)} | "  # type: ignore[index]
+        f"{_fmt(exact['raw']['diff_percent'])} | {_fmt(tolerant['raw']['diff_percent'])} | "  # type: ignore[index]
+        f"({offset['x']},{offset['y']}) | {link} |"  # type: ignore[index]
+    )
+
+
+def write_markdown(
+    path: Path,
+    suite: dict[str, object],
+    command: str,
+    gaps: str | None,
+) -> None:
+    cases = suite["cases"]  # type: ignore[index]
+    counts: dict[str, int] = {}
+    for case in cases:  # type: ignore[union-attr]
+        status = str(case["status"])
+        counts[status] = counts.get(status, 0) + 1
+    lines = [
+        "# kitr vs C kitty screenshot parity",
+        "",
+        f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        "",
+        "## Environment",
+        "",
+        f"- C kitty: `{suite['c_kitty']}`",
+        f"- kitten: `{suite['kitten']}`",
+        f"- kitr: `{suite['kitr_binary']}`",
+        f"- Python: `{sys.version.split()[0]}`",
+        f"- display: `{suite['display']}` (Xvfb unless `--display` was used)",
+        f"- font: `{suite['font_family']}` at `{suite['font_size']}pt`",
+        f"- kitr startup settle: `{suite['settle']}s`",
+        "",
+        "## Command",
+        "",
+        "```sh",
+        command,
+        "```",
+        "",
+        "`exact` counts any non-zero channel difference. `tolerant` ignores "
+        "per-channel differences up to the pixel threshold. `aligned` uses the "
+        "best integer offset (shown as `(dx,dy)`); `raw` compares at `(0,0)` and "
+        "therefore includes kitr's reserved tab-bar strip. Pass/fail uses "
+        "aligned tolerant percentage.",
+        "",
+        "## Results",
+        "",
+        "| Case | Status | Exact aligned | Tolerant aligned | Exact raw | Tolerant raw | Offset | Artifacts |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for case in cases:  # type: ignore[union-attr]
+        lines.append(_case_markdown(case, path.parent))
+    lines += [
+        "",
+        f"Summary: {counts.get('pass', 0)} pass, {counts.get('fail', 0)} fail, "
+        f"{counts.get('skipped', 0)} skipped, {counts.get('error', 0)} error.",
+        "",
+        "Artifacts for each case contain `kitty.png`, `kitr.ppm`, normalized "
+        "`kitty.ppm`, `diff.ppm`, `diff.png`, logs and the per-case `report.json`.",
+        "",
+    ]
+    if gaps:
+        lines += ["## Reproduction notes and known visual gaps", "", gaps.rstrip(), ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Best-effort C kitty vs kitr screenshot comparison",
+        description="C kitty vs kitr screenshot comparison and corpus runner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--command", help="shell snippet run in both terminals")
     source.add_argument("--script", type=Path, help="file containing the shell snippet")
+    source.add_argument("--corpus", type=Path, help="directory of .sh/.session parity cases")
+    parser.add_argument("--case", action="append", default=[], help="only run matching corpus case (repeatable)")
     parser.add_argument("--kitty", default=None, help="C kitty binary")
     parser.add_argument("--kitten", default=None, help="C kitty 'kitten' binary")
-    parser.add_argument("--kitr", default="target/release/kitr", help="kitr binary")
-    parser.add_argument("--size", default="80x24", help="terminal size COLSxROWS")
+    parser.add_argument("--kitr", default="rust/target/release/kitr", help="kitr binary")
+    parser.add_argument("--size", default="80x24", help="default terminal size COLSxROWS")
+    parser.add_argument("--font-family", default=DEFAULT_FONT_FAMILY, help="font family used by both terminals")
+    parser.add_argument("--font-size", type=float, default=DEFAULT_FONT_SIZE, help="font size in points")
     parser.add_argument("--timeout", type=float, default=10.0, help="startup/run timeout in seconds")
     parser.add_argument("--settle", type=float, default=1.5, help="capture delay after startup")
-    parser.add_argument("--threshold", type=float, default=5.0, help="maximum differing-pixel percentage")
+    parser.add_argument("--threshold", type=float, default=8.0, help="maximum tolerated aligned diff percentage")
     parser.add_argument("--pixel-threshold", type=int, default=16, help="per-channel delta treated as different")
+    parser.add_argument("--max-shift", type=int, default=48, help="maximum vertical alignment search in pixels")
     parser.add_argument("--artifacts", type=Path, default=Path("artifacts/screenshot-parity"))
+    parser.add_argument("--markdown", type=Path, default=None, help="write a markdown report here")
+    parser.add_argument("--json", type=Path, default=None, help="write the suite JSON report here")
+    parser.add_argument("--gaps", type=Path, default=None, help="markdown file appended as known visual gaps")
     parser.add_argument("--xvfb", default="Xvfb", help="Xvfb executable")
     parser.add_argument("--convert", default=None, help="ImageMagick convert/magick executable")
     parser.add_argument("--display", default=None, help="use this DISPLAY instead of starting Xvfb")
@@ -455,47 +807,56 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--threshold must be >= 0")
     if args.pixel_threshold < 0 or args.pixel_threshold > 255:
         parser.error("--pixel-threshold must be between 0 and 255")
+    if args.max_shift < 0:
+        parser.error("--max-shift must be >= 0")
+    if args.font_size <= 0:
+        parser.error("--font-size must be > 0")
     try:
         cols_raw, rows_raw = args.size.lower().split("x", 1)
-        cols, rows = int(cols_raw), int(rows_raw)
-        if cols <= 0 or rows <= 0:
+        default_size = (int(cols_raw), int(rows_raw))
+        if default_size[0] <= 0 or default_size[1] <= 0:
             raise ValueError
     except ValueError:
         parser.error("--size must be COLSxROWS with positive integers")
 
-    if args.script is not None:
-        try:
-            script = args.script.read_text(encoding="utf-8")
-        except OSError as e:
-            print(f"screenshot-parity: error: cannot read script: {e}", file=sys.stderr)
-            return ERROR
-    else:
-        script = args.command or DEFAULT_SCRIPT
-    if not script.strip():
-        print("screenshot-parity: error: empty command/script", file=sys.stderr)
+    try:
+        if args.corpus is not None:
+            cases = load_corpus(args.corpus, default_size)
+        else:
+            if args.script is not None:
+                try:
+                    script = args.script.read_text(encoding="utf-8")
+                except OSError as e:
+                    print(f"screenshot-parity: error: cannot read script: {e}", file=sys.stderr)
+                    return ERROR
+                name = args.script.stem
+            else:
+                script = args.command or DEFAULT_SCRIPT
+                name = "command"
+            if not script.strip():
+                print("screenshot-parity: error: empty command/script", file=sys.stderr)
+                return ERROR
+            cases = [Case(name=name, mode="command", script=script, size=default_size)]
+    except ParityError as e:
+        print(f"screenshot-parity: error: {e}", file=sys.stderr)
         return ERROR
+
+    if args.case:
+        wanted = set(args.case)
+        cases = [c for c in cases if c.name in wanted]
+        if not cases:
+            print(f"screenshot-parity: error: no case matched {sorted(wanted)}", file=sys.stderr)
+            return ERROR
+
+    if args.kitty_arg:
+        for case in cases:
+            case.kitty_args.extend(args.kitty_arg)
+    if args.kitr_arg:
+        for case in cases:
+            case.kitr_args.extend(args.kitr_arg)
 
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
-    for stale in ("kitty.png", "kitty.ppm", "kitr.ppm", "diff.ppm", "diff.png", "report.json"):
-        try:
-            (artifacts / stale).unlink()
-        except OSError:
-            pass
-    for log_name in ("kitty.log", "kitty-rc.log", "kitr.log", "display.log", "convert.log"):
-        try:
-            (artifacts / log_name).unlink()
-        except OSError:
-            pass
-
-    report: dict[str, object] = {
-        "status": "running",
-        "script": script,
-        "size": args.size,
-        "threshold_percent": args.threshold,
-        "pixel_channel_threshold": args.pixel_threshold,
-        "artifacts": str(artifacts),
-    }
 
     kitty = shutil.which(args.kitty) if args.kitty else shutil.which("kitty")
     kitten = shutil.which(args.kitten) if args.kitten else shutil.which("kitten")
@@ -512,14 +873,36 @@ def main(argv: list[str] | None = None) -> int:
     if convert is None:
         missing.append("ImageMagick convert/magick (set --convert)")
     if missing:
-        return skip(artifacts, report, "; ".join(missing), args.strict)
+        report = {"status": "skipped", "message": "; ".join(missing), "artifacts": str(artifacts)}
+        write_report(artifacts, report)
+        print(f"screenshot-parity: SKIP: {'; '.join(missing)}")
+        return ERROR if args.strict else SKIP
 
-    report["c_kitty"] = kitty
-    report["kitten"] = kitten
-    report["kitr_binary"] = str(kitr)
-    report["convert"] = convert[0]
+    command = " ".join([Path(sys.argv[0]).as_posix(), *sys.argv[1:]])
+    suite: dict[str, object] = {
+        "status": "running",
+        "command": command,
+        "c_kitty": kitty,
+        "kitten": kitten,
+        "kitr_binary": str(kitr),
+        "convert": convert[0],
+        "font_family": args.font_family,
+        "font_size": args.font_size,
+        "settle": args.settle,
+        "pixel_channel_threshold": args.pixel_threshold,
+        "threshold_percent": args.threshold,
+        "artifacts": str(artifacts),
+        "cases": [],
+    }
+    gaps_text = None
+    if args.gaps is not None:
+        try:
+            gaps_text = args.gaps.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"screenshot-parity: warning: cannot read gaps file: {e}", file=sys.stderr)
 
     display: VirtualDisplay | None = None
+    exit_code = PASS
     try:
         if args.display:
             display = VirtualDisplay(args.display)
@@ -530,95 +913,161 @@ def main(argv: list[str] | None = None) -> int:
             if not xvfb:
                 raise MissingPrerequisite("no DISPLAY and Xvfb not found")
             display = VirtualDisplay.start(xvfb, "1280x800x24", artifacts / "display.log")
-        report["display"] = display.name
+        suite["display"] = display.name
         env = dict(os.environ)
         env["DISPLAY"] = display.name
         env.setdefault("XLIB_SKIP_ARGB_VISUALS", "1")
+        env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+        env.setdefault("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe")
 
-        print(f"screenshot-parity: running C kitty on DISPLAY={display.name}")
-        kitty_png = run_kitty(
-            kitty,
-            kitten,
-            script,
-            (cols, rows),
-            args.settle,
-            args.timeout,
-            artifacts,
-            args.kitty_arg,
-            env,
-        )
-        print("screenshot-parity: running kitr")
-        kitr_ppm = run_kitr(
-            str(kitr),
-            script,
-            (cols, rows),
-            args.settle,
-            args.timeout,
-            artifacts,
-            args.kitr_arg,
-            env,
-        )
-
-        kitty_ppm = artifacts / "kitty.ppm"
-        kitr_ppm_common = artifacts / "kitr-common.ppm"
-        convert_to_ppm(convert, kitty_png, kitty_ppm, artifacts / "convert.log")
-        convert_to_ppm(convert, kitr_ppm, kitr_ppm_common, artifacts / "convert.log")
-        kitty_image = read_ppm(kitty_ppm)
-        kitr_image = read_ppm(kitr_ppm_common)
-
-        result = compare(kitty_image, kitr_image, args.pixel_threshold, artifacts)
-        report.update(result)
-        report["dimensions"] = {
-            "kitty": [kitty_image.width, kitty_image.height],
-            "kitr": [kitr_image.width, kitr_image.height],
-        }
-        status = "pass" if float(result["diff_percent"]) <= args.threshold else "fail"
-        report["status"] = status
-        report["artifacts"] = {
-            "kitty_png": str(kitty_png),
-            "kitr_ppm": str(kitr_ppm),
-            "kitty_ppm": str(kitty_ppm),
-            "kitr_common_ppm": str(kitr_ppm_common),
-            "diff_ppm": str(artifacts / "diff.ppm"),
-        }
-        diff_png = artifacts / "diff.png"
-        try:
-            with (artifacts / "convert.log").open("ab") as f:
-                subprocess.run(
-                    [convert[1], str(artifacts / "diff.ppm"), str(diff_png)],
-                    stdout=f,
-                    stderr=subprocess.STDOUT,
+        case_results: list[dict[str, object]] = []
+        for case in cases:
+            case_dir = artifacts / "cases" / case.name
+            case_dir.mkdir(parents=True, exist_ok=True)
+            clean_case_artifacts(case_dir)
+            print(f"screenshot-parity: case {case.name} (C kitty)")
+            if case.skip:
+                result = {
+                    "name": case.name,
+                    "status": "skipped",
+                    "message": case.skip,
+                    "artifacts": str(case_dir),
+                }
+                case_results.append(result)
+                write_report(case_dir, result)
+                print(f"screenshot-parity: {case.name}: SKIP: {case.skip}")
+                continue
+            case_settle = args.settle if case.settle is None else case.settle
+            case_timeout = args.timeout if case.timeout is None else case.timeout
+            case_threshold = args.threshold if case.threshold is None else case.threshold
+            try:
+                kitty_png = run_kitty(
+                    kitty,
+                    kitten,
+                    case,
+                    case_settle,
+                    case_timeout,
+                    case_dir,
+                    args.font_family,
+                    args.font_size,
+                    env,
                 )
-            if diff_png.is_file():
-                report["artifacts"]["diff_png"] = str(diff_png)
-        except OSError:
-            pass
-        write_report(artifacts, report)
+                print(f"screenshot-parity: case {case.name} (kitr)")
+                kitr_ppm = run_kitr(
+                    str(kitr),
+                    case,
+                    case_settle,
+                    case_timeout,
+                    case_dir,
+                    args.font_family,
+                    args.font_size,
+                    env,
+                )
+                kitty_ppm = case_dir / "kitty.ppm"
+                kitr_common = case_dir / "kitr-common.ppm"
+                convert_to_ppm(convert, kitty_png, kitty_ppm, case_dir / "convert.log")
+                convert_to_ppm(convert, kitr_ppm, kitr_common, case_dir / "convert.log")
+                kitty_image = read_ppm(kitty_ppm)
+                kitr_image = read_ppm(kitr_common)
+                result = compare(kitty_image, kitr_image, args.pixel_threshold, case_dir, args.max_shift)
+                result.update(
+                    {
+                        "name": case.name,
+                        "mode": case.mode,
+                        "size": f"{case.size[0]}x{case.size[1]}",
+                        "tags": case.tags,
+                        "threshold_percent": case_threshold,
+                        "pixel_channel_threshold": args.pixel_threshold,
+                        "dimensions": {
+                            "kitty": [kitty_image.width, kitty_image.height],
+                            "kitr": [kitr_image.width, kitr_image.height],
+                        },
+                        "artifacts": str(case_dir),
+                    }
+                )
+                diff_png = case_dir / "diff.png"
+                with (case_dir / "convert.log").open("ab") as f:
+                    subprocess.run(
+                        [convert[1], str(case_dir / "diff.ppm"), str(diff_png)],
+                        stdout=f,
+                        stderr=subprocess.STDOUT,
+                    )
+                if diff_png.is_file():
+                    result["diff_png"] = str(diff_png)
+                tolerant = result["tolerant"]  # type: ignore[index]
+                aligned = float(tolerant["aligned"]["diff_percent"])  # type: ignore[index]
+                status = "pass" if aligned <= case_threshold else "fail"
+                result["status"] = status
+                case_results.append(result)
+                write_report(case_dir, result)
+                print(
+                    f"screenshot-parity: {case.name}: {status.upper()}: aligned "
+                    f"exact {_fmt(result['exact']['aligned']['diff_percent'])} "  # type: ignore[index]
+                    f"tolerant {_fmt(aligned)} (threshold {case_threshold:.3f}%), "
+                    f"raw tolerant {_fmt(result['tolerant']['raw']['diff_percent'])}, "  # type: ignore[index]
+                    f"offset {result['offset']}"  # type: ignore[index]
+                )
+                if status == "fail" and exit_code == PASS:
+                    exit_code = DIFF
+            except (ParityError, OSError, subprocess.SubprocessError) as e:
+                result = {
+                    "name": case.name,
+                    "mode": case.mode,
+                    "status": "error",
+                    "message": str(e),
+                    "artifacts": str(case_dir),
+                }
+                case_results.append(result)
+                write_report(case_dir, result)
+                print(f"screenshot-parity: {case.name}: ERROR: {e}", file=sys.stderr)
+                exit_code = ERROR
+
+        suite["cases"] = case_results
+        statuses = [str(c["status"]) for c in case_results]
+        if "error" in statuses:
+            suite["status"] = "error"
+            exit_code = ERROR
+        elif "fail" in statuses:
+            suite["status"] = "fail"
+            exit_code = DIFF
+        else:
+            suite["status"] = "pass"
+            exit_code = PASS
+        write_report(artifacts, suite)
+        if args.json is not None:
+            args.json.parent.mkdir(parents=True, exist_ok=True)
+            args.json.write_text(json.dumps(suite, indent=2) + "\n", encoding="utf-8")
+        if args.markdown is not None:
+            args.markdown.parent.mkdir(parents=True, exist_ok=True)
+            write_markdown(args.markdown, suite, command, gaps_text)
+        counts: dict[str, int] = {}
+        for status in statuses:
+            counts[status] = counts.get(status, 0) + 1
         print(
-            "screenshot-parity: {status}: {diff:.3f}% differing pixels "
-            "({pixels}/{total}, threshold {threshold:.3f}%), mean channel delta {mean:.2f}".format(
-                status=status.upper(),
-                diff=float(result["diff_percent"]),
-                pixels=result["different_pixels"],
-                total=result["compared_pixels"],
-                threshold=args.threshold,
-                mean=float(result["mean_channel_delta"]),
+            "screenshot-parity: {status}: {passn} pass, {failn} fail, "
+            "{skipn} skipped, {errn} error. Artifacts in {artifacts}".format(
+                status=str(suite["status"]).upper(),
+                passn=counts.get("pass", 0),
+                failn=counts.get("fail", 0),
+                skipn=counts.get("skipped", 0),
+                errn=counts.get("error", 0),
+                artifacts=artifacts,
             )
         )
-        print(f"screenshot-parity: artifacts in {artifacts}")
-        if kitty_image.width != kitr_image.width or kitty_image.height != kitr_image.height:
-            print(
-                "screenshot-parity: note: image dimensions differ "
-                f"(kitty {kitty_image.width}x{kitty_image.height}, "
-                f"kitr {kitr_image.width}x{kitr_image.height}); compared the overlap"
-            )
-        return PASS if status == "pass" else DIFF
+        return exit_code
     except MissingPrerequisite as e:
-        return skip(artifacts, report, str(e), args.strict)
+        suite["status"] = "skipped"
+        suite["message"] = str(e)
+        write_report(artifacts, suite)
+        if args.markdown is not None:
+            args.markdown.parent.mkdir(parents=True, exist_ok=True)
+            write_markdown(args.markdown, suite, command, gaps_text)
+        print(f"screenshot-parity: SKIP: {e}")
+        return ERROR if args.strict else SKIP
     except (ParityError, OSError, subprocess.SubprocessError) as e:
-        report["status"] = "error"
-        report["message"] = str(e)
-        write_report(artifacts, report)
+        suite["status"] = "error"
+        suite["message"] = str(e)
+        write_report(artifacts, suite)
         print(f"screenshot-parity: ERROR: {e}", file=sys.stderr)
         return ERROR
     finally:

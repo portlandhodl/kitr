@@ -8,6 +8,7 @@
 
 use std::time::Instant;
 
+use kitty_graphics::AnimationTick;
 use kitty_screen::{CursorShape, Screen};
 
 use crate::atlas::{AtlasConfig, GlyphAtlas, GlyphRasterizer};
@@ -104,6 +105,8 @@ impl RendererCore {
         now: f32,
     ) {
         let damage = self.damage.update(screen);
+        self.generator
+            .tick_animations((now.max(0.0) * 1000.0) as u64);
         let fingerprint = overlay_fingerprint(&self.generator.config, screen);
         let overlays_changed = self.overlay_fingerprint != Some(fingerprint);
         self.overlay_fingerprint = Some(fingerprint);
@@ -171,6 +174,11 @@ impl RendererCore {
     /// Force the next frame to be a full redraw.
     pub fn invalidate(&mut self) {
         self.damage.invalidate();
+    }
+
+    /// Advance running graphics animations and report images needing redraw.
+    pub fn tick_animations(&mut self, now_ms: u64) -> AnimationTick {
+        self.generator.tick_animations(now_ms)
     }
 }
 

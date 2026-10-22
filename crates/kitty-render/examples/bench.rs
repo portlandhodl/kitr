@@ -12,8 +12,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use kitty_graphics::{decode_image, parse_raw, AnimationManager, AnimationState, ImageLimits};
 use kitty_render::{
-    BasicColorResolver, GlyphBitmap, GlyphKey, GlyphRasterizer, OverlayStats, RenderConfig,
+    collect_protocol_images_with_animations, expand_unicode_placeholders, BasicColorResolver,
+    CellMetrics, GlyphBitmap, GlyphKey, GlyphRasterizer, GridGeometry, OverlayStats, RenderConfig,
     RendererCore, SelectionRange, ShapedRunCluster, ShapedRunOutput, ShapedRunRequest, TabBarSpec,
 };
 use kitty_screen::Screen;
@@ -123,6 +125,120 @@ fn bench_frames(
         overlay,
         atlas_insertions: stats.insertions,
     }
+}
+
+fn bench_animation_frame_swap(iters: usize) {
+    let mut root_command = parse_raw(b"a=t,f=32,s=32,v=32,i=1").unwrap();
+    root_command.payload = vec![0u8; 32 * 32 * 4];
+    let root = decode_image(
+        &root_command,
+        &root_command.payload,
+        &ImageLimits::default(),
+    )
+    .unwrap();
+    let mut manager = AnimationManager::new();
+    manager.insert_root(&root).unwrap();
+    for number in 2..=16u32 {
+        let mut command = parse_raw(format!("a=f,i=1,r={number},s=32,v=32").as_bytes()).unwrap();
+        command.payload = vec![number as u8; 32 * 32 * 4];
+        manager.feed(&command, &ImageLimits::default(), 0).unwrap();
+        manager.set_gap(1, number, 5);
+    }
+    manager.set_gap(1, 1, 5);
+    manager.set_state(1, AnimationState::Running, 0);
+
+    let start = Instant::now();
+    let mut swaps = 0usize;
+    for i in 0..iters {
+        let tick = manager.tick(i as u64 * 5);
+        swaps += tick.redraw.len();
+        black_box(manager.image(1).unwrap().current_data());
+    }
+    let elapsed = start.elapsed();
+    let per_swap = elapsed.as_secs_f64() / iters.max(1) as f64;
+    println!(
+        "animation: {iters} ticks in {:?}  {:.3} us/tick  {:.0} ticks/s  ({} frame swaps)",
+        elapsed,
+        per_swap * 1e6,
+        1.0 / per_swap,
+        swaps
+    );
+}
+
+fn diacritic_for(number: u32) -> u32 {
+    if number == 0 {
+        0x305
+    } else {
+        0x30d + number - 1
+    }
+}
+
+fn bench_placeholder_expansion(iters: usize, columns: u32, rows: u32) {
+    let mut screen = Screen::builder(columns, rows)
+        .scrollback(16)
+        .build()
+        .expect("placeholder screen");
+    let mut image = parse_raw(b"a=t,f=32,s=1,v=1,i=42").unwrap();
+    image.payload = vec![1, 2, 3, 255];
+    screen.handle_graphics_command(image).unwrap();
+    let mut placement = parse_raw(format!("a=p,U=1,i=42,c={columns},r={rows}").as_bytes()).unwrap();
+    placement.payload.clear();
+    screen.handle_graphics_command(placement).unwrap();
+    screen.cursor.sgr.fg = (42 << 8) | 1;
+    for row in 0..rows {
+        let mut text = Vec::with_capacity(columns as usize + 1);
+        text.push(kitty_core::cell::IMAGE_PLACEHOLDER_CHAR);
+        text.push(diacritic_for(row));
+        text.resize(
+            columns as usize + 1,
+            kitty_core::cell::IMAGE_PLACEHOLDER_CHAR,
+        );
+        screen.cursor_position(row + 1, 1);
+        screen.draw_text(&text);
+    }
+
+    let geometry = GridGeometry::new(
+        columns,
+        rows,
+        CellMetrics {
+            cell_width: 9.0,
+            cell_height: 17.0,
+            ..CellMetrics::default()
+        },
+    );
+    let cells = u64::from(columns) * u64::from(rows);
+    let start = Instant::now();
+    let mut runs = 0usize;
+    let mut instances = Vec::new();
+    let mut uploads = Vec::new();
+    for _ in 0..iters {
+        runs += expand_unicode_placeholders(&screen).len();
+        instances.clear();
+        uploads.clear();
+        collect_protocol_images_with_animations(
+            &screen,
+            None,
+            &geometry,
+            columns as f32 * 9.0,
+            rows as f32 * 17.0,
+            kitty_render::ImageFilter::Nearest,
+            &mut instances,
+            &mut uploads,
+        );
+        black_box(instances.len());
+    }
+    let elapsed = start.elapsed();
+    let per_iter = elapsed.as_secs_f64() / iters.max(1) as f64;
+    println!(
+        "placeholders: {}x{} cells, {iters} expansions in {:?}  {:.3} ms/pass  {:.1} Mcell/s  ({} runs/pass, {} quads/pass)",
+        columns,
+        rows,
+        elapsed,
+        per_iter * 1e3,
+        cells as f64 * iters as f64 / elapsed.as_secs_f64().max(f64::EPSILON) / 1e6,
+        runs / iters.max(1),
+        instances.len()
+    );
 }
 
 fn main() {
@@ -296,4 +412,6 @@ fn main() {
             result.per_frame * 1e3,
         );
     }
+    bench_animation_frame_swap(iters);
+    bench_placeholder_expansion(iters, columns, rows);
 }

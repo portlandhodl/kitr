@@ -75,6 +75,9 @@
 //! * Graphics-protocol placements stored by `kitty-screen` as textured quads,
 //!   with source rectangles, cell/pixel offsets, automatic aspect-ratio sizing,
 //!   z-index/layer ordering and clipping to the viewport.
+//! * Animation frames from [`kitty_graphics::AnimationManager`], timed frame
+//!   swaps, composition canvases and Unicode `U+10EEEE` placeholder runs with
+//!   row/column diacritics and image-id foreground colours.
 //! * PNG background images with all six layout modes, tint and opacity, and
 //!   window logos with nine anchors, alpha and percentage scaling.
 //! * A simple fading cursor trail driven by recent cursor positions (not
@@ -112,15 +115,15 @@
 //!
 //! # Renderer features not supported yet
 //!
-//! * Graphics-protocol animations (`a=a`/`a=f`), composition (`a=c`),
-//!   parent/child placement offsets and Unicode-placeholder expansion. Only
-//!   directly placed RGBA images are rendered; indexed-colour images without
-//!   RGBA data are skipped.
+//! * Parent/child placement offsets and relative placement chains. Indexed
+//!   protocol images without RGBA data are not rendered. Animation/composition
+//!   state itself lives in `kitty-graphics`; the renderer consumes its current
+//!   frame and exposes [`RendererCore::tick_animations`].
 //! * The full cursor-trail corner animation and custom trail shaders. The
 //!   implemented trail is a simple bounded history of recent cursor cells that
 //!   fades linearly and is replaced rather than smoothly eased.
 //! * Image transforms (rotation, mirroring, scaling filters beyond
-//!   nearest/linear), animations and per-window background-image lists.
+//!   nearest/linear) and per-window background-image lists.
 //! * Image and trail changes are not part of `kitty-screen`'s dirty-line
 //!   tracking, so [`RendererCore`] forces a full redraw while those layers are
 //!   present. Background images survive a GPU resize, but the frame must be
@@ -198,10 +201,11 @@ pub use decorations::{
 pub use font_rasterizer::FontRasterizer;
 pub use geom::{CellMetrics, EdgeWidths, GridGeometry, Rect, Region};
 pub use images::{
-    background_image, background_quad, clip_rect_uv, collect_protocol_images, fingerprint,
-    window_logo, window_logo_quad, BackgroundImageConfig, BackgroundLayout, ImageAsset, ImageData,
-    ImageFilter, ImageInstance, ImageKey, ImageLayer, ImageLoadError, ImageUpload, ImageWrap,
-    LogoPosition, WindowLogoConfig,
+    background_image, background_quad, clip_rect_uv, collect_protocol_images,
+    collect_protocol_images_with_animations, color_to_image_id, diacritic_to_num,
+    expand_unicode_placeholders, fingerprint, window_logo, window_logo_quad, BackgroundImageConfig,
+    BackgroundLayout, ImageAsset, ImageData, ImageFilter, ImageInstance, ImageKey, ImageLayer,
+    ImageLoadError, ImageUpload, ImageWrap, LogoPosition, PlaceholderRun, WindowLogoConfig,
 };
 pub use instances::{
     BackgroundInstance, CursorGeometry, CursorInstance, DecorationInstance, DecorationKind, Frame,

@@ -1,0 +1,4 @@
+new_tab layouts
+layout splits
+launch --title left /bin/sh -c "printf 'left pane\n'; sleep 30"
+launch --location=vsplit --title right /bin/sh -c "printf 'right pane\n'; sleep 30"

@@ -113,6 +113,7 @@ version = "0.1.0"
 dependencies = [
  "kitty-config",
  "kitty-core",
+ "kitty-graphics",
  "kitty-remote",
 ]
 
