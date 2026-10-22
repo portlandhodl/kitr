@@ -94,6 +94,17 @@ fn send_chunk<F: FnMut(&[i32], bool)>(
     }
 }
 
+fn parse_hyperlink_id(params: &str) -> Option<String> {
+    for token in params.split(':') {
+        if let Some(id) = token.strip_prefix("id=") {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 const STATE_NORMAL: u8 = 0;
 const STATE_SUB: u8 = 1;
 const STATE_COLOR: u8 = 2;
@@ -325,7 +336,7 @@ impl Handler for ScreenHandler {
             }
             b'P' => {
                 if secondary == b'#' && params.primary() == 0 {
-                    self.report_error("Color stack is not implemented");
+                    self.screen.push_colors();
                     return;
                 }
                 let count = self.positive(params, 0, 1);
@@ -416,6 +427,13 @@ impl Handler for ScreenHandler {
                     self.report_error("Unsupported CSI q sequence");
                 }
             }
+            b'Q' => {
+                if secondary == b'#' && params.primary() == 0 {
+                    self.screen.pop_colors();
+                } else {
+                    self.report_error("Unsupported CSI Q sequence");
+                }
+            }
             b'c' | b'n' | b't' => {
                 self.report_error("Device reports and window manipulation are not implemented");
             }
@@ -424,12 +442,13 @@ impl Handler for ScreenHandler {
     }
 
     fn osc_dispatch(&mut self, data: &[u8]) {
-        let Some(sep) = data.iter().position(|&b| b == b';') else {
-            self.report_error("Unsupported OSC sequence without a separator");
-            return;
+        let (code, payload) = match data.iter().position(|&b| b == b';') {
+            Some(sep) => (
+                &data[..sep],
+                String::from_utf8_lossy(&data[sep + 1..]).into_owned(),
+            ),
+            None => (data, String::new()),
         };
-        let code = &data[..sep];
-        let payload = String::from_utf8_lossy(&data[sep + 1..]).into_owned();
         match code {
             b"0" => {
                 self.screen.title = Some(payload.clone());
@@ -437,10 +456,34 @@ impl Handler for ScreenHandler {
             }
             b"1" => self.screen.icon_name = Some(payload),
             b"2" => self.screen.title = Some(payload),
-            _ => self.report_error(&format!(
-                "Unsupported OSC code: {}",
-                String::from_utf8_lossy(code)
-            )),
+            b"8" => {
+                // OSC 8 ; params ; URI. The URI may itself contain semicolons.
+                let (params, url) = match payload.find(';') {
+                    Some(i) => (&payload[..i], &payload[i + 1..]),
+                    None => ("", payload.as_str()),
+                };
+                let id = parse_hyperlink_id(params);
+                if url.is_empty() {
+                    self.screen.set_active_hyperlink(None, None);
+                } else {
+                    self.screen.set_active_hyperlink(id.as_deref(), Some(url));
+                }
+            }
+            _ => {
+                if let Ok(code_num) = std::str::from_utf8(code)
+                    .ok()
+                    .and_then(|c| c.parse::<u32>().ok())
+                    .ok_or(())
+                {
+                    if self.screen.handle_color_osc(code_num, &payload) {
+                        return;
+                    }
+                }
+                self.report_error(&format!(
+                    "Unsupported OSC code: {}",
+                    String::from_utf8_lossy(code)
+                ));
+            }
         }
     }
 
@@ -460,8 +503,20 @@ impl Handler for ScreenHandler {
         self.report_error("SOS sequences are not implemented");
     }
 
-    fn apc_dispatch(&mut self, _data: &[u8]) {
-        self.report_error("APC sequences are not implemented");
+    fn apc_dispatch(&mut self, data: &[u8]) {
+        // Kitty graphics commands are APC strings of the form ESC _ G ... ESC \.
+        if let Some(rest) = data.strip_prefix(b"G") {
+            match kitty_graphics::parse_raw(rest) {
+                Ok(cmd) => {
+                    if let Err(e) = self.screen.handle_graphics_command(cmd) {
+                        self.report_error(&format!("Graphics command failed: {e}"));
+                    }
+                }
+                Err(e) => self.report_error(&format!("Graphics command parse error: {e}")),
+            }
+        } else {
+            self.report_error("APC sequences are not implemented");
+        }
     }
 
     fn report_error(&mut self, message: &str) {
@@ -568,7 +623,7 @@ mod tests {
         feed(&mut h, b"\x1bPqq\x1b\\");
         assert!(h.errors.iter().any(|e| e.contains("DCS")));
         feed(&mut h, b"\x1b]8;;http://x\x1b\\");
-        assert!(h.errors.iter().any(|e| e.contains("OSC")));
+        assert!(!h.errors.iter().any(|e| e.contains("OSC")));
         feed(&mut h, b"\x1b[14t");
         assert!(h.errors.iter().any(|e| e.contains("window")));
     }

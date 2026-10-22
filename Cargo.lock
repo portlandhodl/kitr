@@ -36,7 +36,6 @@ name = "kitty-graphics"
 version = "0.1.0"
 dependencies = [
  "kitty-core",
- "kitty-screen",
 ]
 
 [[package]]
@@ -81,6 +80,7 @@ name = "kitty-screen"
 version = "0.1.0"
 dependencies = [
  "kitty-core",
+ "kitty-graphics",
  "kitty-simd",
  "kitty-unicode",
  "kitty-vt",
@@ -103,4 +103,11 @@ version = "0.1.0"
 dependencies = [
  "kitty-core",
  "kitty-simd",
+]
+
+[[package]]
+name = "kitty-window"
+version = "0.1.0"
+dependencies = [
+ "kitty-core",
 ]

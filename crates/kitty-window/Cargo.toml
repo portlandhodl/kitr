@@ -1,0 +1,10 @@
+[package]
+name = "kitty-window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux X11/EGL window and event backend for kitr"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }

@@ -11,3 +11,4 @@ kitty-core = { path = "../kitty-core" }
 kitty-vt = { path = "../kitty-vt" }
 kitty-simd = { path = "../kitty-simd" }
 kitty-unicode = { path = "../kitty-unicode" }
+kitty-graphics = { path = "../kitty-graphics" }

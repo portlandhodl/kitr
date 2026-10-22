@@ -3,6 +3,7 @@
 // Copyright (C) 2016-2024 Kovid Goyal <kovid at kovidgoyal.net>
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use kitty_core::cell::{CharType, VS15, VS16};
@@ -15,10 +16,18 @@ use kitty_unicode::{
     CharProps, GraphemeBreakProperty, GraphemeSegmentationResult,
 };
 
+use kitty_graphics::{GraphicsError, Image, ImageAssembler};
+
 use crate::charset::CharsetState;
+use crate::colors::{ColorOverrides, ColorStack};
 use crate::cursor::Cursor;
-use crate::lineops::{apply_sgr_to_cells, line_apply_cursor, line_as_ansi, line_as_text};
+use crate::graphics::{GraphicsQuery, ImagePlacement, UnsupportedGraphics};
+use crate::hyperlink::{HyperlinkAt, HyperlinkPool, HyperlinkSpan};
+use crate::lineops::{
+    apply_sgr_to_cells, line_apply_cursor, line_as_ansi_with_links, line_as_text,
+};
 use crate::modes::{self, Modes};
+use crate::selection::{range_line, Selections};
 
 /// `CSI_REP_MAX_REPETITIONS`.
 pub const CSI_REP_MAX_REPETITIONS: u32 = 65535;
@@ -58,9 +67,9 @@ impl From<HistoryBufError> for ScreenError {
 
 /// Options accepted by [`ScreenBuilder`].
 ///
-/// Only fields required by the implemented subset are present. Resize/rewrap,
-/// font metrics, graphics and shell integration options from the C `Screen`
-/// constructor are intentionally absent.
+/// Only fields required by the implemented subset are present. Font metrics,
+/// graphics sizing and shell integration options from the C `Screen`
+/// constructor are not needed by this port.
 #[derive(Clone, Debug, Default)]
 pub struct ScreenOptions {
     /// Scrollback capacity in lines. The effective capacity is
@@ -104,8 +113,8 @@ impl ScreenBuilder {
 
 /// A savepoint used by DECSC/DECRC (`Savepoint` in `screen.h`).
 #[derive(Clone, Debug, Default)]
-struct Savepoint {
-    cursor: Cursor,
+pub(crate) struct Savepoint {
+    pub(crate) cursor: Cursor,
     modes: Modes,
     charset: CharsetState,
     is_valid: bool,
@@ -179,16 +188,28 @@ pub struct Screen {
     pub last_graphic_char: CharType,
     pub active_hyperlink_id: u16,
 
-    text_cache: Rc<RefCell<TextCache>>,
-    main_linebuf: LineBuf,
-    alt_linebuf: LineBuf,
-    on_alt: bool,
-    historybuf: HistoryBuf,
-    main_tabstops: Vec<bool>,
-    alt_tabstops: Vec<bool>,
-    main_savepoint: Savepoint,
-    alt_savepoint: Savepoint,
-    history_scratch: Line,
+    pub(crate) text_cache: Rc<RefCell<TextCache>>,
+    pub(crate) main_linebuf: LineBuf,
+    pub(crate) alt_linebuf: LineBuf,
+    pub(crate) on_alt: bool,
+    pub(crate) historybuf: HistoryBuf,
+    pub(crate) main_tabstops: Vec<bool>,
+    pub(crate) alt_tabstops: Vec<bool>,
+    pub(crate) main_savepoint: Savepoint,
+    pub(crate) alt_savepoint: Savepoint,
+    pub(crate) history_scratch: Line,
+
+    pub(crate) hyperlinks: HyperlinkPool,
+    pub(crate) selections: Selections,
+    pub(crate) images: HashMap<u32, Image>,
+    pub(crate) placements: Vec<ImagePlacement>,
+    pub(crate) image_assembler: ImageAssembler,
+    pub(crate) graphics_queries: Vec<GraphicsQuery>,
+    pub(crate) graphics_unsupported: Vec<UnsupportedGraphics>,
+    pub last_graphics_error: Option<GraphicsError>,
+    pub(crate) colors: ColorOverrides,
+    pub(crate) color_stack: ColorStack,
+    pub(crate) output: Vec<u8>,
 }
 
 impl Screen {
@@ -237,6 +258,17 @@ impl Screen {
             main_savepoint: Savepoint::default(),
             alt_savepoint: Savepoint::default(),
             history_scratch: Line::new(columns as usize),
+            hyperlinks: HyperlinkPool::new(),
+            selections: Selections::default(),
+            images: HashMap::new(),
+            placements: Vec::new(),
+            image_assembler: ImageAssembler::default(),
+            graphics_queries: Vec::new(),
+            graphics_unsupported: Vec::new(),
+            last_graphics_error: None,
+            colors: ColorOverrides::new(),
+            color_stack: ColorStack::default(),
+            output: Vec::new(),
         };
         screen.cursor.x = 0;
         screen.cursor.y = 0;
@@ -263,7 +295,7 @@ impl Screen {
     }
 
     #[inline]
-    fn lb_mut(&mut self) -> &mut LineBuf {
+    pub(crate) fn lb_mut(&mut self) -> &mut LineBuf {
         if self.on_alt {
             &mut self.alt_linebuf
         } else {
@@ -309,6 +341,16 @@ impl Screen {
         self.lb()
     }
 
+    #[inline]
+    pub(crate) fn linebuf_mut(&mut self) -> &mut LineBuf {
+        self.lb_mut()
+    }
+
+    #[inline]
+    pub fn hyperlinks(&self) -> &HyperlinkPool {
+        &self.hyperlinks
+    }
+
     /// Dirty screen rows, in row order.
     pub fn dirty_lines(&self) -> Vec<usize> {
         self.lb().dirty_lines()
@@ -343,7 +385,13 @@ impl Screen {
         match self.line(y) {
             Some(line) => {
                 let tc = self.text_cache.borrow();
-                line_as_ansi(&line, &tc, 0, self.columns as usize)
+                line_as_ansi_with_links(
+                    &line,
+                    &tc,
+                    0,
+                    self.columns as usize,
+                    Some(&self.hyperlinks),
+                )
             }
             None => String::new(),
         }
@@ -582,6 +630,7 @@ impl Screen {
             self.history_line_added_count += 1;
         }
         self.lb_mut().clear_line(bottom, true);
+        self.index_selections(true);
         self.is_dirty = true;
     }
 
@@ -590,6 +639,7 @@ impl Screen {
         let bottom = self.margin_bottom as usize;
         self.lb_mut().reverse_index(top, bottom);
         self.lb_mut().clear_line(top, true);
+        self.index_selections(false);
         self.is_dirty = true;
     }
 
@@ -956,6 +1006,13 @@ impl Screen {
             self.alt_linebuf.clear(0);
             self.historybuf.clear();
             self.history_line_added_count = 0;
+        }
+        self.selections.clear();
+        self.colors = ColorOverrides::new();
+        self.color_stack.clear();
+        if hard {
+            self.hyperlinks.clear();
+            self.clear_images();
         }
         self.modes = default_modes();
         self.saved_modes = default_modes();
@@ -1357,6 +1414,9 @@ impl Screen {
     /// `screen_draw_text()`.
     pub fn draw_text(&mut self, chars: &[CharType]) {
         self.is_dirty = true;
+        if !chars.is_empty() {
+            self.selections.clear();
+        }
         let gpu_template = self.cursor.sgr.as_gpu_cell();
         let mut cpu_template = CpuCell::new();
         cpu_template.set_hyperlink_id(self.active_hyperlink_id);
@@ -1813,6 +1873,154 @@ impl Screen {
 
     // }}}
 
+    // {{{ Hyperlinks
+
+    /// `set_active_hyperlink()`: OSC 8 start/end.
+    pub fn set_active_hyperlink(&mut self, id: Option<&str>, url: Option<&str>) {
+        self.active_hyperlink_id = if url.map(|u| !u.is_empty()).unwrap_or(false) {
+            self.hyperlinks.get_id(id, url)
+        } else {
+            0
+        };
+    }
+
+    /// The hyperlink id stored in the cell at visual coordinates.
+    pub fn hyperlink_id_at(&self, x: u32, y: u32) -> u16 {
+        if x >= self.columns || y >= self.lines {
+            return 0;
+        }
+        let row = y as i64 - self.scrolled_by as i64;
+        range_line(self, row)
+            .map(|line| {
+                line.cpu_cells
+                    .get(x as usize)
+                    .map(|c| c.hyperlink_id())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    fn spans_for_row(&self, row: i64, wanted: Option<u16>) -> Vec<HyperlinkSpan> {
+        let Some(line) = range_line(self, row) else {
+            return Vec::new();
+        };
+        let mut ans = Vec::new();
+        let mut start: Option<(u16, u32)> = None;
+        for x in 0..line.xnum() as u32 {
+            let id = line.cpu_cells[x as usize].hyperlink_id();
+            let matches = id != 0 && wanted.map(|w| w == id).unwrap_or(true);
+            match (start, matches) {
+                (Some((_sid, _sx)), true) if _sid == id => {}
+                (Some((_sid, sx)), _) => {
+                    ans.push(HyperlinkSpan {
+                        y: row,
+                        x_start: sx,
+                        x_end: x,
+                    });
+                    start = if matches { Some((id, x)) } else { None };
+                }
+                (None, true) => start = Some((id, x)),
+                (None, false) => {}
+            }
+        }
+        if let Some((_, sx)) = start {
+            ans.push(HyperlinkSpan {
+                y: row,
+                x_start: sx,
+                x_end: line.xnum() as u32,
+            });
+        }
+        ans
+    }
+
+    /// Contiguous hyperlink runs on one visual screen row.
+    pub fn url_spans(&self, y: u32) -> Vec<HyperlinkSpan> {
+        if y >= self.lines {
+            return Vec::new();
+        }
+        let row = y as i64 - self.scrolled_by as i64;
+        self.spans_for_row(row, None)
+    }
+
+    /// `hyperlink_at()`: the link under a cell, including links that span
+    /// nearby soft-wrapped rows (kitty searches five rows in each direction).
+    pub fn hyperlink_at(&self, x: u32, y: u32) -> Option<HyperlinkAt> {
+        if x >= self.columns || y >= self.lines {
+            return None;
+        }
+        let row = y as i64 - self.scrolled_by as i64;
+        let id = self.hyperlink_id_at(x, y);
+        if id == 0 {
+            return None;
+        }
+        let mut spans = Vec::new();
+        for r in
+            (row - 5).max(-(self.historybuf.count as i64))..=(row + 5).min(self.lines as i64 - 1)
+        {
+            spans.extend(self.spans_for_row(r, Some(id)));
+        }
+        let url = self
+            .hyperlinks
+            .url_for_id(id)
+            .unwrap_or_default()
+            .to_string();
+        Some(HyperlinkAt { id, url, spans })
+    }
+
+    /// `hyperlinks_as_set()`: `(key, id)` pairs still in the pool.
+    pub fn hyperlinks_as_set(&self) -> HashSet<(String, u16)> {
+        self.hyperlinks
+            .iter()
+            .map(|(id, link)| (link.key(), id))
+            .collect()
+    }
+
+    /// Drop links that are no longer referenced by any cell.
+    pub fn garbage_collect_hyperlink_pool(&mut self) {
+        let mut used: HashSet<u16> = HashSet::new();
+        for lnum in 0..self.historybuf.count {
+            for c in self.historybuf.cpu_cells(lnum) {
+                let id = c.hyperlink_id();
+                if id != 0 {
+                    used.insert(id);
+                }
+            }
+        }
+        for lb in [&self.main_linebuf, &self.alt_linebuf] {
+            for y in 0..lb.ynum as usize {
+                for c in lb.cpu_cells_for_line(y) {
+                    let id = c.hyperlink_id();
+                    if id != 0 {
+                        used.insert(id);
+                    }
+                }
+            }
+        }
+        let map = self.hyperlinks.garbage_collect(&used);
+        let remap = |id: u16| -> u16 { map.get(id as usize).copied().unwrap_or(0) };
+        for lnum in 0..self.historybuf.count {
+            for c in self.historybuf.cpu_cells_mut(lnum) {
+                let id = c.hyperlink_id();
+                if id != 0 {
+                    c.set_hyperlink_id(remap(id));
+                }
+            }
+        }
+        for lb in [&mut self.main_linebuf, &mut self.alt_linebuf] {
+            for y in 0..lb.ynum as usize {
+                for c in lb.cpu_cells_for_line_mut(y) {
+                    let id = c.hyperlink_id();
+                    if id != 0 {
+                        c.set_hyperlink_id(remap(id));
+                    }
+                }
+            }
+        }
+        self.active_hyperlink_id = remap(self.active_hyperlink_id);
+    }
+
+    // }}}
+
     // {{{ DSR helpers used by the handler
 
     /// The cursor position as 1-based `(row, column)`.
@@ -1828,7 +2036,7 @@ impl Screen {
     // }}}
 }
 
-fn default_tabstops(count: u32) -> Vec<bool> {
+pub(crate) fn default_tabstops(count: u32) -> Vec<bool> {
     (0..count).map(|i| i % 8 == 0).collect()
 }
 

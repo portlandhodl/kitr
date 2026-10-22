@@ -5,13 +5,15 @@
 //! Line-level operations: SGR serialization, cell attributes, and plain/ANSI
 //! text extraction.
 //!
-//! Hyperlinks, images, text-sizing (multicell) escape prefixes and prompt
-//! markers are intentionally not serialized; see the crate level docs.
+//! Standard SGR and OSC 8 hyperlinks are serialized. Images, text-sizing
+//! (multicell) escape prefixes and prompt markers are intentionally not
+//! serialized; see the crate level docs.
 
 use kitty_core::cell::{SGR_MASK, VS15, VS16};
 use kitty_core::{CellAttrs, CpuCell, GpuCell, Line, TextCache};
 
 use crate::cursor::{Cursor, DECORATION_FG_CODE};
+use crate::hyperlink::HyperlinkPool;
 
 /// `color_as_sgr()`: serialize one encoded colour.
 fn color_as_sgr(out: &mut String, val: u32, simple_code: u32, aix_code: u32, complex_code: u32) {
@@ -416,12 +418,47 @@ pub fn line_as_text(line: &Line, tc: &TextCache) -> String {
     line_as_text_range(line, tc, 0, xlimit_for_line(line), false, true)
 }
 
+/// Write one OSC 8 hyperlink start/end sequence to `out`.
+fn write_hyperlink(out: &mut String, id: u16, pool: &HyperlinkPool) {
+    out.push_str("\x1b]8;");
+    if id != 0 {
+        if let Some(link) = pool.get(id) {
+            if !link.id.is_empty() {
+                out.push_str("id=");
+                out.push_str(&link.id);
+            }
+            out.push(';');
+            out.push_str(&link.url);
+        } else {
+            out.push(';');
+        }
+    } else {
+        out.push(';');
+    }
+    out.push_str("\x1b\\");
+}
+
 /// `line_as_ansi()`: serialize a line with SGR escape codes.
 ///
-/// This mirrors `line_as_ansi()` for attributes and colours. Hyperlinks,
-/// images, prompt markers and text-sizing prefixes are omitted because those
-/// features are outside this port's scope.
+/// This mirrors `line_as_ansi()` for attributes and colours. Images, prompt
+/// markers and text-sizing prefixes are omitted because those features are
+/// outside this port's scope. Use [`line_as_ansi_with_links`] to also emit
+/// OSC 8 hyperlink sequences.
 pub fn line_as_ansi(line: &Line, tc: &TextCache, start_at: usize, stop_before: usize) -> String {
+    line_as_ansi_with_links(line, tc, start_at, stop_before, None)
+}
+
+/// Like [`line_as_ansi`] but emits OSC 8 start/end sequences for hyperlinks.
+///
+/// When `pool` is `None`, the cell hyperlink ids are ignored (matching the
+/// historical behaviour of this crate).
+pub fn line_as_ansi_with_links(
+    line: &Line,
+    tc: &TextCache,
+    start_at: usize,
+    stop_before: usize,
+    pool: Option<&HyperlinkPool>,
+) -> String {
     let limit = stop_before.min(xlimit_for_line(line));
     if limit <= start_at {
         return String::new();
@@ -429,8 +466,16 @@ pub fn line_as_ansi(line: &Line, tc: &TextCache, start_at: usize, stop_before: u
     let mut out = String::new();
     let blank = GpuCell::default();
     let mut prev = blank;
+    let mut active_hyperlink_id: u16 = 0;
     let mut pos = start_at;
     while pos < limit {
+        if let Some(pool) = pool {
+            let hid = line.cpu_cells[pos].hyperlink_id();
+            if hid != active_hyperlink_id {
+                write_hyperlink(&mut out, hid, pool);
+                active_hyperlink_id = hid;
+            }
+        }
         let cell = &line.gpu_cells[pos];
         let cpu = &line.cpu_cells[pos];
         if (cell.attrs.val() & SGR_MASK) != (prev.attrs.val() & SGR_MASK)
@@ -480,6 +525,14 @@ pub fn line_as_ansi(line: &Line, tc: &TextCache, start_at: usize, stop_before: u
             }
         }
         pos += 1;
+    }
+    if let Some(pool) = pool {
+        if active_hyperlink_id != 0
+            && limit < line.xnum()
+            && line.cpu_cells[limit].hyperlink_id() == 0
+        {
+            write_hyperlink(&mut out, 0, pool);
+        }
     }
     out
 }
