@@ -12,6 +12,7 @@ use crate::ffi::freetype::{self, FT_Face};
 use crate::ffi::harfbuzz;
 use crate::library::FreeTypeLibrary;
 use crate::metrics::{FaceMetrics, FontCellMetrics, GlyphMetrics};
+use crate::raster::{GlyphBitmap, PixelFormat};
 use crate::shaping::{shape, ShapeOptions, ShapedRun};
 
 pub const DEFAULT_SIZE_PTS: f64 = 12.0;
@@ -343,6 +344,130 @@ impl Face {
         })
     }
 
+    /// Rasterize a glyph with kitty's default load flags
+    /// (`FT_LOAD_DEFAULT | FT_LOAD_RENDER`). Color faces automatically also
+    /// get `FT_LOAD_COLOR`.
+    pub fn rasterize_glyph(&self, glyph_id: u32) -> Result<GlyphBitmap> {
+        self.rasterize_glyph_with_flags(
+            glyph_id,
+            freetype::FT_LOAD_DEFAULT | freetype::FT_LOAD_RENDER,
+        )
+    }
+
+    /// Rasterize a glyph, ORing `flags` into the face's hinting/load flags.
+    ///
+    /// Callers that want pixels must include `FT_LOAD_RENDER` (see
+    /// [`crate::ffi::freetype::FT_LOAD_RENDER`]); [`Face::rasterize_glyph`]
+    /// does so by default.
+    pub fn rasterize_glyph_with_flags(
+        &self,
+        glyph_id: u32,
+        flags: freetype::FT_Int,
+    ) -> Result<GlyphBitmap> {
+        if glyph_id as i64 >= self.num_glyphs() as i64 {
+            return Err(Error::MissingGlyph(glyph_id));
+        }
+        let mut load_flags = self.load_flags | flags;
+        if self.has_color {
+            load_flags |= freetype::FT_LOAD_COLOR;
+        }
+        let code = unsafe { freetype::FT_Load_Glyph(self.face, glyph_id, load_flags) };
+        ft_check("FT_Load_Glyph", code)?;
+        let slot = unsafe { (*self.face).glyph };
+        if slot.is_null() {
+            return Err(Error::Raster("FreeType returned a null glyph slot"));
+        }
+        if unsafe { (*slot).format } == freetype::FT_GLYPH_FORMAT_OUTLINE
+            && load_flags & freetype::FT_LOAD_RENDER != 0
+        {
+            let code = unsafe { freetype::FT_Render_Glyph(slot, freetype::FT_RENDER_MODE_NORMAL) };
+            ft_check("FT_Render_Glyph", code)?;
+        }
+        let slot = unsafe { &*slot };
+        if slot.format != freetype::FT_GLYPH_FORMAT_BITMAP {
+            return Err(Error::UnsupportedGlyphFormat(slot.format));
+        }
+        let bitmap = &slot.bitmap;
+        let pixel_mode = bitmap.pixel_mode;
+        let format = match pixel_mode {
+            freetype::FT_PIXEL_MODE_NONE | freetype::FT_PIXEL_MODE_GRAY => PixelFormat::Gray8,
+            freetype::FT_PIXEL_MODE_MONO
+            | freetype::FT_PIXEL_MODE_GRAY2
+            | freetype::FT_PIXEL_MODE_GRAY4 => PixelFormat::Gray8,
+            freetype::FT_PIXEL_MODE_BGRA => PixelFormat::Bgra8,
+            other => return Err(Error::UnsupportedPixelMode(other)),
+        };
+        let raw_advance_x = if slot.advance.x != 0 {
+            slot.advance.x as i32
+        } else {
+            slot.metrics.horiAdvance as i32
+        };
+        let raw_advance_y = if slot.advance.y != 0 {
+            slot.advance.y as i32
+        } else {
+            slot.metrics.vertAdvance as i32
+        };
+        let width = bitmap.width;
+        let height = bitmap.rows;
+        let bpp = format.bytes_per_pixel();
+        let pitch = width as usize * bpp;
+        let mut data = Vec::new();
+        if width > 0 && height > 0 {
+            if bitmap.buffer.is_null() {
+                return Err(Error::Raster("FreeType returned a null bitmap buffer"));
+            }
+            if bitmap.pitch == 0 {
+                return Err(Error::Raster("FreeType returned a zero bitmap pitch"));
+            }
+            data.resize(pitch * height as usize, 0);
+            let src_pitch = bitmap.pitch as isize;
+            for y in 0..height as usize {
+                let src = unsafe { bitmap.buffer.offset(y as isize * src_pitch) };
+                let dst = &mut data[y * pitch..(y + 1) * pitch];
+                unsafe {
+                    expand_bitmap_row(src, dst, width as usize, pixel_mode);
+                }
+            }
+        }
+        Ok(GlyphBitmap {
+            width,
+            height,
+            left: slot.bitmap_left,
+            top: slot.bitmap_top,
+            advance_x: convert_26_6(raw_advance_x),
+            advance_y: convert_26_6(raw_advance_y),
+            advance_x_26_6: raw_advance_x,
+            advance_y_26_6: raw_advance_y,
+            format,
+            pitch,
+            data,
+        })
+    }
+
+    /// Rasterize a codepoint on this face. Missing codepoints return
+    /// [`Error::MissingGlyph`].
+    pub fn rasterize_codepoint(&self, codepoint: u32) -> Result<GlyphBitmap> {
+        self.rasterize_codepoint_with_flags(
+            codepoint,
+            freetype::FT_LOAD_DEFAULT | freetype::FT_LOAD_RENDER,
+        )
+    }
+
+    pub fn rasterize_codepoint_with_flags(
+        &self,
+        codepoint: u32,
+        flags: freetype::FT_Int,
+    ) -> Result<GlyphBitmap> {
+        if codepoint > 0x10FFFF {
+            return Err(Error::MissingGlyph(codepoint));
+        }
+        let glyph_id = self.glyph_id(codepoint);
+        if glyph_id == 0 {
+            return Err(Error::MissingGlyph(codepoint));
+        }
+        self.rasterize_glyph_with_flags(glyph_id, flags)
+    }
+
     /// Advance of U+0020 at the current size, in 26.6 pixels.
     pub fn space_advance_26_6(&self) -> i32 {
         match self.glyph_metrics(self.space_glyph) {
@@ -524,6 +649,53 @@ fn ceil_div_64(value: i32) -> u32 {
     }
 }
 
+fn convert_26_6(value: i32) -> i32 {
+    if value >= 0 {
+        (value + 63) / 64
+    } else {
+        -((-value + 63) / 64)
+    }
+}
+
+/// Expand one FreeType bitmap row into a tightly packed output row.
+///
+/// # Safety
+///
+/// `src` must point to at least the number of bytes FreeType reports for the
+/// row, and `dst` must be exactly `width * bytes_per_pixel` bytes.
+unsafe fn expand_bitmap_row(src: *const u8, dst: &mut [u8], width: usize, pixel_mode: u8) {
+    match pixel_mode {
+        freetype::FT_PIXEL_MODE_GRAY => {
+            unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), width) };
+        }
+        freetype::FT_PIXEL_MODE_MONO => {
+            for (x, out) in dst.iter_mut().enumerate().take(width) {
+                let byte = unsafe { *src.add(x / 8) };
+                let bit = (byte >> (7 - (x % 8))) & 1;
+                *out = if bit == 0 { 0 } else { 255 };
+            }
+        }
+        freetype::FT_PIXEL_MODE_GRAY2 => {
+            for (x, out) in dst.iter_mut().enumerate().take(width) {
+                let byte = unsafe { *src.add(x / 4) };
+                let shift = 6 - 2 * (x % 4);
+                *out = ((byte >> shift) & 0x3) * 85;
+            }
+        }
+        freetype::FT_PIXEL_MODE_GRAY4 => {
+            for (x, out) in dst.iter_mut().enumerate().take(width) {
+                let byte = unsafe { *src.add(x / 2) };
+                let value = if x % 2 == 0 { byte >> 4 } else { byte & 0xf };
+                *out = value * 17;
+            }
+        }
+        freetype::FT_PIXEL_MODE_BGRA => {
+            unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), width * 4) };
+        }
+        _ => {}
+    }
+}
+
 unsafe fn c_string(ptr: *mut std::ffi::c_char) -> String {
     if ptr.is_null() {
         return String::new();
@@ -531,4 +703,57 @@ unsafe fn c_string(ptr: *mut std::ffi::c_char) -> String {
     unsafe { std::ffi::CStr::from_ptr(ptr) }
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_bitmap_row;
+    use crate::ffi::freetype;
+
+    #[test]
+    fn expands_supported_bitmap_rows() {
+        let mut mono = [0u8; 4];
+        unsafe {
+            expand_bitmap_row(
+                [0b1010_0000].as_ptr(),
+                &mut mono,
+                4,
+                freetype::FT_PIXEL_MODE_MONO,
+            );
+        }
+        assert_eq!(mono, [255, 0, 255, 0]);
+
+        let mut gray2 = [0u8; 4];
+        unsafe {
+            expand_bitmap_row(
+                [0b0001_1011].as_ptr(),
+                &mut gray2,
+                4,
+                freetype::FT_PIXEL_MODE_GRAY2,
+            );
+        }
+        assert_eq!(gray2, [0, 85, 170, 255]);
+
+        let mut gray4 = [0u8; 2];
+        unsafe {
+            expand_bitmap_row(
+                [0x0f].as_ptr(),
+                &mut gray4,
+                2,
+                freetype::FT_PIXEL_MODE_GRAY4,
+            );
+        }
+        assert_eq!(gray4, [0, 255]);
+
+        let mut bgra = [0u8; 8];
+        unsafe {
+            expand_bitmap_row(
+                [1, 2, 3, 4, 5, 6, 7, 8].as_ptr(),
+                &mut bgra,
+                2,
+                freetype::FT_PIXEL_MODE_BGRA,
+            );
+        }
+        assert_eq!(bgra, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
 }

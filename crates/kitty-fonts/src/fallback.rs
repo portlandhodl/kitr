@@ -12,6 +12,7 @@ use crate::discovery::{Fontconfig, MatchedFace};
 use crate::error::{Error, Result};
 use crate::face::Face;
 use crate::family::{FontSpec, FontStyle};
+use crate::raster::{GlyphBitmap, RasterCache};
 use crate::shaping::{ShapeOptions, ShapedRun, ShapedRunCache};
 
 /// One shaped segment, produced because the face changed or a glyph was
@@ -198,6 +199,30 @@ impl FontStack {
             return Ok(None);
         }
         Ok(Some(self.add_face(face)))
+    }
+
+    /// Rasterize a codepoint through the stack, loading a fallback face if
+    /// necessary. Returns the face index and bitmap, or `None` if no face
+    /// covers the codepoint.
+    pub fn rasterize_codepoint(&mut self, codepoint: u32) -> Result<Option<(usize, GlyphBitmap)>> {
+        let Some(face_index) = self.face_index_for_char(codepoint)? else {
+            return Ok(None);
+        };
+        let bitmap = self.faces[face_index].rasterize_codepoint(codepoint)?;
+        Ok(Some((face_index, bitmap)))
+    }
+
+    /// Cached variant of [`FontStack::rasterize_codepoint`].
+    pub fn rasterize_codepoint_cached(
+        &mut self,
+        cache: &mut RasterCache,
+        codepoint: u32,
+    ) -> Result<Option<(usize, GlyphBitmap)>> {
+        let Some(face_index) = self.face_index_for_char(codepoint)? else {
+            return Ok(None);
+        };
+        let bitmap = cache.rasterize_codepoint(&self.faces[face_index], codepoint)?;
+        Ok(Some((face_index, bitmap)))
     }
 
     /// Shape text, splitting at face boundaries. Ligatures cannot span two

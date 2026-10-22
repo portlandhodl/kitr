@@ -182,6 +182,19 @@ pub const FT_LOAD_DEFAULT: c_int = 0;
 pub const FT_LOAD_NO_HINTING: c_int = 1 << 1;
 pub const FT_LOAD_RENDER: c_int = 1 << 2;
 pub const FT_LOAD_COLOR: c_int = 1 << 20;
+
+pub const FT_PIXEL_MODE_NONE: u8 = 0;
+pub const FT_PIXEL_MODE_MONO: u8 = 1;
+pub const FT_PIXEL_MODE_GRAY: u8 = 2;
+pub const FT_PIXEL_MODE_GRAY2: u8 = 3;
+pub const FT_PIXEL_MODE_GRAY4: u8 = 4;
+pub const FT_PIXEL_MODE_LCD: u8 = 5;
+pub const FT_PIXEL_MODE_LCD_V: u8 = 6;
+pub const FT_PIXEL_MODE_BGRA: u8 = 7;
+
+pub const FT_GLYPH_FORMAT_BITMAP: c_uint = 0x6269_7473; // 'bits'
+pub const FT_GLYPH_FORMAT_OUTLINE: c_uint = 0x6f75_746c; // 'outl'
+pub const FT_RENDER_MODE_NORMAL: c_int = 0;
 pub const FT_LOAD_TARGET_LIGHT: c_int = 1 << 16;
 pub const FT_LOAD_TARGET_NORMAL: c_int = 0;
 
@@ -208,6 +221,7 @@ extern "C" {
     pub fn FT_Select_Size(face: FT_Face, strike_index: FT_Int) -> FT_Error;
     pub fn FT_Get_Char_Index(face: FT_Face, charcode: FT_ULong) -> FT_UInt;
     pub fn FT_Load_Glyph(face: FT_Face, glyph_index: FT_UInt, load_flags: FT_Int) -> FT_Error;
+    pub fn FT_Render_Glyph(slot: FT_GlyphSlot, render_mode: c_int) -> FT_Error;
     pub fn FT_Get_Postscript_Name(face: FT_Face) -> *const c_char;
     pub fn FT_Get_Sfnt_Table(face: FT_Face, tag: c_int) -> *mut c_void;
     pub fn FT_MulFix(a: FT_Long, b: FT_Long) -> FT_Long;

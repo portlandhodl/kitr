@@ -1,4 +1,153 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! OpenGL renderer ported from `kitty/gl.c`, `kitty/gl-wrapper.c`,
-//! `kitty/shaders.c`, `kitty/decorations.c`, `kitty/glyph-cache.c` and
-//! related rendering code.
+//! CPU-side renderer core ported from kitty's rendering code.
+//!
+//! The default build is deliberately backend-free. It owns the pieces that can
+//! be built and tested without an OpenGL/EGL context:
+//!
+//! * [`damage`] — dirty-line coalescing, scroll/cursor/full-redraw detection;
+//! * [`colors`] — SGR colour decoding, palette resolution, premultiplication
+//!   and the sRGB/gamma LUT from `shaders/linear2srgb.slang`;
+//! * [`atlas`] — deterministic Gray8/RGBA8 glyph page packing with a
+//!   [`GlyphRasterizer`] bridge to `kitty-fonts`;
+//! * [`instances`] — background/glyph/decoration/cursor instance generation
+//!   from [`kitty_screen::Screen`] cells;
+//! * [`decorations`] — underline/strikethrough masks and geometry, cursor
+//!   geometry, window/tab-bar borders, padding rects and rounded-corner
+//!   tessellation, ported from `kitty/decorations.c`, `kitty/borders.py` and
+//!   `kitty/tab_bar.py`;
+//! * [`RendererCore`] — the persistent object that owns an atlas and damage
+//!   tracker and produces [`Frame`]s.
+//!
+//! # API overview
+//!
+//! ```no_run
+//! use kitty_render::{BasicColorResolver, RendererCore};
+//! use kitty_screen::Screen;
+//!
+//! let screen = Screen::builder(80, 24).scrollback(1000).build().unwrap();
+//! let mut core = RendererCore::default();
+//! let mut rasterizer = |key: &kitty_render::GlyphKey| {
+//!     // A real adapter asks kitty-fonts for the glyph bitmap here.
+//!     kitty_render::GlyphBitmap::gray(8, 12, vec![0; 96]).ok()
+//! };
+//! let resolver = BasicColorResolver::default();
+//! let frame = core.prepare_frame(&screen, &mut rasterizer, &resolver);
+//! for glyph in &frame.glyphs {
+//!     if let Some(sprite) = glyph.sprite {
+//!         // sprite.page, sprite.uv, ...
+//!     }
+//! }
+//! ```
+//!
+//! # Supported
+//!
+//! * Dirty line ranges, full redraws on the first frame/resize/alt-screen/
+//!   scroll, cursor-only damage and explicit invalidation.
+//! * SGR colours (default, indexed, RGB and context-dependent special
+//!   colours), reverse video, dim/blink/style flags.
+//! * Wide cells and multicell continuations, skipped blank cells.
+//! * Block, beam, underline and hollow cursor geometry.
+//! * Straight, double, curly, dotted and dashed underlines plus
+//!   strikethrough, with a separate decoration colour.
+//! * Window borders with compensatory padding and rounded-corner geometry,
+//!   tab-bar blank/margin rectangles, padding rectangles.
+//! * Gray8 and RGBA8 atlas pages with deterministic shelf packing, UVs,
+//!   page-creation/eviction events and duplicate detection.
+//! * Allocation reuse across frames via [`RendererCore::recycle_frame`] or
+//!   [`RendererCore::prepare_frame_into`].
+//!
+//! # OpenGL backend (`gl` feature)
+//!
+//! The optional, default-off `gl` feature adds a headless EGL/OpenGL
+//! implementation of the backend contract:
+//!
+//! * [`egl`] — raw `libEGL`/GL FFI, a surfaceless/pbuffer
+//!   [`GlContext`](egl::GlContext), an `eglGetProcAddress` function table,
+//!   version/extension queries, resize, swap and readback;
+//! * [`gl_shaders`] — embedded GLSL 330 core programs (with a GLES 3.00
+//!   adaptation) for glyph quads, solid backgrounds/decorations/cursors and
+//!   rounded-rectangle SDFs, plus optional gamma conversion;
+//! * [`gl_backend`] — instanced drawing, per-page atlas textures, scissor-based
+//!   damage, premultiplied blending and `read_pixels()`.
+//!
+//! The shaders are a functional subset, not a line-for-line port of
+//! `kitty/shaders/*.slang` (see [`gl_shaders`]).
+//!
+//! ```text
+//! cargo test -p kitty-render                    # CPU only, no EGL linked
+//! cargo test -p kitty-render --features gl      # adds the headless GPU tests
+//! cargo run  -p kitty-render --features gl --example bench_gl
+//! ```
+//!
+//! Headless GPU tests create a surfaceless EGL context and skip at runtime
+//! with a message when EGL or the required GL version is unavailable.
+//!
+//! # Renderer features not supported yet
+//!
+//! * Graphics-protocol images, background images, animations, cursor trails
+//!   and the window logo.
+//! * Selection/hyperlink overlays, marks and URL underlines; the resolver
+//!   traits expose the colours needed to add them later.
+//! * Custom user shaders and the full kitty shader pipeline.
+//! * Ligature/multicell shaping, shaped-run sprite caching and colour glyph
+//!   formats (COLR/CBDT/SVG). [`GlyphRasterizer`] is the insertion point for
+//!   `kitty-fonts` once rasterization exists there.
+//! * Blink animation (the flag is carried but not animated) and font-fallback
+//!   selection plus rendered-glyph disk caching.
+//!
+//! The CPU-only build uses only `std` and contains no `unsafe`; the `gl`
+//! feature is the only place with FFI.
+
+#![cfg_attr(not(feature = "gl"), forbid(unsafe_code))]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod atlas;
+pub mod colors;
+pub mod core;
+pub mod damage;
+pub mod decorations;
+pub mod geom;
+pub mod instances;
+
+#[cfg(feature = "gl")]
+pub mod egl;
+#[cfg(feature = "gl")]
+pub mod gl_backend;
+#[cfg(feature = "gl")]
+pub mod gl_shaders;
+
+pub use atlas::{
+    AtlasConfig, AtlasError, AtlasEvent, AtlasFormat, AtlasInsert, AtlasPage, AtlasStats,
+    GlyphAtlas, GlyphBitmap, GlyphKey, GlyphRasterizer, GlyphSlot, GlyphText, UvRect,
+    MAX_GLYPH_CODEPOINTS,
+};
+pub use colors::{
+    build_gamma_lut, contrast_ratio, decode_color, dimmed_color, encode_indexed, encode_rgb,
+    encode_special, gamma_lut, gamma_lut_lookup, linear_to_srgb, luminance, rgb_u32_to_linear,
+    srgb_to_linear, BasicColorResolver, CellColor, ColorResolver, Rgba8,
+};
+pub use core::RendererCore;
+pub use damage::{coalesce_lines, CursorState, Damage, DamageTracker, FullRedrawReason, LineRange};
+pub use decorations::{
+    add_borders, background_rect, beam_cursor_rect, curly_underline_mask, dashed_underline_mask,
+    dotted_underline_mask, double_underline_geometry, double_underline_mask, hollow_cursor_rects,
+    horizontal_edge, missing_glyph_mask, padding_rects, padding_rects_between, rounded_rect_points,
+    straight_underline_geometry, straight_underline_mask, strikethrough_geometry,
+    strikethrough_mask, strikethrough_rects, tab_bar_blank_rects, tessellate_rounded_rect_border,
+    tessellate_rounded_rect_fill, underline_cursor_rect, underline_mask, underline_rects,
+    vertical_edge, BorderColor, BorderRect, DecorationGeometry, DecorationMask, Edge,
+    TabBarBlankRectConfig, Triangle, UnderlineStyle, Vertex, WindowGeometry,
+};
+pub use geom::{CellMetrics, EdgeWidths, GridGeometry, Rect, Region};
+pub use instances::{
+    BackgroundInstance, CursorGeometry, CursorInstance, DecorationInstance, DecorationKind, Frame,
+    GlyphInstance, InstanceFlags, InstanceGenerator, RenderConfig, GLYPH_FLAG_BOLD,
+    GLYPH_FLAG_COLOR, GLYPH_FLAG_ITALIC,
+};
+
+#[cfg(feature = "gl")]
+pub use egl::{ContextConfig, EglError, GlApi, GlContext, GlError, GlFns, GlVersion};
+#[cfg(feature = "gl")]
+pub use gl_backend::{
+    AtlasSyncStats, FilterMode, GammaMode, GlBackend, GlBackendConfig, GlBackendError, RenderStats,
+};

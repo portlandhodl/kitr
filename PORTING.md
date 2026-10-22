@@ -680,7 +680,7 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `cursor.c` | `kitty-screen/src/cursor.rs` | **ported** (core cursor/SGR/shape; beam/underline rendering pending) |
 | `cursor_trail.c` | `kitty-render/src/cursor_trail.rs` | planned |
 | `data-types.c` | `kitty-remote/src/{base64,binary}.rs` + `kitty-vt/src/constants.rs` (module dissolved) | in progress (base64/base85/binary ported; other exports pending) |
-| `decorations.c` | `kitty-render/src/decorations.rs` | planned |
+| `decorations.c` | `kitty-render/src/decorations.rs` | **ported** (geometry/masks) |
 | `desktop.c` | `kitty-os/src/desktop.rs` | planned |
 | `disk-cache.c` | `kitty-fonts/src/disk_cache.rs` | planned |
 | `dnd.c` | `kitty-input/src/dnd.rs` | planned |
@@ -690,11 +690,11 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `fonts.c` | `kitty-fonts/src/fonts.rs` | in progress (specs, metrics, fallback, shaping; rasterization/atlas pending) |
 | `freetype.c` | `kitty-fonts/src/freetype.rs` | in progress (metrics/glyph lookup; rendering/variable axes pending) |
 | `freetype_render_ui_text.c` | `kitty-fonts/src/ui_text.rs` | planned |
-| `gl.c` | `kitty-render/src/gl.rs` | planned |
+| `gl.c` | `kitty-render/src/{egl,gl_backend}.rs` | in progress (headless EGL/GL 3.3 core backend; window/presentation pending) |
 | `glfw.c` | `kitty-os/src/glfw.rs` | planned |
 | `glfw-wrapper.c` | `kitty-os/src/glfw.rs` | planned |
-| `gl-wrapper.c` | `kitty-render/src/gl.rs` | planned |
-| `glyph-cache.c` | `kitty-render/src/glyph_cache.rs` | planned |
+| `gl-wrapper.c` | `kitty-render/src/egl.rs` | in progress (function loading via eglGetProcAddress) |
+| `glyph-cache.c` | `kitty-render/src/atlas.rs` | in progress (CPU atlas; shaped-run sprites pending) |
 | `graphics.c` | `kitty-graphics/src/graphics.rs` | in progress (protocol parser + image pipeline; Screen/GPU integration pending) |
 | `history.c` | `kitty-core/src/history.rs` | **ported** (core ring; pager/rewrap pending) |
 | `hyperlink.c` | `kitty-screen/src/hyperlink.rs` | planned |
@@ -713,7 +713,7 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `resize.c` | `kitty-screen/src/resize.rs` | planned |
 | `rowcolumn-diacritics.c` | `kitty-vt/src/diacritics.rs` | planned |
 | `screen.c` | `kitty-screen/src/screen.rs` | in progress (draw/cursor/edit/scroll/alt-screen/CSI subset; graphics/resize/mouse/DnD/OSC mutations pending) |
-| `shaders.c` | `kitty-render/src/shaders.rs` | planned |
+| `shaders.c` | `kitty-render/src/gl_shaders.rs` | in progress (functional GLSL subset; kitty Slang programs pending) |
 | `shaped-run-cache.c` | `kitty-fonts/src/shaped_run_cache.rs` | **ported** (bounded cache; cell-group representation pending) |
 | `shlex.c` | `kitty-config/src/shlex.rs` | **ported** |
 | `simd-string.c` | `kitty-simd/src/{lib,scalar,utf8}.rs` | **ported** |

@@ -27,10 +27,10 @@ it is marked **ported** in [PORTING.md](PORTING.md).
 | `kitty-input` | `keys.c`, `key_encoding.c`, `mouse.c` | keyboard, kitty protocol, mouse protocols ported |
 | `kitty-os` | `child.c`, `child-monitor.c`, `loop-utils.c`, `monotonic.c` | Linux PTY/fork/exec, poll loop, SIGCHLD monitor ported |
 | `kitty-config` | `shlex.c`, `state.c`, `config.py`, `options/*` | shlex, typed options, colors, includes and overrides ported; advanced options pending |
-| `kitty-fonts` | `fonts.c`, `freetype.c`, `fontconfig.c`, `font-names.c`, `shaped-run-cache.c` | FreeType/HarfBuzz/Fontconfig FFI, metrics, fallback and shaping; rasterization/cache pending |
+| `kitty-fonts` | `fonts.c`, `freetype.c`, `fontconfig.c`, `font-names.c`, `shaped-run-cache.c` | FreeType/HarfBuzz/Fontconfig FFI, metrics, fallback, shaping, glyph rasterization and cache |
 | `kitty-graphics` | `graphics.c`, `png-reader.c`, `mime-cache.c`, graphics parser | PNG decode, MIME, base64, graphics command parser and image pipeline; Screen/GPU integration pending |
 | `kitty-remote` | `crypto.c`, protocol half of `data-types.c`, `fast-file-copy.c` | X25519/ECDH, AES-256-GCM, base64/base85, DCS framing, file-copy primitives |
-| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | scaffold only |
+| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | CPU core: damage, atlas, instances, decorations; headless EGL/GL backend (`--features gl`, llvmpipe verified); window presentation and full shader parity pending |
 | `kitty-kittens` | `kittens.c`, Python/Go kittens | scaffold only |
 | `kitty` (binary) | `main.py`, launcher | headless PTY terminal (`kitr`); no window/renderer yet |
 

@@ -23,6 +23,13 @@ pub enum Error {
     NoCoverage { codepoint: u32 },
     /// The requested size is not usable for this face.
     InvalidSize,
+    /// FreeType produced a pixel mode that cannot be represented by
+    /// [`crate::GlyphBitmap`].
+    UnsupportedPixelMode(u8),
+    /// FreeType produced a glyph format that is not a bitmap after rendering.
+    UnsupportedGlyphFormat(u32),
+    /// The glyph could not be rasterized safely.
+    Raster(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -43,6 +50,13 @@ impl fmt::Display for Error {
                 write!(f, "no face in the stack covers U+{codepoint:04X}")
             }
             Self::InvalidSize => write!(f, "invalid font size"),
+            Self::UnsupportedPixelMode(mode) => {
+                write!(f, "unsupported FreeType pixel mode: {mode}")
+            }
+            Self::UnsupportedGlyphFormat(format) => {
+                write!(f, "unsupported FreeType glyph format: 0x{format:08x}")
+            }
+            Self::Raster(msg) => write!(f, "rasterization failed: {msg}"),
         }
     }
 }

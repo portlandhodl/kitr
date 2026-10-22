@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use kitty_fonts::{
-    ClusterLevel, Face, Feature, FontSpec, FontStack, FontStyle, Fontconfig, ShapeOptions,
-    ShapedRunCache,
+    ClusterLevel, Error, Face, Feature, FontSpec, FontStack, FontStyle, Fontconfig, GlyphBitmap,
+    PixelFormat, RasterCache, ShapeOptions, ShapedRunCache, RASTER_CACHE_MAX_ENTRIES,
 };
 
 const FIRA: &str = "FiraCode-Medium.otf";
@@ -553,4 +553,270 @@ fn face_descriptor_round_trip() {
     let f2 = d.load(12.0, 96.0, 96.0).unwrap();
     assert_eq!(f2.cell_metrics(), f.cell_metrics());
     assert_eq!(f2.postscript_name(), f.postscript_name());
+}
+
+fn assert_bitmap_integrity(bitmap: &GlyphBitmap) {
+    assert_eq!(
+        bitmap.data.len(),
+        bitmap.pitch * bitmap.height as usize,
+        "data length must be pitch * height"
+    );
+    assert!(
+        bitmap.pitch >= bitmap.width as usize * bitmap.format.bytes_per_pixel(),
+        "stride {} is smaller than {} pixels of {}",
+        bitmap.pitch,
+        bitmap.width,
+        bitmap.format
+    );
+    if !bitmap.is_empty() {
+        assert!(bitmap.pitch > 0);
+        for y in 0..bitmap.height {
+            assert_eq!(bitmap.row(y).unwrap().len(), bitmap.pitch);
+        }
+    }
+}
+
+#[test]
+fn rasterize_ascii_glyph() {
+    let f = face(FIRA);
+    let bitmap = f.rasterize_codepoint('A' as u32).unwrap();
+    assert!(!bitmap.is_empty());
+    assert!(bitmap.width >= 5 && bitmap.height >= 5, "{bitmap:?}");
+    assert_eq!(bitmap.format, PixelFormat::Gray8);
+    assert!(bitmap.advance_x > 0);
+    assert!(bitmap.advance_x_26_6 > 0);
+    assert!(bitmap.top > 0);
+    assert!(
+        bitmap.data.iter().any(|&p| p != 0),
+        "glyph is all transparent"
+    );
+    assert_bitmap_integrity(&bitmap);
+}
+
+#[test]
+fn rasterize_space_is_a_valid_empty_bitmap() {
+    let f = face(FIRA);
+    let bitmap = f.rasterize_codepoint(' ' as u32).unwrap();
+    assert!(bitmap.is_empty());
+    assert_eq!((bitmap.width, bitmap.height, bitmap.pitch), (0, 0, 0));
+    assert!(bitmap.data.is_empty());
+    assert!(bitmap.advance_x > 0);
+    assert_bitmap_integrity(&bitmap);
+}
+
+#[test]
+fn rasterize_codepoint_matches_glyph_id() {
+    let f = face(FIRA);
+    let gid = f.glyph_id('g' as u32);
+    let by_id = f.rasterize_glyph(gid).unwrap();
+    let by_cp = f.rasterize_codepoint('g' as u32).unwrap();
+    assert_eq!(by_id, by_cp);
+    assert!(!by_id.is_empty());
+}
+
+#[test]
+fn rasterize_missing_glyph_returns_an_error() {
+    let f = face(FIRA);
+    assert!(matches!(
+        f.rasterize_codepoint('你' as u32),
+        Err(Error::MissingGlyph(cp)) if cp == '你' as u32
+    ));
+    assert!(matches!(
+        f.rasterize_codepoint(0x1F600),
+        Err(Error::MissingGlyph(0x1F600))
+    ));
+    assert!(matches!(
+        f.rasterize_glyph(u32::MAX),
+        Err(Error::MissingGlyph(_))
+    ));
+}
+
+#[test]
+fn rasterize_at_varying_sizes() {
+    let path = bundled(FIRA);
+    let small = Face::from_path_with_size(&path, 0, 11.0, 96.0, 96.0).unwrap();
+    let large = Face::from_path_with_size(&path, 0, 22.0, 96.0, 96.0).unwrap();
+    let a = small.rasterize_codepoint('A' as u32).unwrap();
+    let b = large.rasterize_codepoint('A' as u32).unwrap();
+    assert_bitmap_integrity(&a);
+    assert_bitmap_integrity(&b);
+    assert!(b.width > a.width, "{a:?} {b:?}");
+    assert!(b.height > a.height, "{a:?} {b:?}");
+    assert!(b.advance_x > a.advance_x);
+}
+
+#[test]
+fn rasterize_bitmap_integrity_across_glyphs() {
+    let f = face(FIRA);
+    for ch in ['W', 'i', '_', '|', '8', 'g'] {
+        let bitmap = f.rasterize_codepoint(ch as u32).unwrap();
+        assert!(!bitmap.is_empty(), "{ch:?}");
+        assert_bitmap_integrity(&bitmap);
+    }
+}
+
+#[test]
+fn rasterize_with_custom_load_flags() {
+    use kitty_fonts::ffi::freetype::{FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_LOAD_RENDER};
+    let f = face(FIRA);
+    let normal = f.rasterize_glyph(f.glyph_id('A' as u32)).unwrap();
+    let unhinted = f
+        .rasterize_glyph_with_flags(
+            f.glyph_id('A' as u32),
+            FT_LOAD_DEFAULT | FT_LOAD_RENDER | FT_LOAD_NO_HINTING,
+        )
+        .unwrap();
+    assert!(!unhinted.is_empty());
+    assert!(unhinted.advance_x > 0);
+    assert_bitmap_integrity(&unhinted);
+    assert!(normal.width > 0 && normal.height > 0);
+}
+
+#[test]
+fn rasterize_cjk_through_font_stack() {
+    let mut stack =
+        FontStack::from_family("Liberation Mono", FontStyle::Regular, 12.0, 96.0).unwrap();
+    match stack.rasterize_codepoint('你' as u32).unwrap() {
+        Some((idx, bitmap)) => {
+            assert!(idx > 0);
+            assert!(!bitmap.is_empty());
+            assert_bitmap_integrity(&bitmap);
+        }
+        None => {
+            // No CJK font is installed; the stack must report that cleanly.
+            assert_eq!(stack.faces().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn rasterize_emoji_from_bundled_color_face() {
+    let f = face(TWEMOJI);
+    assert!(f.has_color());
+    assert!(f.has_codepoint(0x1F601));
+    let bitmap = f.rasterize_codepoint(0x1F601).unwrap();
+    assert_bitmap_integrity(&bitmap);
+    assert!(bitmap.advance_x > 0);
+    // The bundled face is a COLRv1 font. Stock FreeType builds without a
+    // COLRv1 painter report a bitmap format but zero pixels; builds with one
+    // emit BGRA. Both outcomes are valid at this layer.
+    if !bitmap.is_empty() {
+        assert!(matches!(
+            bitmap.format,
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Gray8
+        ));
+    }
+}
+
+#[test]
+fn color_and_bitmap_only_faces_never_panic() {
+    let fc = Fontconfig::new().unwrap();
+    let Some(m) = fc
+        .match_for_codepoint(0x1F600, FontStyle::Regular, true)
+        .unwrap()
+    else {
+        return;
+    };
+    let Ok(f) = m.load(12.0, 96.0, 96.0) else {
+        return;
+    };
+    assert!(f.has_color());
+    match f.rasterize_codepoint(0x1F600) {
+        Ok(bitmap) => {
+            assert_bitmap_integrity(&bitmap);
+            if !bitmap.is_empty() {
+                assert!(matches!(
+                    bitmap.format,
+                    PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Gray8
+                ));
+            }
+        }
+        Err(
+            Error::FreeType { .. }
+            | Error::UnsupportedPixelMode(_)
+            | Error::UnsupportedGlyphFormat(_)
+            | Error::Raster(_),
+        ) => {
+            // Example: a CBDT/PNG color font when FreeType was built without
+            // PNG support. The failure is reported as an error, not a panic.
+        }
+        Err(other) => panic!("unexpected rasterization error: {other}"),
+    }
+}
+
+#[test]
+fn rasterize_font_stack_returns_the_fallback_face_index() {
+    let mut stack = FontStack::new(vec![face(FIRA), face(TWEMOJI)]).without_fontconfig();
+    let (idx, bitmap) = stack.rasterize_codepoint(0x1F601).unwrap().unwrap();
+    assert_eq!(idx, 1);
+    assert_bitmap_integrity(&bitmap);
+    assert!(bitmap.advance_x > 0);
+
+    let (idx, bitmap) = stack.rasterize_codepoint('A' as u32).unwrap().unwrap();
+    assert_eq!(idx, 0);
+    assert!(!bitmap.is_empty());
+
+    assert!(stack.rasterize_codepoint('你' as u32).unwrap().is_none());
+}
+
+#[test]
+fn raster_cache_hits_misses_and_stats() {
+    let f = face(FIRA);
+    let mut cache = RasterCache::new();
+    let a = f.glyph_id('A' as u32);
+    let g = f.glyph_id('g' as u32);
+
+    let first = cache.rasterize(&f, a).unwrap();
+    let second = cache.rasterize(&f, a).unwrap();
+    assert_eq!(first, second);
+    assert_eq!((cache.hits(), cache.misses()), (1, 1));
+    assert_eq!(cache.len(), 1);
+
+    let _ = cache.rasterize(&f, g).unwrap();
+    assert_eq!((cache.hits(), cache.misses()), (1, 2));
+    assert_eq!(cache.len(), 2);
+    assert!(cache.bytes() > 0);
+
+    cache.clear();
+    assert!(cache.is_empty());
+    assert_eq!(cache.bytes(), 0);
+}
+
+#[test]
+fn raster_cache_handles_zero_size_glyphs() {
+    let f = face(FIRA);
+    let mut cache = RasterCache::new();
+    let space = f.glyph_id(' ' as u32);
+    let first = cache.rasterize(&f, space).unwrap();
+    let second = cache.rasterize(&f, space).unwrap();
+    assert!(first.is_empty());
+    assert_eq!(first, second);
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.hits(), 1);
+    assert_eq!(cache.misses(), 1);
+}
+
+#[test]
+fn raster_cache_is_bounded() {
+    let f = face(FIRA);
+    let mut cache = RasterCache::new();
+    for gid in 1..=RASTER_CACHE_MAX_ENTRIES as u32 + 8 {
+        if f.rasterize_glyph(gid).is_ok() {
+            let _ = cache.rasterize(&f, gid);
+        }
+    }
+    assert!(cache.len() <= RASTER_CACHE_MAX_ENTRIES);
+    assert!(cache.bytes() <= kitty_fonts::RASTER_CACHE_MAX_BYTES);
+}
+
+#[test]
+fn raster_cache_codepoint_api() {
+    let f = face(FIRA);
+    let mut cache = RasterCache::new();
+    let bitmap = cache.rasterize_codepoint(&f, 'A' as u32).unwrap();
+    assert!(!bitmap.is_empty());
+    assert!(matches!(
+        cache.rasterize_codepoint(&f, '你' as u32),
+        Err(Error::MissingGlyph(_))
+    ));
 }
