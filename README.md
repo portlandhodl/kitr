@@ -30,10 +30,11 @@ it is marked **ported** in [PORTING.md](PORTING.md).
 | `kitty-config` | `shlex.c`, `state.c`, `config.py`, `options/*` | shlex, typed options, colors, includes and overrides ported; advanced options pending |
 | `kitty-fonts` | `fonts.c`, `freetype.c`, `fontconfig.c`, `font-names.c`, `shaped-run-cache.c` | FreeType/HarfBuzz/Fontconfig FFI, metrics, fallback, shaping, glyph rasterization and cache |
 | `kitty-graphics` | `graphics.c`, `png-reader.c`, `mime-cache.c`, graphics parser | PNG decode, MIME, base64, graphics command parser and image pipeline; Screen/GPU integration pending |
-| `kitty-remote` | `crypto.c`, protocol half of `data-types.c`, `fast-file-copy.c` | X25519/ECDH, AES-256-GCM, base64/base85, DCS framing, file-copy primitives |
-| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | CPU core plus EGL/GL 3.3 backend, damage, atlas, instances, decorations; window presentation wired; full Slang shader parity pending |
+| `kitty-remote` | `crypto.c`, `remote_control.py`, `client.py`, `rc/*` | X25519/ECDH, AES-256-GCM, framing, JSON, Unix-socket server + client, command dispatch, file-copy primitives |
+| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | CPU core plus EGL/GL backend: damage, atlas, instances, decorations, image placements, background images, logo, cursor trail; full Slang shader parity pending |
 | `kitty-kittens` | `kittens.c`, Python/Go kittens | scaffold only |
-| `kitty-window` | GLFW window/event layer | Linux X11 backend: window/events, XKB keys, mouse, clipboard, EGL surface; Wayland/Cocoa pending |
+| `kitty-ui` | `tabs.py`, `window.py`, `layout/*`, `session.py` | tabs/windows/layout/session CPU model |
+| `kitty-window` | GLFW window/event layer | Linux X11 + Wayland (`--features wayland`) backends: window/events, XKB keys, mouse, clipboard, EGL surface, HiDPI; Cocoa/IME/DnD pending |
 | `kitty` (binary) | `main.py`, launcher | headless and X11 GUI terminal (`kitr`), run loop, config, font/render integration |
 
 [PORTING.md](PORTING.md) contains the complete C/Python inventory, the crate
@@ -73,6 +74,10 @@ cargo run --release -p kitty-unicode --example bench
 cargo run --release -p kitty-screen --example bench
 cargo run --release -p kitty-input --example bench
 ```
+
+Packaging includes a `Makefile`, a byte-identical `xterm-kitty` terminfo,
+shell-integration scripts, desktop/AppStream/man pages, a screenshot parity
+harness and CI. See [packaging/README.md](packaging/README.md).
 
 See [BENCHMARKS.md](BENCHMARKS.md) for measured C-vs-Rust numbers and the
 methodology. The C sources are not included in this repository. Ported files carry an SPDX

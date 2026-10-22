@@ -19,6 +19,7 @@ use crate::types::{
     keysym, KeyAction, KeyInput, ModifierMasks, Modifiers, MouseButton, PointerShape, Selection,
     WindowConfig, WindowError, WindowEvent,
 };
+use crate::wakeup::{WakeupHandle, WakeupPipe};
 
 // {{{ Raw Xlib declarations
 
@@ -666,81 +667,6 @@ unsafe fn get_property(
     Some((actual_type, actual_format, data))
 }
 
-struct WakeupPipe {
-    read_fd: c_int,
-    write_fd: c_int,
-}
-
-impl WakeupPipe {
-    fn new() -> Result<Self, WindowError> {
-        let mut fds = [0 as c_int; 2];
-        if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(xerr("failed to create wakeup pipe"));
-        }
-        for fd in fds {
-            let flags = unsafe { fcntl(fd, F_GETFL) };
-            if flags >= 0 {
-                unsafe {
-                    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-                }
-            }
-        }
-        Ok(Self {
-            read_fd: fds[0],
-            write_fd: fds[1],
-        })
-    }
-
-    fn wake(&self) {
-        let byte = 1u8;
-        loop {
-            let written = unsafe { write(self.write_fd, (&byte as *const u8).cast(), 1) };
-            if written >= 0 {
-                break;
-            }
-            if errno() != EINTR {
-                break;
-            }
-        }
-    }
-
-    /// Drain all pending wakeup bytes. Returns true if any were present.
-    fn drain(&self) -> bool {
-        let mut buf = [0u8; 128];
-        let mut any = false;
-        loop {
-            let read_count = unsafe { read(self.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if read_count > 0 {
-                any = true;
-            } else {
-                break;
-            }
-        }
-        any
-    }
-}
-
-impl Drop for WakeupPipe {
-    fn drop(&mut self) {
-        unsafe {
-            close(self.read_fd);
-            close(self.write_fd);
-        }
-    }
-}
-
-/// Cloneable handle that lets another thread wake a blocked event loop.
-#[derive(Clone)]
-pub struct WakeupHandle {
-    pipe: Arc<WakeupPipe>,
-}
-
-impl WakeupHandle {
-    pub fn wakeup(&self) {
-        self.pipe.wake();
-    }
-}
-
 // }}}
 // {{{ Window state
 
@@ -1374,9 +1300,7 @@ impl X11Window {
     // {{{ Event pump
 
     pub fn wakeup_handle(&self) -> WakeupHandle {
-        WakeupHandle {
-            pipe: Arc::clone(&self.wakeup),
-        }
+        WakeupHandle::from_pipe(Arc::clone(&self.wakeup))
     }
 
     pub fn wakeup(&self) {
@@ -1432,7 +1356,7 @@ impl X11Window {
                     revents: 0,
                 },
                 PollFd {
-                    fd: self.wakeup.read_fd,
+                    fd: self.wakeup.read_fd(),
                     events: POLLIN,
                     revents: 0,
                 },

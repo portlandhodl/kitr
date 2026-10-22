@@ -38,6 +38,13 @@
 //! `Frame::atlas_events` are uploaded, plus pages that are referenced by a
 //! glyph but have no GPU texture yet. Textures are reused across frames.
 //!
+//! Image data lives in [`Frame::image_uploads`]; call
+//! [`sync_images`](GlBackend::sync_images) (also done by
+//! [`render_with_atlas`](GlBackend::render_with_atlas)) to upload and evict
+//! them. Textures are keyed by [`ImageKey`]; content fingerprints avoid
+//! needless uploads, and textures no longer referenced by the frame are
+//! deleted. This is what makes graphics-protocol deletes visible on the GPU.
+//!
 //! # Damage
 //!
 //! A full redraw clears the whole viewport. A partial frame sets the scissor
@@ -48,8 +55,10 @@
 //!
 //! # Supported subset
 //!
-//! * Instanced background, glyph, decoration and cursor quads;
+//! * Instanced background, glyph, image, decoration, cursor and trail quads;
 //! * Gray8 atlas pages (`GL_R8`) and RGBA8 pages (`GL_RGBA8`);
+//! * RGBA8 image textures keyed by [`ImageKey`], with nearest/linear filtering
+//!   and clamp/repeat/mirrored-repeat wrapping for background layouts;
 //! * nearest or linear atlas filtering;
 //! * premultiplied alpha blending;
 //! * scissor-based damage, viewport, clear, offscreen `glReadPixels`;
@@ -57,13 +66,15 @@
 //!
 //! # Not supported yet
 //!
-//! Graphics-protocol images, background images, animations, cursor trails,
-//! window logos, selection/hyperlink overlays, custom user shaders, shaped-run
-//! sprite caches and multi-format colour glyphs (COLR/CBDT/SVG). Blink and
-//! strikethrough style flags are carried by the CPU instances but blinking is
-//! not animated here; dim is implemented as a 50% alpha reduction.
+//! Image animation/composition and placeholder expansion, transforms beyond
+//! source-rectangle scaling, per-window background image lists, the full
+//! cursor-trail corner animation, selection/hyperlink overlays, custom user
+//! shaders, shaped-run sprite caches and multi-format colour glyphs
+//! (COLR/CBDT/SVG). Blink and strikethrough style flags are carried by the CPU
+//! instances but blinking is not animated here; dim is implemented as a 50%
+//! alpha reduction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
 use std::fmt;
 use std::mem::size_of;
@@ -82,6 +93,7 @@ use crate::egl::{
 };
 use crate::geom::Rect;
 use crate::gl_shaders;
+use crate::images::{ImageFilter, ImageKey, ImageWrap};
 use crate::instances::{CursorGeometry, Frame, RenderConfig};
 
 /// Texture filtering for atlas pages.
@@ -98,6 +110,23 @@ impl FilterMode {
             Self::Nearest => GL_NEAREST,
             Self::Linear => GL_LINEAR,
         }
+    }
+}
+
+#[inline]
+const fn image_filter_gl(filter: ImageFilter) -> u32 {
+    match filter {
+        ImageFilter::Nearest => GL_NEAREST,
+        ImageFilter::Linear => GL_LINEAR,
+    }
+}
+
+#[inline]
+const fn image_wrap_gl(wrap: ImageWrap) -> u32 {
+    match wrap {
+        ImageWrap::Clamp => GL_CLAMP_TO_EDGE,
+        ImageWrap::Repeat => GL_REPEAT,
+        ImageWrap::MirroredRepeat => GL_MIRRORED_REPEAT,
     }
 }
 
@@ -169,6 +198,18 @@ pub struct RenderStats {
     pub scissor_rects: usize,
     pub glyphs_skipped: usize,
     pub cursor_instances: usize,
+    /// Protocol image placements considered this frame.
+    pub images: usize,
+    /// Image quads actually drawn (texture available).
+    pub images_drawn: usize,
+    /// Image quads skipped because their texture was missing.
+    pub images_skipped: usize,
+    /// Whether the background image was drawn.
+    pub background_image_drawn: bool,
+    /// Whether the window logo was drawn.
+    pub logo_drawn: bool,
+    /// Cursor-trail quads drawn.
+    pub trail_instances: usize,
 }
 
 /// Statistics from one [`GlBackend::sync_atlas`] call.
@@ -177,6 +218,19 @@ pub struct AtlasSyncStats {
     pub pages_created: usize,
     pub pages_uploaded: usize,
     pub pages_removed: usize,
+}
+
+/// Statistics from one [`GlBackend::sync_images`] call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageSyncStats {
+    /// New GPU textures created.
+    pub created: usize,
+    /// Existing textures refreshed with new pixels.
+    pub updated: usize,
+    /// Textures deleted because they are no longer referenced.
+    pub removed: usize,
+    /// Uploads that were already current and skipped.
+    pub unchanged: usize,
 }
 
 /// Errors produced by the OpenGL backend.
@@ -249,10 +303,15 @@ struct QuadInstance {
 
 const QUAD_INSTANCE_STRIDE: i32 = size_of::<QuadInstance>() as i32;
 
+// Not exported by `egl.rs` because the atlas only uses clamp-to-edge.
+const GL_REPEAT: u32 = 0x2901;
+const GL_MIRRORED_REPEAT: u32 = 0x8370;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchKind {
     Solid,
     Glyph { page: u32, is_color: bool },
+    Image(ImageKey),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -271,6 +330,16 @@ struct AtlasTexture {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct CachedImage {
+    texture: u32,
+    width: u32,
+    height: u32,
+    filter: ImageFilter,
+    wrap: ImageWrap,
+    fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ScissorRect {
     x: i32,
     y: i32,
@@ -282,12 +351,16 @@ struct Programs {
     gl: GlFns,
     glyph: u32,
     solid: u32,
+    image: u32,
     glyph_viewport: i32,
     glyph_atlas: i32,
     glyph_is_color: i32,
     glyph_gamma: i32,
     solid_viewport: i32,
     solid_gamma: i32,
+    image_viewport: i32,
+    image_texture: i32,
+    image_gamma: i32,
 }
 
 impl Programs {
@@ -342,16 +415,59 @@ impl Programs {
             }
         };
 
+        let image_sources = gl_shaders::image_sources(api);
+        let image_vs =
+            match compile_shader(gl, GL_VERTEX_SHADER, "image vertex", &image_sources.vertex) {
+                Ok(id) => id,
+                Err(error) => {
+                    unsafe {
+                        (gl.glDeleteProgram)(glyph);
+                        (gl.glDeleteProgram)(solid);
+                    }
+                    return Err(error);
+                }
+            };
+        let image_fs = match compile_shader(
+            gl,
+            GL_FRAGMENT_SHADER,
+            "image fragment",
+            &image_sources.fragment,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                unsafe {
+                    (gl.glDeleteShader)(image_vs);
+                    (gl.glDeleteProgram)(glyph);
+                    (gl.glDeleteProgram)(solid);
+                }
+                return Err(error);
+            }
+        };
+        let image = match link_program(gl, image_vs, image_fs, "image") {
+            Ok(id) => id,
+            Err(error) => {
+                unsafe {
+                    (gl.glDeleteProgram)(glyph);
+                    (gl.glDeleteProgram)(solid);
+                }
+                return Err(error);
+            }
+        };
+
         Ok(Self {
             gl: *gl,
             glyph,
             solid,
+            image,
             glyph_viewport: uniform_location(gl, glyph, "u_viewport"),
             glyph_atlas: uniform_location(gl, glyph, "u_atlas"),
             glyph_is_color: uniform_location(gl, glyph, "u_is_color"),
             glyph_gamma: uniform_location(gl, glyph, "u_gamma"),
             solid_viewport: uniform_location(gl, solid, "u_viewport"),
             solid_gamma: uniform_location(gl, solid, "u_gamma"),
+            image_viewport: uniform_location(gl, image, "u_viewport"),
+            image_texture: uniform_location(gl, image, "u_image"),
+            image_gamma: uniform_location(gl, image, "u_gamma"),
         })
     }
 
@@ -366,6 +482,10 @@ impl Programs {
             if self.solid != 0 {
                 (self.gl.glDeleteProgram)(self.solid);
                 self.solid = 0;
+            }
+            if self.image != 0 {
+                (self.gl.glDeleteProgram)(self.image);
+                self.image = 0;
             }
         }
     }
@@ -588,6 +708,7 @@ pub struct GlBackend {
     draw_calls: Vec<DrawCall>,
     glyph_order: Vec<(u32, usize)>,
     atlas_pages: HashMap<u32, AtlasTexture>,
+    image_textures: HashMap<ImageKey, CachedImage>,
     width: u32,
     height: u32,
     last_stats: RenderStats,
@@ -690,6 +811,7 @@ impl GlBackend {
             draw_calls: Vec::new(),
             glyph_order: Vec::new(),
             atlas_pages: HashMap::new(),
+            image_textures: HashMap::new(),
             width,
             height,
             last_stats: RenderStats::default(),
@@ -764,6 +886,18 @@ impl GlBackend {
     #[inline]
     pub fn atlas_texture_count(&self) -> usize {
         self.atlas_pages.len()
+    }
+
+    /// Number of live GPU image textures (protocol, background and logo).
+    #[inline]
+    pub fn image_texture_count(&self) -> usize {
+        self.image_textures.len()
+    }
+
+    /// Whether a texture for `key` is currently resident.
+    #[inline]
+    pub fn has_image_texture(&self, key: ImageKey) -> bool {
+        self.image_textures.contains_key(&key)
     }
 
     /// Resize the owned pbuffer (if any) and keep the GPU resources.
@@ -983,6 +1117,155 @@ impl GlBackend {
         Ok(stats)
     }
 
+    /// Upload image textures referenced by `frame` and delete unreferenced
+    /// ones.
+    ///
+    /// Textures are keyed by [`ImageKey`]. Uploads whose content fingerprint,
+    /// dimensions, filter and wrap mode are unchanged are skipped. A texture
+    /// that is no longer referenced by the frame (after a graphics-protocol
+    /// delete, or after clearing the background/logo) is removed, which is how
+    /// `a=d` becomes visible to the GPU.
+    pub fn sync_images(&mut self, frame: &Frame) -> Result<ImageSyncStats, GlBackendError> {
+        self.ensure_current()?;
+        let mut stats = ImageSyncStats::default();
+
+        let mut live: HashSet<ImageKey> = frame.image_uploads.iter().map(|u| u.key).collect();
+        for image in &frame.images {
+            live.insert(image.key);
+        }
+        if let Some(background) = &frame.background_image {
+            live.insert(background.key);
+        }
+        if let Some(logo) = &frame.logo {
+            live.insert(logo.key);
+        }
+        let stale: Vec<ImageKey> = self
+            .image_textures
+            .keys()
+            .copied()
+            .filter(|key| !live.contains(key))
+            .collect();
+        for key in stale {
+            if let Some(cached) = self.image_textures.remove(&key) {
+                // SAFETY: the texture is owned by this backend.
+                unsafe { (self.gl.glDeleteTextures)(1, &cached.texture) };
+                stats.removed += 1;
+            }
+        }
+
+        if frame.image_uploads.is_empty() {
+            return Ok(stats);
+        }
+
+        // SAFETY: a context is current; upload data outlives each call.
+        unsafe {
+            (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+        }
+        for upload in &frame.image_uploads {
+            if !upload.is_valid() {
+                continue;
+            }
+            let current = self.image_textures.get(&upload.key).copied();
+            let recreate = current.is_none_or(|cached| {
+                cached.width != upload.width
+                    || cached.height != upload.height
+                    || cached.filter != upload.filter
+                    || cached.wrap != upload.wrap
+            });
+            if recreate {
+                if let Some(old) = self.image_textures.remove(&upload.key) {
+                    // SAFETY: the texture is owned by this backend.
+                    unsafe { (self.gl.glDeleteTextures)(1, &old.texture) };
+                }
+                let mut texture = 0u32;
+                // SAFETY: a context is current.
+                unsafe {
+                    (self.gl.glGenTextures)(1, &mut texture);
+                }
+                if texture == 0 {
+                    return Err(GlError {
+                        code: 1,
+                        operation: "glGenTextures",
+                    }
+                    .into());
+                }
+                // SAFETY: the newly created texture is bound before any use.
+                unsafe {
+                    (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                    let filter = image_filter_gl(upload.filter) as i32;
+                    (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+                    (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                    (self.gl.glTexParameteri)(
+                        GL_TEXTURE_2D,
+                        GL_TEXTURE_WRAP_S,
+                        image_wrap_gl(upload.wrap) as i32,
+                    );
+                    (self.gl.glTexParameteri)(
+                        GL_TEXTURE_2D,
+                        GL_TEXTURE_WRAP_T,
+                        image_wrap_gl(upload.wrap) as i32,
+                    );
+                    (self.gl.glTexImage2D)(
+                        GL_TEXTURE_2D,
+                        0,
+                        GL_RGBA8 as i32,
+                        upload.width as i32,
+                        upload.height as i32,
+                        0,
+                        GL_RGBA,
+                        GL_UNSIGNED_BYTE,
+                        upload.data.as_ptr() as *const c_void,
+                    );
+                }
+                self.image_textures.insert(
+                    upload.key,
+                    CachedImage {
+                        texture,
+                        width: upload.width,
+                        height: upload.height,
+                        filter: upload.filter,
+                        wrap: upload.wrap,
+                        fingerprint: upload.fingerprint,
+                    },
+                );
+                stats.created += 1;
+            } else {
+                let Some(cached) = self.image_textures.get_mut(&upload.key) else {
+                    continue;
+                };
+                if cached.fingerprint == upload.fingerprint {
+                    stats.unchanged += 1;
+                    continue;
+                }
+                // SAFETY: the texture and upload data are valid for this call.
+                unsafe {
+                    (self.gl.glBindTexture)(GL_TEXTURE_2D, cached.texture);
+                    (self.gl.glTexSubImage2D)(
+                        GL_TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        upload.width as i32,
+                        upload.height as i32,
+                        GL_RGBA,
+                        GL_UNSIGNED_BYTE,
+                        upload.data.as_ptr() as *const c_void,
+                    );
+                }
+                cached.fingerprint = upload.fingerprint;
+                stats.updated += 1;
+            }
+        }
+        // SAFETY: restoring conventional state.
+        unsafe {
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
+        }
+        self.gl.check("image upload")?;
+        Ok(stats)
+    }
+
     /// Upload `atlas` changes and draw `frame` (convenience wrapper).
     pub fn render_with_atlas(
         &mut self,
@@ -991,6 +1274,7 @@ impl GlBackend {
         atlas: &GlyphAtlas,
     ) -> Result<RenderStats, GlBackendError> {
         self.sync_atlas(atlas, frame)?;
+        self.sync_images(frame)?;
         self.render(frame, config)
     }
 
@@ -1111,10 +1395,106 @@ impl GlBackend {
         self.push_quad(rect, [0.0; 4], color, [radius, 0.0, 0.0, 0.0]);
     }
 
+    fn push_images(&mut self, images: &[crate::images::ImageInstance], stats: &mut RenderStats) {
+        let mut index = 0usize;
+        while index < images.len() {
+            let key = images[index].key;
+            if !self.image_textures.contains_key(&key) {
+                while index < images.len() && images[index].key == key {
+                    stats.images_skipped += 1;
+                    index += 1;
+                }
+                continue;
+            }
+            let start = self.instances.len();
+            while index < images.len() && images[index].key == key {
+                let image = &images[index];
+                let color = self.storage_color(image.color);
+                self.push_quad(
+                    image.rect,
+                    [image.uv.u0, image.uv.v0, image.uv.u1, image.uv.v1],
+                    [color[0], color[1], color[2], 1.0],
+                    [image.tint, image.opacity, 0.0, 0.0],
+                );
+                stats.images_drawn += 1;
+                index += 1;
+            }
+            if self.instances.len() > start {
+                self.draw_calls.push(DrawCall {
+                    kind: BatchKind::Image(key),
+                    first: start as i32,
+                    count: (self.instances.len() - start) as i32,
+                });
+            }
+        }
+    }
+
+    fn push_image_layer(
+        &mut self,
+        images: &[crate::images::ImageInstance],
+        layer: crate::images::ImageLayer,
+        stats: &mut RenderStats,
+    ) {
+        let mut index = 0usize;
+        while index < images.len() {
+            if images[index].layer != layer {
+                index += 1;
+                continue;
+            }
+            let key = images[index].key;
+            let missing = !self.image_textures.contains_key(&key);
+            let start = self.instances.len();
+            while index < images.len() && images[index].layer == layer && images[index].key == key {
+                if missing {
+                    stats.images_skipped += 1;
+                } else {
+                    let image = &images[index];
+                    let color = self.storage_color(image.color);
+                    self.push_quad(
+                        image.rect,
+                        [image.uv.u0, image.uv.v0, image.uv.u1, image.uv.v1],
+                        [color[0], color[1], color[2], 1.0],
+                        [image.tint, image.opacity, 0.0, 0.0],
+                    );
+                    stats.images_drawn += 1;
+                }
+                index += 1;
+            }
+            if !missing && self.instances.len() > start {
+                self.draw_calls.push(DrawCall {
+                    kind: BatchKind::Image(key),
+                    first: start as i32,
+                    count: (self.instances.len() - start) as i32,
+                });
+            }
+        }
+    }
+
     fn build_instances(&mut self, frame: &Frame, stats: &mut RenderStats) {
-        // Backgrounds.
+        stats.images = frame.images.len();
+
+        // The background image is the bottom-most layer. When one is present,
+        // default-background cell quads are skipped so the image remains
+        // visible behind text; explicitly coloured cells still draw on top.
+        if let Some(background) = &frame.background_image {
+            if self.image_textures.contains_key(&background.key) {
+                stats.background_image_drawn = true;
+                self.push_images(std::slice::from_ref(background), stats);
+            }
+        }
+
+        self.push_image_layer(
+            &frame.images,
+            crate::images::ImageLayer::BelowBackground,
+            stats,
+        );
+
+        // Cell backgrounds.
         let start = self.instances.len();
         for background in &frame.backgrounds {
+            if frame.background_image.is_some() && background.is_default_bg {
+                continue;
+            }
             let color = self.instance_color(background.color, background.flags.dim);
             self.push_solid(background.rect, color, 0.0);
         }
@@ -1125,6 +1505,16 @@ impl GlBackend {
                 count: (self.instances.len() - start) as i32,
             });
         }
+
+        // Window logo sits between the background and the text.
+        if let Some(logo) = &frame.logo {
+            if self.image_textures.contains_key(&logo.key) {
+                stats.logo_drawn = true;
+                self.push_images(std::slice::from_ref(logo), stats);
+            }
+        }
+
+        self.push_image_layer(&frame.images, crate::images::ImageLayer::BelowText, stats);
 
         // Glyphs, grouped by atlas page so each page is bound once.
         for (index, glyph) in frame.glyphs.iter().enumerate() {
@@ -1176,6 +1566,24 @@ impl GlBackend {
         for decoration in &frame.decorations {
             let color = self.instance_color(decoration.color, decoration.flags.dim);
             self.push_solid(decoration.rect, color, 0.0);
+        }
+        if self.instances.len() > start {
+            self.draw_calls.push(DrawCall {
+                kind: BatchKind::Solid,
+                first: start as i32,
+                count: (self.instances.len() - start) as i32,
+            });
+        }
+
+        self.push_image_layer(&frame.images, crate::images::ImageLayer::AboveText, stats);
+
+        // Cursor trail, then the cursor itself so the cursor always wins.
+        let start = self.instances.len();
+        for trail in &frame.trail {
+            let mut color = self.storage_color(trail.color);
+            color[3] *= trail.opacity.clamp(0.0, 1.0);
+            self.push_quad(trail.rect, [0.0; 4], color, [0.0; 4]);
+            stats.trail_instances += 1;
         }
         if self.instances.len() > start {
             self.draw_calls.push(DrawCall {
@@ -1320,6 +1728,22 @@ impl GlBackend {
                                 .unwrap_or(0);
                             (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
                         }
+                        BatchKind::Image(key) => {
+                            (self.gl.glUseProgram)(self.programs.image);
+                            (self.gl.glUniform2f)(
+                                self.programs.image_viewport,
+                                viewport[0],
+                                viewport[1],
+                            );
+                            (self.gl.glUniform1i)(self.programs.image_texture, 0);
+                            (self.gl.glUniform1i)(self.programs.image_gamma, gamma);
+                            let texture = self
+                                .image_textures
+                                .get(&key)
+                                .map(|cached| cached.texture)
+                                .unwrap_or(0);
+                            (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                        }
                     }
                     (self.gl.glDrawArraysInstanced)(GL_TRIANGLE_STRIP, 0, 4, call.count);
                     stats.draw_calls += 1;
@@ -1417,6 +1841,9 @@ impl Drop for GlBackend {
             for (_, texture) in self.atlas_pages.drain() {
                 (self.gl.glDeleteTextures)(1, &texture.texture);
             }
+            for (_, cached) in self.image_textures.drain() {
+                (self.gl.glDeleteTextures)(1, &cached.texture);
+            }
         }
         let _ = self.gl.check("teardown");
         self.programs.destroy();
@@ -1431,6 +1858,7 @@ impl fmt::Debug for GlBackend {
             .field("gl_version", &self.gl_version_string())
             .field("renderer", &self.renderer())
             .field("atlas_textures", &self.atlas_texture_count())
+            .field("image_textures", &self.image_texture_count())
             .field("stats", &self.last_stats)
             .finish_non_exhaustive()
     }

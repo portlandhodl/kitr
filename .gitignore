@@ -1,1 +1,4 @@
 /target
+/build
+/artifacts
+__pycache__/

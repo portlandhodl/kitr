@@ -7,3 +7,7 @@ license.workspace = true
 description = "Remote control crypto, framing and file copy ported from kitty"
 
 [dependencies]
+
+[[bench]]
+name = "remote"
+harness = false

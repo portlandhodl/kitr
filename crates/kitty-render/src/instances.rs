@@ -23,6 +23,10 @@ use crate::colors::{ColorResolver, Rgba8};
 use crate::damage::Damage;
 use crate::decorations::{self, UnderlineStyle};
 use crate::geom::{CellMetrics, GridGeometry, Rect};
+use crate::images::{
+    self, BackgroundImageConfig, ImageFilter, ImageInstance, ImageUpload, WindowLogoConfig,
+};
+use crate::trail::{CursorTrailConfig, TrailInstance};
 
 /// Style flags attached to each instance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -179,6 +183,18 @@ pub struct RenderConfig {
     /// Emit a background quad even for blank cells with the default
     /// background. Normally only the clear colour handles those.
     pub emit_default_backgrounds: bool,
+    /// Drawable size in pixels used for background images and the window logo.
+    /// Zero means "use the grid extent plus its origin".
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+    /// Filtering used for graphics-protocol placements.
+    pub image_filter: ImageFilter,
+    /// Optional background image.
+    pub background_image: Option<BackgroundImageConfig>,
+    /// Optional window logo.
+    pub window_logo: Option<WindowLogoConfig>,
+    /// Cursor trail settings.
+    pub cursor_trail: CursorTrailConfig,
 }
 
 impl Default for RenderConfig {
@@ -193,6 +209,12 @@ impl Default for RenderConfig {
             cursor_hollow_thickness: 1.0,
             undercurl_style: 0,
             emit_default_backgrounds: false,
+            viewport_width: 0.0,
+            viewport_height: 0.0,
+            image_filter: ImageFilter::Nearest,
+            background_image: None,
+            window_logo: None,
+            cursor_trail: CursorTrailConfig::default(),
         }
     }
 }
@@ -208,6 +230,22 @@ impl RenderConfig {
         GridGeometry::new(screen.columns, screen.lines, self.metrics)
             .with_origin(self.origin_x, self.origin_y)
     }
+
+    /// Drawable size used for background images and logos.
+    #[inline]
+    pub fn viewport_for(&self, grid: &GridGeometry) -> (f32, f32) {
+        let width = if self.viewport_width > 0.0 {
+            self.viewport_width
+        } else {
+            grid.origin_x + grid.width_px()
+        };
+        let height = if self.viewport_height > 0.0 {
+            self.viewport_height
+        } else {
+            grid.origin_y + grid.height_px()
+        };
+        (width.max(0.0), height.max(0.0))
+    }
 }
 
 /// All instances for one frame.
@@ -221,6 +259,16 @@ pub struct Frame {
     pub glyphs: Vec<GlyphInstance>,
     pub decorations: Vec<DecorationInstance>,
     pub cursors: Vec<CursorInstance>,
+    /// Graphics-protocol image placements, sorted by z-index draw order.
+    pub images: Vec<ImageInstance>,
+    /// Texture data for images referenced by this frame.
+    pub image_uploads: Vec<ImageUpload>,
+    /// Optional background image quad (also present in `image_uploads`).
+    pub background_image: Option<ImageInstance>,
+    /// Optional window logo quad (also present in `image_uploads`).
+    pub logo: Option<ImageInstance>,
+    /// Fading cursor-trail quads, oldest first.
+    pub trail: Vec<TrailInstance>,
     /// Glyphs that were rasterized and inserted into the atlas this frame.
     /// A backend uses these slots to upload just the newly touched pages.
     pub atlas_updates: Vec<GlyphSlot>,
@@ -235,13 +283,25 @@ impl Frame {
         self.glyphs.clear();
         self.decorations.clear();
         self.cursors.clear();
+        self.images.clear();
+        self.image_uploads.clear();
+        self.background_image = None;
+        self.logo = None;
+        self.trail.clear();
         self.atlas_updates.clear();
         self.atlas_events.clear();
     }
 
     /// Total number of instances in the frame.
     pub fn instance_count(&self) -> usize {
-        self.backgrounds.len() + self.glyphs.len() + self.decorations.len() + self.cursors.len()
+        self.backgrounds.len()
+            + self.glyphs.len()
+            + self.decorations.len()
+            + self.cursors.len()
+            + self.images.len()
+            + usize::from(self.background_image.is_some())
+            + usize::from(self.logo.is_some())
+            + self.trail.len()
     }
 }
 
@@ -434,6 +494,34 @@ impl InstanceGenerator {
                         flags,
                     });
                 }
+            }
+        }
+        drop(tc);
+
+        let (viewport_width, viewport_height) = self.config.viewport_for(&frame.geometry);
+        images::collect_protocol_images(
+            screen,
+            &frame.geometry,
+            viewport_width,
+            viewport_height,
+            self.config.image_filter,
+            &mut frame.images,
+            &mut frame.image_uploads,
+        );
+        if let Some(config) = &self.config.background_image {
+            if let Some((instance, upload)) =
+                images::background_image(config, viewport_width, viewport_height, default_bg)
+            {
+                frame.background_image = Some(instance);
+                frame.image_uploads.push(upload);
+            }
+        }
+        if let Some(config) = &self.config.window_logo {
+            if let Some((instance, upload)) =
+                images::window_logo(config, viewport_width, viewport_height)
+            {
+                frame.logo = Some(instance);
+                frame.image_uploads.push(upload);
             }
         }
     }
@@ -656,5 +744,93 @@ mod tests {
         gen.generate(&s, &mut atlas, &mut r, &res, &mut frame);
         assert_eq!(atlas.len(), 1);
         assert_eq!(frame.glyphs.capacity(), cap);
+    }
+    #[test]
+    fn protocol_placements_and_media_layers() {
+        use kitty_graphics::parse_raw;
+
+        let mut s = screen(10, 5);
+        let mut image = parse_raw(b"a=t,f=32,s=2,v=2,i=7").unwrap();
+        image.payload = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        s.handle_graphics_command(image).unwrap();
+        let mut put = parse_raw(b"a=p,i=7,p=3,c=2,r=1,x=1,y=2,z=-1").unwrap();
+        put.payload.clear();
+        s.handle_graphics_command(put).unwrap();
+
+        let bg = crate::images::BackgroundImageConfig {
+            asset: crate::images::ImageAsset::from_rgba(1, 1, vec![9, 8, 7, 255]).unwrap(),
+            layout: crate::images::BackgroundLayout::Scaled,
+            opacity: 0.75,
+            tint: 0.25,
+            linear: false,
+        };
+        let logo = crate::images::WindowLogoConfig {
+            asset: crate::images::ImageAsset::from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap(),
+            position: crate::images::LogoPosition::TopLeft,
+            alpha: 0.5,
+            scale_x: 0.0,
+            scale_y: 0.0,
+            linear: true,
+        };
+        let config = RenderConfig {
+            viewport_width: 100.0,
+            viewport_height: 60.0,
+            background_image: Some(bg),
+            window_logo: Some(logo),
+            ..RenderConfig::default()
+        };
+        let mut atlas = GlyphAtlas::new(AtlasConfig::default());
+        let mut r = rasterizer();
+        let res = resolver();
+        let mut frame = Frame::default();
+        InstanceGenerator::new(config).generate(&s, &mut atlas, &mut r, &res, &mut frame);
+
+        assert_eq!(frame.images.len(), 1);
+        let image = frame.images[0];
+        assert_eq!(image.key, crate::images::ImageKey::Protocol(7));
+        assert_eq!(image.rect, Rect::new(1.0, 2.0, 20.0, 20.0));
+        assert_eq!(image.layer, crate::images::ImageLayer::BelowText);
+        assert_eq!(image.z_index, -1);
+        assert_eq!(image.uv.u1, 1.0);
+
+        let background = frame.background_image.expect("background image");
+        assert_eq!(background.rect, Rect::new(0.0, 0.0, 100.0, 60.0));
+        assert_eq!(background.key, crate::images::ImageKey::Background(0));
+        assert_eq!(background.tint, 0.25);
+        assert_eq!(background.opacity, 0.75);
+        assert!(frame.logo.is_some());
+        assert_eq!(
+            frame
+                .image_uploads
+                .iter()
+                .map(|u| u.key)
+                .collect::<Vec<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn protocol_placement_preserves_aspect_ratio() {
+        use kitty_graphics::parse_raw;
+
+        let mut s = screen(10, 5);
+        let mut image = parse_raw(b"a=t,f=32,s=4,v=2,i=4").unwrap();
+        image.payload = vec![0; 4 * 2 * 4];
+        s.handle_graphics_command(image).unwrap();
+        let mut put = parse_raw(b"a=p,i=4,p=1,c=2").unwrap();
+        put.payload.clear();
+        s.handle_graphics_command(put).unwrap();
+
+        let mut atlas = GlyphAtlas::new(AtlasConfig::default());
+        let mut r = rasterizer();
+        let res = resolver();
+        let mut frame = Frame::default();
+        generator().generate(&s, &mut atlas, &mut r, &res, &mut frame);
+        // 2 cells wide = 20px; the 2:1 image gives 10px height.
+        assert_eq!(frame.images[0].rect.width, 20.0);
+        assert_eq!(frame.images[0].rect.height, 10.0);
     }
 }

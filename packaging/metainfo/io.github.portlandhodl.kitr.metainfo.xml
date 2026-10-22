@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<component type="desktop-application">
+  <id>io.github.portlandhodl.kitr</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>kitr</name>
+  <summary>Rust port of the kitty terminal emulator</summary>
+  <description>
+    <p>
+      kitr is an early, Linux/X11-only terminal emulator written in Rust. It is
+      a behavioural port of kitty and is not affiliated with or endorsed by the
+      kitty project.
+    </p>
+    <p>
+      Current builds provide an X11/EGL GUI and a headless PTY runner. Wayland,
+      macOS, tabs and layouts, graphics, remote control and kittens are not
+      integrated yet.
+    </p>
+  </description>
+  <launchable type="desktop-id">kitr.desktop</launchable>
+  <provides>
+    <binary>kitr</binary>
+  </provides>
+  <url type="homepage">https://github.com/portlandhodl/kitr</url>
+  <url type="bugtracker">https://github.com/portlandhodl/kitr/issues</url>
+  <project_license>GPL-3.0-or-later</project_license>
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <keywords>
+    <keyword>terminal</keyword>
+    <keyword>console</keyword>
+    <keyword>shell</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-22">
+      <description>
+        <p>Initial packaging skeleton for the early Linux/X11 port.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -49,6 +49,14 @@ pub enum Error {
     },
     /// The final chunk has not been seen yet.
     MissingLastChunk,
+    /// A JSON payload could not be parsed or serialized.
+    Json(String),
+    /// The remote-control protocol was violated.
+    Protocol(String),
+    /// The remote-control peer closed the connection.
+    ConnectionClosed,
+    /// The peer is not permitted to use remote control.
+    PermissionDenied(String),
     /// Any underlying I/O error.
     Io(std::io::Error),
 }
@@ -74,6 +82,10 @@ impl fmt::Display for Error {
                 "out-of-order file-copy chunk: expected index {expected_index} offset {expected_offset}, got index {got_index} offset {got_offset}"
             ),
             Self::MissingLastChunk => f.write_str("file-copy stream ended without a last chunk"),
+            Self::Json(msg) => write!(f, "JSON error: {msg}"),
+            Self::Protocol(msg) => write!(f, "remote-control protocol error: {msg}"),
+            Self::ConnectionClosed => f.write_str("remote-control connection closed"),
+            Self::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
             Self::Io(err) => write!(f, "I/O error: {err}"),
         }
     }
@@ -84,6 +96,21 @@ impl std::error::Error for Error {
         match self {
             Self::Io(err) => Some(err),
             _ => None,
+        }
+    }
+}
+
+impl From<crate::json::JsonError> for Error {
+    fn from(value: crate::json::JsonError) -> Self {
+        Self::Json(value.to_string())
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::Io(err) => err,
+            other => std::io::Error::other(other.to_string()),
         }
     }
 }

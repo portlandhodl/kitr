@@ -1,0 +1,31 @@
+Shell integration files in this directory
+========================================
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+These files are unmodified copies of kitty's shell-integration scripts:
+
+  kitty is Copyright (C) 2016-2026 Kovid Goyal and kitty contributors
+  Upstream: https://github.com/kovidgoyal/kitty
+  License: GNU General Public License, version 3 or later (GPL-3.0-or-later)
+  Source path: shell-integration/ in the upstream kitty tree
+
+kitr is a derivative work of kitty and is distributed under the same license.
+The full license text is in the repository root at ../../LICENSE.
+
+Included (see MANIFEST.md and SHA256SUMS for exact source revisions and hashes):
+
+  bash/kitty.bash
+  zsh/.zshenv
+  zsh/kitty.zsh
+  zsh/kitty-integration
+  fish/vendor_conf.d/kitty-shell-integration.fish
+
+Deliberately not included:
+  - shell-integration/ssh/* (the Python bootstrap requires Python at runtime)
+  - fish completion scripts (they invoke the Python `kitten` executable)
+  - zsh `_kitty` completion (it invokes `kitten`)
+
+These scripts are only integrated by kitty's launcher machinery. kitr does not
+implement that injection yet. See ../../packaging/README.md for how to source
+them manually. No Python is required to run the files shipped here.

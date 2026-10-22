@@ -1,0 +1,109 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# kitr launcher wrapper.
+#
+# The installed layout is:
+#   $PREFIX/bin/kitr                     this wrapper
+#   $PREFIX/libexec/kitr/kitr            the real binary
+#   $PREFIX/share/terminfo/x/xterm-kitty compiled terminfo
+#
+# The wrapper selects a TERM that actually has a terminfo entry and exposes the
+# packaged shell-integration directory. It does not inject shell integration
+# into bash/zsh/fish; that upstream kitty machinery is not implemented by kitr.
+
+set -eu
+
+self=$0
+case $self in
+    */*) ;;
+    *) self=$(command -v -- "$self" 2>/dev/null || printf '%s' "$self") ;;
+esac
+
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *) self=$(dirname -- "$self")/$link ;;
+    esac
+done
+bindir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
+prefix=$(dirname -- "$bindir")
+
+real=${KITR_REAL_BINARY:-}
+if [ -z "$real" ] && [ -x "$prefix/libexec/kitr/kitr" ]; then
+    real=$prefix/libexec/kitr/kitr
+fi
+if [ -z "$real" ] && [ -x "$bindir/kitr-bin" ]; then
+    real=$bindir/kitr-bin
+fi
+if [ -z "$real" ] && [ -x "$bindir/../../target/release/kitr" ]; then
+    real=$bindir/../../target/release/kitr
+fi
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+    printf '%s\n' "kitr: cannot find the kitr binary; set KITR_REAL_BINARY" >&2
+    exit 127
+fi
+
+terminfo_has() {
+    term=$1
+    first=$(printf '%s' "$term" | cut -c1)
+    if [ -n "$first" ]; then
+        hex=$(printf '%x' "'$first")
+    else
+        hex=
+    fi
+    for dir in \
+        "${TERMINFO:-}" \
+        "${HOME:-}/.terminfo" \
+        "$prefix/share/terminfo" \
+        /usr/local/share/terminfo \
+        /usr/share/terminfo \
+        /lib/terminfo \
+        /etc/terminfo
+    do
+        [ -n "$dir" ] || continue
+        if [ -r "$dir/$first/$term" ] || { [ -n "$hex" ] && [ -r "$dir/$hex/$term" ]; }; then
+            return 0
+        fi
+    done
+    if command -v infocmp >/dev/null 2>&1 && infocmp "$term" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+if [ -z "${TERMINFO:-}" ] && [ -r "$prefix/share/terminfo/x/xterm-kitty" ]; then
+    TERMINFO=$prefix/share/terminfo
+    export TERMINFO
+fi
+
+requested=${KITR_TERM:-xterm-kitty}
+if terminfo_has "$requested"; then
+    TERM=$requested
+elif terminfo_has xterm-256color; then
+    if [ "${KITR_TERM_WARN:-1}" != 0 ] && [ "$requested" != xterm-256color ]; then
+        printf '%s\n' "kitr: no terminfo entry for $requested; falling back to xterm-256color" >&2
+    fi
+    TERM=xterm-256color
+else
+    TERM=${TERM:-xterm-256color}
+fi
+export TERM
+export COLORTERM=${COLORTERM:-truecolor}
+export TERM_PROGRAM=kitr
+
+if [ -z "${KITTY_INSTALLATION_DIR:-}" ] && [ -d "$prefix/share/kitr" ]; then
+    KITTY_INSTALLATION_DIR=$prefix/share/kitr
+    export KITTY_INSTALLATION_DIR
+fi
+if [ -z "${KITR_SHELL_INTEGRATION_DIR:-}" ] && [ -d "$prefix/share/kitr/shell-integration" ]; then
+    KITR_SHELL_INTEGRATION_DIR=$prefix/share/kitr/shell-integration
+    export KITR_SHELL_INTEGRATION_DIR
+fi
+if [ -n "${KITR_SHELL_INTEGRATION:-}" ] && [ -z "${KITTY_SHELL_INTEGRATION+x}" ]; then
+    KITTY_SHELL_INTEGRATION=$KITR_SHELL_INTEGRATION
+    export KITTY_SHELL_INTEGRATION
+fi
+
+exec "$real" "$@"

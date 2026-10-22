@@ -188,7 +188,7 @@ split across crates in practice.
 | `os_window_size.py` | OS window sizing | `kitty-os` |
 | `program_status.py` | child status | render/UI |
 | `progress.py` | progress reporting | render/UI |
-| `remote_control.py` | remote protocol framing/crypto | `kitty-remote` |
+| `remote_control.py` | remote protocol framing/crypto | `kitty-remote` (server/client subset ported) |
 | `render_cache.py` | render cache | `kitty-render` |
 | `rgb.py` | color parsing | protocol/core |
 | `search_query_parser.py` | scrollback search syntax | `kitty-input` |
@@ -691,11 +691,11 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `freetype.c` | `kitty-fonts/src/freetype.rs` | in progress (metrics/glyph lookup; rendering/variable axes pending) |
 | `freetype_render_ui_text.c` | `kitty-fonts/src/ui_text.rs` | planned |
 | `gl.c` | `kitty-render/src/{egl,gl_backend}.rs` | in progress (headless EGL/GL 3.3 core backend; window/presentation pending) |
-| `glfw.c` | `kitty-window/src/lib.rs` | in progress (Linux X11 backend; Wayland/Cocoa pending) |
+| `glfw.c` | `kitty-window/src/{lib,wayland}.rs` | in progress (Linux X11 + Wayland; Cocoa/IME/DnD pending) |
 | `glfw-wrapper.c` | `kitty-window/src/lib.rs` | in progress (X11/EGL equivalent backend) |
 | `gl-wrapper.c` | `kitty-render/src/egl.rs` | in progress (function loading via eglGetProcAddress) |
 | `glyph-cache.c` | `kitty-render/src/atlas.rs` | in progress (CPU atlas; shaped-run sprites pending) |
-| `graphics.c` | `kitty-graphics/src/graphics.rs` | in progress (protocol parser + image pipeline; Screen/GPU integration pending) |
+| `graphics.c` | `kitty-graphics/src/graphics.rs` + `kitty-render/src/images.rs` | in progress (parser, placements, textures, z-order; animation/composition/shm pending) |
 | `history.c` | `kitty-core/src/history.rs` | **ported** (core ring; pager/rewrap pending) |
 | `hyperlink.c` | `kitty-screen/src/hyperlink.rs` | **ported** |
 | `key_encoding.c` | `kitty-input/src/key_encoding.rs` | **ported** |

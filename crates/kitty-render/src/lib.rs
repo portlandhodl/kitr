@@ -55,6 +55,13 @@
 //!   page-creation/eviction events and duplicate detection.
 //! * Allocation reuse across frames via [`RendererCore::recycle_frame`] or
 //!   [`RendererCore::prepare_frame_into`].
+//! * Graphics-protocol placements stored by `kitty-screen` as textured quads,
+//!   with source rectangles, cell/pixel offsets, automatic aspect-ratio sizing,
+//!   z-index/layer ordering and clipping to the viewport.
+//! * PNG background images with all six layout modes, tint and opacity, and
+//!   window logos with nine anchors, alpha and percentage scaling.
+//! * A simple fading cursor trail driven by recent cursor positions (not
+//!   kitty's full corner animation).
 //!
 //! # OpenGL backend (`gl` feature)
 //!
@@ -65,12 +72,14 @@
 //!   [`GlContext`](egl::GlContext), an `eglGetProcAddress` function table,
 //!   version/extension queries, resize, swap and readback;
 //! * [`gl_shaders`] — embedded GLSL 330 core programs (with a GLES 3.00
-//!   adaptation) for glyph quads, solid backgrounds/decorations/cursors and
-//!   rounded-rectangle SDFs, plus optional gamma conversion;
-//! * [`gl_backend`] — instanced drawing, per-page atlas textures, scissor-based
-//!   damage, premultiplied blending and `read_pixels()`. `GlBackend::new`
-//!   creates its own headless pbuffer context; `GlBackend::with_loader` reuses
-//!   a caller-provided current EGL window context.
+//!   adaptation) for glyph quads, solid backgrounds/decorations/cursors,
+//!   textured image quads and rounded-rectangle SDFs, plus optional gamma
+//!   conversion;
+//! * [`gl_backend`] — instanced drawing, per-page atlas textures, an image
+//!   texture cache keyed by [`ImageKey`], scissor-based damage, premultiplied
+//!   blending and `read_pixels()`. `GlBackend::new` creates its own headless
+//!   pbuffer context; `GlBackend::with_loader` reuses a caller-provided current
+//!   EGL window context.
 //!
 //! The shaders are a functional subset, not a line-for-line port of
 //! `kitty/shaders/*.slang` (see [`gl_shaders`]).
@@ -86,8 +95,20 @@
 //!
 //! # Renderer features not supported yet
 //!
-//! * Graphics-protocol images, background images, animations, cursor trails
-//!   and the window logo.
+//! * Graphics-protocol animations (`a=a`/`a=f`), composition (`a=c`),
+//!   parent/child placement offsets and Unicode-placeholder expansion. Only
+//!   directly placed RGBA images are rendered; indexed-colour images without
+//!   RGBA data are skipped.
+//! * The full cursor-trail corner animation and custom trail shaders. The
+//!   implemented trail is a simple bounded history of recent cursor cells that
+//!   fades linearly and is replaced rather than smoothly eased.
+//! * Image transforms (rotation, mirroring, scaling filters beyond
+//!   nearest/linear), animations and per-window background-image lists.
+//! * Image and trail changes are not part of `kitty-screen`'s dirty-line
+//!   tracking, so [`RendererCore`] forces a full redraw while those layers are
+//!   present. Background images survive a GPU resize, but the frame must be
+//!   regenerated with the new [`RenderConfig::viewport_width`] /
+//!   [`RenderConfig::viewport_height`] so the quad covers the new drawable.
 //! * Selection/hyperlink overlays, marks and URL underlines; the resolver
 //!   traits expose the colours needed to add them later.
 //! * Custom user shaders and the full kitty shader pipeline.
@@ -109,7 +130,9 @@ pub mod core;
 pub mod damage;
 pub mod decorations;
 pub mod geom;
+pub mod images;
 pub mod instances;
+pub mod trail;
 
 #[cfg(feature = "gl")]
 pub mod egl;
@@ -141,15 +164,23 @@ pub use decorations::{
     TabBarBlankRectConfig, Triangle, UnderlineStyle, Vertex, WindowGeometry,
 };
 pub use geom::{CellMetrics, EdgeWidths, GridGeometry, Rect, Region};
+pub use images::{
+    background_image, background_quad, clip_rect_uv, collect_protocol_images, fingerprint,
+    window_logo, window_logo_quad, BackgroundImageConfig, BackgroundLayout, ImageAsset, ImageData,
+    ImageFilter, ImageInstance, ImageKey, ImageLayer, ImageLoadError, ImageUpload, ImageWrap,
+    LogoPosition, WindowLogoConfig,
+};
 pub use instances::{
     BackgroundInstance, CursorGeometry, CursorInstance, DecorationInstance, DecorationKind, Frame,
     GlyphInstance, InstanceFlags, InstanceGenerator, RenderConfig, GLYPH_FLAG_BOLD,
     GLYPH_FLAG_COLOR, GLYPH_FLAG_ITALIC,
 };
+pub use trail::{CursorTrail, CursorTrailConfig, TrailInstance};
 
 #[cfg(feature = "gl")]
 pub use egl::{ContextConfig, EglError, GlApi, GlContext, GlError, GlFns, GlVersion};
 #[cfg(feature = "gl")]
 pub use gl_backend::{
-    AtlasSyncStats, FilterMode, GammaMode, GlBackend, GlBackendConfig, GlBackendError, RenderStats,
+    AtlasSyncStats, FilterMode, GammaMode, GlBackend, GlBackendConfig, GlBackendError,
+    ImageSyncStats, RenderStats,
 };

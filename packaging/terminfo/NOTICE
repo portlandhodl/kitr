@@ -1,0 +1,16 @@
+Terminfo sources
+================
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+`kitty.terminfo` and `kitty.termcap` are unmodified copies of kitty's
+generated terminfo sources:
+
+  kitty is Copyright (C) 2016-2026 Kovid Goyal and kitty contributors
+  Upstream: https://github.com/kovidgoyal/kitty
+  License: GNU General Public License, version 3 or later (GPL-3.0-or-later)
+  Source paths: terminfo/kitty.terminfo and terminfo/kitty.termcap
+
+Compile with `tic -x -o <dir> kitty.terminfo`. The terminal name is
+`xterm-kitty`. See README.md for byte-comparison details and SHA256SUMS for
+the file hashes.

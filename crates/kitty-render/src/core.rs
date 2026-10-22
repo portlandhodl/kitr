@@ -6,12 +6,15 @@
 //! touches OpenGL, EGL or any platform API; a later backend only needs to
 //! upload atlas pages and draw the instance lists.
 
-use kitty_screen::Screen;
+use std::time::Instant;
+
+use kitty_screen::{CursorShape, Screen};
 
 use crate::atlas::{AtlasConfig, GlyphAtlas, GlyphRasterizer};
 use crate::colors::ColorResolver;
-use crate::damage::DamageTracker;
+use crate::damage::{DamageTracker, FullRedrawReason};
 use crate::instances::{Frame, InstanceGenerator, RenderConfig};
+use crate::trail::CursorTrail;
 
 /// Owns all persistent CPU renderer state.
 #[derive(Clone, Debug)]
@@ -19,6 +22,8 @@ pub struct RendererCore {
     pub atlas: GlyphAtlas,
     pub damage: DamageTracker,
     pub generator: InstanceGenerator,
+    pub trail: CursorTrail,
+    started: Instant,
     spare: Option<Frame>,
 }
 
@@ -34,6 +39,8 @@ impl RendererCore {
             atlas: GlyphAtlas::new(atlas_config),
             damage: DamageTracker::new(),
             generator: InstanceGenerator::new(config),
+            trail: CursorTrail::new(),
+            started: Instant::now(),
             spare: None,
         }
     }
@@ -55,6 +62,23 @@ impl RendererCore {
         frame
     }
 
+    /// Build a frame with an explicit monotonic time in seconds.
+    ///
+    /// Use this for deterministic cursor-trail animation and tests. The
+    /// regular [`prepare_frame`](Self::prepare_frame) uses seconds since the
+    /// core was created.
+    pub fn prepare_frame_at(
+        &mut self,
+        screen: &Screen,
+        rasterizer: &mut dyn GlyphRasterizer,
+        resolver: &dyn ColorResolver,
+        now: f32,
+    ) -> Frame {
+        let mut frame = self.spare.take().unwrap_or_default();
+        self.prepare_frame_into_at(screen, rasterizer, resolver, &mut frame, now);
+        frame
+    }
+
     /// Build a frame into an existing allocation, retaining all vector
     /// capacities.
     pub fn prepare_frame_into(
@@ -64,10 +88,55 @@ impl RendererCore {
         resolver: &dyn ColorResolver,
         frame: &mut Frame,
     ) {
+        let now = self.started.elapsed().as_secs_f32();
+        self.prepare_frame_into_at(screen, rasterizer, resolver, frame, now);
+    }
+
+    /// [`prepare_frame_into`](Self::prepare_frame_into) with an explicit time.
+    pub fn prepare_frame_into_at(
+        &mut self,
+        screen: &Screen,
+        rasterizer: &mut dyn GlyphRasterizer,
+        resolver: &dyn ColorResolver,
+        frame: &mut Frame,
+        now: f32,
+    ) {
         let damage = self.damage.update(screen);
         self.generator
             .generate(screen, &mut self.atlas, rasterizer, resolver, frame);
         frame.damage = damage;
+
+        let config = &self.generator.config.cursor_trail;
+        let color = config.color.unwrap_or_else(|| resolver.cursor_bg());
+        let visible = screen.is_cursor_visible() && screen.cursor.shape != CursorShape::NoCursor;
+        let (cursor_rect, cursor_cell) = if visible {
+            let x = screen.cursor.x.min(screen.columns.saturating_sub(1));
+            let y = screen.cursor.y.min(screen.lines.saturating_sub(1));
+            (Some(frame.geometry.cell_rect(x, y)), Some((x, y)))
+        } else {
+            (None, None)
+        };
+        self.trail.update(
+            cursor_rect,
+            cursor_cell,
+            now,
+            config,
+            color,
+            &mut frame.trail,
+        );
+
+        // Image and trail state is not part of kitty-screen's dirty-line
+        // tracking. Replaying those layers only inside damaged row scissor
+        // rectangles would leave stale pixels, so force a full redraw while
+        // they are present.
+        let media = !frame.images.is_empty()
+            || frame.background_image.is_some()
+            || frame.logo.is_some()
+            || !frame.trail.is_empty();
+        if media && !frame.damage.full_redraw {
+            frame.damage.full_redraw = true;
+            frame.damage.full_redraw_reason = Some(FullRedrawReason::Explicit);
+        }
     }
 
     /// Reset the screen's dirty-line state after the frame has been consumed.
@@ -189,5 +258,35 @@ mod tests {
         let mut core = RendererCore::new(cfg, atlas_cfg);
         let frame = core.prepare_frame(&s, &mut rasterize, &resolve());
         assert!(!frame.atlas_events.is_empty());
+    }
+    #[test]
+    fn cursor_trail_is_generated_and_fades() {
+        use crate::trail::CursorTrailConfig;
+
+        let mut s = Screen::builder(10, 4).scrollback(8).build().unwrap();
+        s.cursor.shape = CursorShape::Block;
+        let config = RenderConfig {
+            cursor_trail: CursorTrailConfig::enabled(4, 1.0),
+            ..RenderConfig::default()
+        };
+        let mut core = RendererCore::new(config, AtlasConfig::default());
+        let r = resolve();
+
+        let frame = core.prepare_frame_at(&s, &mut rasterize, &r, 0.0);
+        assert!(frame.trail.is_empty());
+        assert!(frame.damage.full_redraw);
+
+        s.cursor_position(3, 1);
+        let frame = core.prepare_frame_at(&s, &mut rasterize, &r, 0.1);
+        assert_eq!(frame.trail.len(), 1);
+        assert!((frame.trail[0].opacity - 1.0).abs() < 1e-6);
+        assert!(frame.damage.full_redraw, "trail forces a full redraw");
+
+        let frame = core.prepare_frame_at(&s, &mut rasterize, &r, 0.6);
+        assert_eq!(frame.trail.len(), 1);
+        assert!((frame.trail[0].opacity - 0.5).abs() < 1e-6);
+
+        let frame = core.prepare_frame_at(&s, &mut rasterize, &r, 1.2);
+        assert!(frame.trail.is_empty());
     }
 }

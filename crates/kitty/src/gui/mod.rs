@@ -191,6 +191,7 @@ impl GuiSession {
             cursor_hollow_thickness: 1.0,
             undercurl_style: 0,
             emit_default_backgrounds: false,
+            ..RenderConfig::default()
         };
         let renderer = RendererCore::new(render_config, AtlasConfig::default());
         let resolver = ConfigColorResolver::new(&cfg);

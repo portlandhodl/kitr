@@ -1,0 +1,11 @@
+[package]
+name = "kitty-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tabs, layouts, windows and sessions model for kitr"
+
+[dependencies]
+kitty-core = { path = "../kitty-core" }
+kitty-os = { path = "../kitty-os" }

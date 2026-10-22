@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (X11, CPU + GL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfreetype-dev libharfbuzz-dev libfontconfig1-dev \
+            libegl1-mesa-dev libx11-dev libpng-dev zlib1g-dev libssl-dev \
+            xvfb xauth imagemagick fonts-dejavu-core ncurses-bin \
+            desktop-file-utils appstream
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (CPU, no default features)
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+      - name: clippy (GL/GUI, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: GUI tests under Xvfb (all features)
+        run: xvfb-run -a cargo test --workspace --all-features
+
+      - name: Build release binary
+        run: cargo build --release --workspace
+
+      - name: Terminfo compile
+        run: make terminfo
+
+      - name: License and packaging checks
+        run: |
+          python3 -m py_compile scripts/check_licenses.py scripts/screenshot_parity.py
+          python3 scripts/check_licenses.py
+          make validate
+
+      - name: Install optional C kitty for parity
+        continue-on-error: true
+        run: sudo apt-get install -y kitty
+
+      - name: Screenshot parity smoke (best effort)
+        continue-on-error: true
+        run: |
+          python3 scripts/screenshot_parity.py \
+            --kitr target/release/kitr \
+            --artifacts artifacts/screenshot-parity
+
+      - name: Upload parity artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-parity
+          path: artifacts/screenshot-parity
+          if-no-files-found: ignore

@@ -1,0 +1,139 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.TH KITR 1 "2026-10-22" "kitr 0.1.0" "User Commands"
+.SH NAME
+kitr \- early Linux/X11 Rust port of the kitty terminal emulator
+.SH SYNOPSIS
+.B kitr
+[\fIOPTIONS\fR] [\fB\-e\fR|\fB\-\-\fR] [\fICOMMAND\fR [\fIARGS\fR...]]
+.br
+.B kitr
+[\fIOPTIONS\fR] \fB\-c\fR \fISCRIPT\fR
+.SH DESCRIPTION
+.B kitr
+is a terminal emulator and behavioural port of kitty written in Rust. This
+manual documents the command-line interface of the current early port.
+.PP
+With no command, \fBkitr\fR runs \fB$SHELL\fR (or \fB/bin/sh\fR). The GUI
+frontend is used automatically when \fB$DISPLAY\fR is set and
+\fB\-\-dump\-screen\fR was not requested; otherwise the headless PTY runner is
+used. Use \fB\-\-headless\fR or \fB\-\-gui\fR to force a frontend.
+.PP
+Wayland and macOS (Cocoa) backends, tabs and layouts, kitty graphics images,
+remote control and kittens are not implemented in this port.
+.SH OPTIONS
+.TP
+.B \-\-headless
+Force the headless PTY runner. This frontend does not open a window.
+.TP
+.B \-\-gui
+Force the Linux/X11 + EGL GUI frontend. This requires a working X11 display,
+EGL, and system fonts.
+.TP
+.BI \-\-config " PATH"
+Load configuration from \fIPATH\fR instead of the default locations. The
+current port implements a subset of kitty's options; unknown options are
+ignored leniently.
+.TP
+.BI \-\-size " COLSxROWS"
+Set the initial PTY and screen size in columns and rows. Both values must be
+positive integers, for example \fB80x24\fR. When omitted, the current
+terminal size is used, falling back to \fB80x24\fR.
+.TP
+.BI \-\-scrollback " N"
+Set the scrollback capacity in lines. The default is 10000.
+.TP
+.BI \-\-screenshot " FILE"
+Use the GUI frontend, render the terminal after child output has settled, and
+write a top-down binary PPM (P6) screenshot to \fIFILE\fR. The process exits
+after writing the screenshot. This is intended for testing and parity checks,
+not for general screen capture.
+.TP
+.BI \-\-timeout " SECONDS"
+Terminate the child after \fISECONDS\fR. Fractional values are accepted. A
+timed-out headless run exits with status 124. A screenshot run also writes its
+screenshot when the timeout is reached.
+.TP
+.B \-\-dump\-screen
+Write the final screen contents as plain text to standard output. This uses the
+headless runner unless \fB\-\-gui\fR is also given.
+.TP
+.BI \-\-title " TITLE"
+Set the window title. This is only meaningful for the GUI frontend.
+.TP
+.B \-e, \-\-
+Pass the remaining arguments to the child command without further option
+parsing. Everything after \fB\-e\fR or \fB\-\-\fR becomes the child's
+\fBargv\fR.
+.TP
+.B \-c
+Shortcut for running the default shell with \fB\-c\fR. The next arguments are
+passed to that shell. This shortcut is disabled after \fB\-e\fR or
+\fB\-\-\fR.
+.TP
+.B \-h, \-\-help
+Show the built-in help text and exit.
+.TP
+.B \-V, \-\-version
+Show the version and exit.
+.SH SHELL INTEGRATION
+The package includes unmodified copies of kitty's bash, zsh and fish
+integration scripts under
+\fI$PREFIX/share/kitr/shell\-integration\fR and, for fish,
+\fI$PREFIX/share/fish/vendor_conf.d/kitty\-shell\-integration.fish\fR. kitr
+does not yet perform kitty's automatic shell-integration injection. Users can
+source the scripts manually; see \fBpackaging/README.md\fR in the source tree.
+No Python is required to run the files shipped in the package.
+.SH FILES
+.TP
+.I $PREFIX/bin/kitr
+Launcher wrapper installed by \fBmake install\fR. It selects a usable
+\fBTERM\fR and executes the real binary.
+.TP
+.I $PREFIX/libexec/kitr/kitr
+The actual kitr executable.
+.TP
+.I $PREFIX/share/terminfo/x/xterm-kitty
+Compiled terminfo entry, also installed under the legacy \fI78/\fR directory.
+If it is unavailable, use \fBTERM=xterm-256color\fR.
+.TP
+.I $PREFIX/share/applications/kitr.desktop
+Desktop entry.
+.TP
+.I $PREFIX/share/metainfo/io.github.portlandhodl.kitr.metainfo.xml
+AppStream metadata skeleton.
+.SH EXIT STATUS
+The exit status is the child's exit status, or 128 plus the terminating signal
+when the child is killed by a signal. A timed-out headless run returns 124.
+Command-line and runtime errors return a non-zero status.
+.SH ENVIRONMENT
+.TP
+.B DISPLAY
+Selects the GUI frontend automatically when set.
+.TP
+.B SHELL
+Shell started when no command is given.
+.TP
+.B TERM
+The launcher sets \fBxterm-kitty\fR when its terminfo entry is available and
+falls back to \fBxterm-256color\fR otherwise.
+.TP
+.B KITR_TERM
+Overrides the \fBTERM\fR value the launcher tries to use.
+.TP
+.B KITR_REAL_BINARY
+Overrides the path of the real binary executed by the launcher wrapper.
+.TP
+.B KITR_SHELL_INTEGRATION
+If set, the launcher exports it as \fBKITTY_SHELL_INTEGRATION\fR when that
+variable is not already set. Sourcing the integration scripts is still the
+user's responsibility.
+.SH SEE ALSO
+.BR kitty (1),
+.BR terminfo (5),
+.BR tic (1)
+.SH LIMITATIONS
+This is an early port. Wayland and macOS support, tabs and layouts, kitty
+graphics images, remote control, kittens, and automatic shell-integration
+injection are absent. Screenshot comparison against C kitty is best-effort and
+depends on matching fonts, font sizes, DPI, window decorations and toolkit
+rendering.

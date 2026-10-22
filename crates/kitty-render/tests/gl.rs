@@ -8,13 +8,15 @@
 
 #![cfg(feature = "gl")]
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use kitty_render::gl_backend::{FilterMode, GammaMode, GlBackend, GlBackendConfig, GlBackendError};
 use kitty_render::{
-    AtlasConfig, BackgroundInstance, BasicColorResolver, CellMetrics, ContextConfig,
-    CursorInstance, Damage, Frame, FullRedrawReason, GlyphAtlas, GlyphBitmap, GlyphInstance,
-    GlyphKey, GridGeometry, InstanceFlags, LineRange, Rect, RenderConfig, RendererCore, Rgba8,
+    AtlasConfig, BackgroundImageConfig, BackgroundInstance, BackgroundLayout, BasicColorResolver,
+    CellMetrics, ContextConfig, CursorInstance, Damage, Frame, FullRedrawReason, GlyphAtlas,
+    GlyphBitmap, GlyphInstance, GlyphKey, GridGeometry, ImageAsset, ImageFilter, ImageInstance,
+    ImageKey, ImageUpload, ImageWrap, InstanceFlags, LineRange, Rect, RenderConfig, RendererCore,
+    Rgba8, TrailInstance,
 };
 use kitty_screen::{CursorShape, Screen};
 
@@ -462,4 +464,457 @@ fn renderer_core_frame_round_trip() {
         pixels[offset..offset + 4] != background
     });
     assert!(changed, "rendered frame differs from the clear colour");
+}
+
+fn image_2x2(key: ImageKey, wrap: ImageWrap) -> ImageUpload {
+    ImageUpload::new(
+        key,
+        2,
+        2,
+        Arc::new(vec![
+            255, 0, 0, 255, // top-left red
+            0, 255, 0, 255, // top-right green
+            0, 0, 255, 255, // bottom-left blue
+            255, 255, 255, 255, // bottom-right white
+        ]),
+        ImageFilter::Nearest,
+        wrap,
+    )
+}
+
+fn image_frame_with(image: ImageInstance, upload: ImageUpload) -> Frame {
+    let mut frame = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    frame.images.push(image);
+    frame.image_uploads.push(upload);
+    frame
+}
+
+#[test]
+fn image_upload_placement_pixels() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let key = ImageKey::Protocol(1);
+    let mut frame = image_frame_with(
+        ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)),
+        image_2x2(key, ImageWrap::Clamp),
+    );
+    frame.damage.full_redraw = true;
+
+    let sync = backend.sync_images(&frame).expect("image upload");
+    assert_eq!(sync.created, 1);
+    assert_eq!(backend.image_texture_count(), 1);
+    let stats = backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render");
+    assert_eq!(stats.images, 1);
+    assert_eq!(stats.images_drawn, 1);
+    assert_eq!(stats.images_skipped, 0);
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 8, 8), [255, 0, 0, 255], 1, "top-left");
+    assert_pixel(pixel(&pixels, 32, 24, 8), [0, 255, 0, 255], 1, "top-right");
+    assert_pixel(
+        pixel(&pixels, 32, 8, 24),
+        [0, 0, 255, 255],
+        1,
+        "bottom-left",
+    );
+    assert_pixel(
+        pixel(&pixels, 32, 24, 24),
+        [255, 255, 255, 255],
+        1,
+        "bottom-right",
+    );
+}
+
+#[test]
+fn image_z_order_under_and_over_text() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let mut atlas = GlyphAtlas::new(AtlasConfig {
+        page_width: 16,
+        page_height: 16,
+        padding: 1,
+        max_gray_pages: 1,
+        max_rgba_pages: 1,
+        allow_eviction: false,
+    });
+    let key = GlyphKey::new(0, 1, 0);
+    let inserted = atlas
+        .insert(key, GlyphBitmap::gray(2, 2, vec![255; 4]).expect("bitmap"))
+        .expect("insert");
+
+    let image_key = ImageKey::Protocol(2);
+    let mut under = image_frame_with(
+        ImageInstance::new(image_key, Rect::new(0.0, 0.0, 32.0, 32.0)).with_z_index(-1),
+        image_2x2(image_key, ImageWrap::Clamp),
+    );
+    under.glyphs.push(GlyphInstance {
+        rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+        cell_x: 0,
+        cell_y: 0,
+        fg: Rgba8::rgb(0, 0, 255),
+        sprite: Some(inserted.slot),
+        text: key.text,
+        flags: InstanceFlags::default(),
+    });
+    backend.sync_atlas(&atlas, &under).expect("atlas");
+    backend.sync_images(&under).expect("images");
+    backend
+        .render(&under, &RenderConfig::default())
+        .expect("render under");
+    let pixels = backend.read_pixels().expect("readback under");
+    assert_pixel(
+        pixel(&pixels, 32, 16, 16),
+        [0, 0, 255, 255],
+        1,
+        "text over a negative-z image",
+    );
+
+    let mut over = image_frame_with(
+        ImageInstance::new(image_key, Rect::new(0.0, 0.0, 32.0, 32.0)).with_z_index(1),
+        image_2x2(image_key, ImageWrap::Clamp),
+    );
+    over.glyphs.push(GlyphInstance {
+        rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+        cell_x: 0,
+        cell_y: 0,
+        fg: Rgba8::rgb(0, 0, 255),
+        sprite: Some(inserted.slot),
+        text: key.text,
+        flags: InstanceFlags::default(),
+    });
+    backend.sync_images(&over).expect("images");
+    backend
+        .render(&over, &RenderConfig::default())
+        .expect("render over");
+    let pixels = backend.read_pixels().expect("readback over");
+    assert_pixel(
+        pixel(&pixels, 32, 8, 8),
+        [255, 0, 0, 255],
+        1,
+        "positive-z image over text",
+    );
+}
+
+#[test]
+fn image_delete_removes_texture_and_pixels() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let key = ImageKey::Protocol(3);
+    let frame = image_frame_with(
+        ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)),
+        image_2x2(key, ImageWrap::Clamp),
+    );
+    backend.sync_images(&frame).expect("upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("draw");
+    assert_eq!(backend.image_texture_count(), 1);
+
+    let mut cleared = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    cleared.damage.full_redraw = true;
+    let sync = backend.sync_images(&cleared).expect("sync after delete");
+    assert_eq!(sync.removed, 1);
+    assert_eq!(backend.image_texture_count(), 0);
+    assert!(!backend.has_image_texture(key));
+    let stats = backend
+        .render(&cleared, &RenderConfig::default())
+        .expect("render after delete");
+    assert_eq!(stats.images_drawn, 0);
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 16, 16), [0, 0, 0, 255], 1, "cleared");
+}
+
+#[test]
+fn image_source_rect_and_scaling() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let key = ImageKey::Protocol(4);
+    let mut image = ImageInstance::new(key, Rect::new(0.0, 0.0, 16.0, 16.0));
+    image.uv = kitty_render::UvRect {
+        u0: 0.5,
+        v0: 0.0,
+        u1: 1.0,
+        v1: 0.5,
+    };
+    let frame = image_frame_with(image, image_2x2(key, ImageWrap::Clamp));
+    backend.sync_images(&frame).expect("upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("draw");
+    let pixels = backend.read_pixels().expect("readback");
+    // Only the top-right texel is sampled, stretched over the 16x16 quad.
+    assert_pixel(
+        pixel(&pixels, 32, 8, 8),
+        [0, 255, 0, 255],
+        1,
+        "source texel",
+    );
+    assert_pixel(
+        pixel(&pixels, 32, 24, 24),
+        [0, 0, 0, 255],
+        1,
+        "outside quad",
+    );
+}
+
+fn background_frame(
+    asset: &ImageAsset,
+    layout: BackgroundLayout,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Frame {
+    let config = BackgroundImageConfig {
+        asset: asset.clone(),
+        layout,
+        opacity: 1.0,
+        tint: 0.0,
+        linear: false,
+    };
+    let (instance, upload) = kitty_render::background_image(
+        &config,
+        viewport_width as f32,
+        viewport_height as f32,
+        Rgba8::BLACK,
+    )
+    .expect("background geometry");
+    let columns = (viewport_width / 16).max(1);
+    let rows = (viewport_height / 16).max(1);
+    let mut frame = empty_frame(columns, rows, 16.0, 16.0, Rgba8::BLACK);
+    frame.background_image = Some(instance);
+    frame.image_uploads.push(upload);
+    frame
+}
+
+fn asset_2x2() -> ImageAsset {
+    ImageAsset::from_rgba(
+        2,
+        2,
+        vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ],
+    )
+    .expect("asset")
+}
+
+#[test]
+fn background_layout_modes_pixels() {
+    let _guard = lock();
+    let mut backend = try_backend!(64, 32);
+    let asset = asset_2x2();
+
+    let frame = background_frame(&asset, BackgroundLayout::Tiling, 64, 32);
+    backend.sync_images(&frame).expect("upload tiling");
+    let stats = backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render tiling");
+    assert!(stats.background_image_drawn);
+    let pixels = backend.read_pixels().expect("readback tiling");
+    assert_pixel(pixel(&pixels, 64, 0, 0), [255, 0, 0, 255], 1, "tiling 0,0");
+    assert_pixel(pixel(&pixels, 64, 3, 0), [0, 255, 0, 255], 1, "tiling 1,0");
+    assert_pixel(
+        pixel(&pixels, 64, 4, 0),
+        [255, 0, 0, 255],
+        1,
+        "tiling repeat x",
+    );
+    assert_pixel(pixel(&pixels, 64, 0, 3), [0, 0, 255, 255], 1, "tiling 0,1");
+
+    let frame = background_frame(&asset, BackgroundLayout::Mirrored, 64, 32);
+    backend.sync_images(&frame).expect("upload mirrored");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render mirrored");
+    let pixels = backend.read_pixels().expect("readback mirrored");
+    assert_pixel(
+        pixel(&pixels, 64, 3, 0),
+        [255, 0, 0, 255],
+        1,
+        "mirrored flips x",
+    );
+
+    let frame = background_frame(&asset, BackgroundLayout::Clamped, 64, 32);
+    backend.sync_images(&frame).expect("upload clamped");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render clamped");
+    let pixels = backend.read_pixels().expect("readback clamped");
+    assert_pixel(
+        pixel(&pixels, 64, 63, 0),
+        [0, 255, 0, 255],
+        1,
+        "clamped right edge",
+    );
+    assert_pixel(
+        pixel(&pixels, 64, 0, 31),
+        [0, 0, 255, 255],
+        1,
+        "clamped bottom edge",
+    );
+
+    let frame = background_frame(&asset, BackgroundLayout::Scaled, 64, 32);
+    backend.sync_images(&frame).expect("upload scaled");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render scaled");
+    let pixels = backend.read_pixels().expect("readback scaled");
+    assert_pixel(pixel(&pixels, 64, 8, 8), [255, 0, 0, 255], 1, "scaled tl");
+    assert_pixel(pixel(&pixels, 64, 56, 8), [0, 255, 0, 255], 1, "scaled tr");
+    assert_pixel(pixel(&pixels, 64, 8, 24), [0, 0, 255, 255], 1, "scaled bl");
+    assert_pixel(
+        pixel(&pixels, 64, 56, 24),
+        [255, 255, 255, 255],
+        1,
+        "scaled br",
+    );
+
+    let frame = background_frame(&asset, BackgroundLayout::CenterClamped, 64, 32);
+    backend.sync_images(&frame).expect("upload centered");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render centered");
+    let pixels = backend.read_pixels().expect("readback centered");
+    assert_pixel(
+        pixel(&pixels, 64, 30, 14),
+        [0, 0, 0, 255],
+        1,
+        "center margin",
+    );
+    assert_pixel(pixel(&pixels, 64, 31, 15), [255, 0, 0, 255], 1, "center tl");
+    assert_pixel(
+        pixel(&pixels, 64, 32, 16),
+        [255, 255, 255, 255],
+        1,
+        "center br",
+    );
+
+    let frame = background_frame(&asset, BackgroundLayout::CenterScaled, 64, 32);
+    backend.sync_images(&frame).expect("upload cscaled");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render cscaled");
+    let pixels = backend.read_pixels().expect("readback cscaled");
+    assert_pixel(pixel(&pixels, 64, 8, 8), [255, 0, 0, 255], 1, "cscaled tl");
+    assert_pixel(
+        pixel(&pixels, 64, 56, 24),
+        [255, 255, 255, 255],
+        1,
+        "cscaled br",
+    );
+}
+
+#[test]
+fn background_image_survives_resize() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let asset = asset_2x2();
+    let frame = background_frame(&asset, BackgroundLayout::Tiling, 32, 32);
+    backend.sync_images(&frame).expect("upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("draw");
+    assert_eq!(backend.image_texture_count(), 1);
+
+    backend.resize(64, 32).expect("resize");
+    let resized = background_frame(&asset, BackgroundLayout::Tiling, 64, 32);
+    let sync = backend.sync_images(&resized).expect("sync after resize");
+    assert_eq!(sync.unchanged, 1);
+    assert_eq!(sync.created, 0);
+    assert_eq!(backend.image_texture_count(), 1);
+    backend
+        .render(&resized, &RenderConfig::default())
+        .expect("draw after resize");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_eq!(pixels.len(), 64 * 32 * 4);
+    assert_pixel(
+        pixel(&pixels, 64, 4, 0),
+        [255, 0, 0, 255],
+        1,
+        "tiling after resize",
+    );
+    assert_pixel(
+        pixel(&pixels, 64, 3, 0),
+        [0, 255, 0, 255],
+        1,
+        "tiling after resize x",
+    );
+}
+
+#[test]
+fn cursor_trail_fades_in_gl() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let mut frame = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    frame.trail.push(TrailInstance {
+        rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+        color: Rgba8::rgb(255, 0, 0),
+        opacity: 0.5,
+    });
+    let stats = backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render trail");
+    assert_eq!(stats.trail_instances, 1);
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 16, 16), [128, 0, 0, 255], 1, "50% trail");
+
+    let mut faded = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    faded.trail.push(TrailInstance {
+        rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+        color: Rgba8::rgb(255, 0, 0),
+        opacity: 0.25,
+    });
+    backend
+        .render(&faded, &RenderConfig::default())
+        .expect("render faded trail");
+    let pixels = backend.read_pixels().expect("readback faded");
+    assert_pixel(pixel(&pixels, 32, 16, 16), [64, 0, 0, 255], 1, "25% trail");
+}
+#[test]
+fn background_opacity_and_tint() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let asset = ImageAsset::from_rgba(1, 1, vec![255, 255, 255, 255]).unwrap();
+
+    let half = BackgroundImageConfig {
+        asset: asset.clone(),
+        layout: BackgroundLayout::Scaled,
+        opacity: 0.5,
+        tint: 0.0,
+        linear: false,
+    };
+    let (instance, upload) =
+        kitty_render::background_image(&half, 32.0, 32.0, Rgba8::BLACK).unwrap();
+    let mut frame = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    frame.background_image = Some(instance);
+    frame.image_uploads.push(upload);
+    backend.sync_images(&frame).expect("upload half");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("draw half");
+    let pixels = backend.read_pixels().expect("readback half");
+    assert_pixel(
+        pixel(&pixels, 32, 16, 16),
+        [128, 128, 128, 255],
+        1,
+        "50% white",
+    );
+
+    let tinted = BackgroundImageConfig { tint: 1.0, ..half };
+    let (instance, upload) =
+        kitty_render::background_image(&tinted, 32.0, 32.0, Rgba8::rgb(0, 0, 255)).unwrap();
+    frame.background_image = Some(instance);
+    frame.image_uploads.clear();
+    frame.image_uploads.push(upload);
+    backend.sync_images(&frame).expect("upload tinted");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("draw tinted");
+    let pixels = backend.read_pixels().expect("readback tinted");
+    // Fully tinted with blue at 50% opacity over black.
+    assert_pixel(
+        pixel(&pixels, 32, 16, 16),
+        [0, 0, 128, 255],
+        1,
+        "tinted blue",
+    );
 }

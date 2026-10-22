@@ -13,6 +13,9 @@
 //! * [`SOLID_VERTEX_330`] / [`SOLID_FRAGMENT_330`] — instanced solid quads for
 //!   backgrounds, underline/strikethrough rectangles and cursor rectangles,
 //!   with an optional rounded-rectangle SDF (anti-aliased with `fwidth`);
+//! * [`IMAGE_VERTEX_330`] / [`IMAGE_FRAGMENT_330`] — instanced textured quads
+//!   for graphics-protocol images, background images and window logos, with
+//!   background tinting, opacity and tiled UVs;
 //! * an optional per-fragment gamma mode: `0` writes colours unchanged, `1`
 //!   converts sRGB input to linear light, `2` encodes linear input as sRGB.
 //!
@@ -27,10 +30,10 @@
 //!
 //! # Not implemented here
 //!
-//! Graphics-protocol images, background images, window logos, cursor trails,
-//! selection/hyperlink overlays, animations, custom user shaders, cell
-//! shaders, linear-to-sRGB framebuffer resolves and the sprite atlas'
-//! multiple-format lookup table. See the crate level documentation.
+//! Animated/trails-specific shaders, selection/hyperlink overlays, animations,
+//! custom user shaders, cell shaders, linear-to-sRGB framebuffer resolves and
+//! the sprite atlas' multiple-format lookup table. See the crate level
+//! documentation.
 
 use crate::egl::GlApi;
 
@@ -170,6 +173,72 @@ void main() {
 }
 "#;
 
+/// Canonical vertex shader for instanced image quads (GLSL 330 core).
+///
+/// The same per-instance layout as the solid/glyph programs is used. `a_uv`
+/// carries the source rectangle in normalised texture coordinates and may
+/// exceed `[0, 1]` for tiled background images; the sampler's wrap mode then
+/// decides how it repeats.
+pub const IMAGE_VERTEX_330: &str = r#"#version 330 core
+layout(location = 0) in vec2 a_unit;
+layout(location = 1) in vec4 a_rect;
+layout(location = 2) in vec4 a_uv;
+layout(location = 3) in vec4 a_color;
+layout(location = 4) in vec4 a_params;
+uniform vec2 u_viewport;
+out vec2 v_uv;
+out vec4 v_color;
+out vec2 v_params;
+void main() {
+    vec2 pos = a_rect.xy + a_unit * a_rect.zw;
+    vec2 ndc = vec2(pos.x / u_viewport.x * 2.0 - 1.0,
+                    1.0 - pos.y / u_viewport.y * 2.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    v_uv = mix(a_uv.xy, a_uv.zw, a_unit);
+    v_color = a_color;
+    v_params = a_params.xy;
+}
+"#;
+
+/// Canonical fragment shader for instanced image quads (GLSL 330 core).
+///
+/// `v_params.x` mixes the sampled RGB towards `v_color.rgb` (the background
+/// tint) and `v_params.y` is an extra alpha multiplier (opacity). Texture data
+/// is non-premultiplied RGBA8; the result is premultiplied for the backend's
+/// `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` blend.
+pub const IMAGE_FRAGMENT_330: &str = r#"#version 330 core
+in vec2 v_uv;
+in vec4 v_color;
+in vec2 v_params;
+uniform sampler2D u_image;
+uniform int u_gamma;
+out vec4 fragColor;
+
+vec3 srgb_to_linear(vec3 c) {
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(hi, lo, lessThanEqual(c, vec3(0.04045)));
+}
+
+vec3 linear_to_srgb(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, lessThanEqual(c, vec3(0.0031308)));
+}
+
+void main() {
+    vec4 texel = texture(u_image, v_uv);
+    vec3 rgb = mix(texel.rgb, v_color.rgb, clamp(v_params.x, 0.0, 1.0));
+    float alpha = texel.a * clamp(v_params.y, 0.0, 1.0);
+    if (u_gamma == 1) {
+        rgb = srgb_to_linear(rgb);
+    } else if (u_gamma == 2) {
+        rgb = linear_to_srgb(rgb);
+    }
+    fragColor = vec4(rgb * alpha, alpha);
+}
+"#;
+
 /// A GLSL dialect the backend can target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShaderDialect {
@@ -227,6 +296,15 @@ pub fn solid_sources(api: GlApi) -> ProgramSources {
     ProgramSources {
         vertex: dialect.adapt(SOLID_VERTEX_330),
         fragment: dialect.adapt(SOLID_FRAGMENT_330),
+    }
+}
+
+/// Image program sources for `api`.
+pub fn image_sources(api: GlApi) -> ProgramSources {
+    let dialect = ShaderDialect::for_api(api);
+    ProgramSources {
+        vertex: dialect.adapt(IMAGE_VERTEX_330),
+        fragment: dialect.adapt(IMAGE_FRAGMENT_330),
     }
 }
 

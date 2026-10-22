@@ -48,6 +48,8 @@ const EGL_BAD_SURFACE: EGLint = 0x300D;
 const EGL_CONTEXT_LOST: EGLint = 0x300E;
 
 const EGL_PLATFORM_X11_KHR: EGLenum = 0x31D5;
+#[cfg(feature = "wayland")]
+const EGL_PLATFORM_WAYLAND_KHR: EGLenum = 0x31D8;
 
 const EGL_NONE: EGLint = 0x3038;
 const EGL_NO_SURFACE_VALUE: *mut c_void = ptr::null_mut();
@@ -138,6 +140,14 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn XResizeWindow(display: *mut c_void, window: c_ulong, width: u32, height: u32) -> c_int;
     fn XSync(display: *mut c_void, discard: c_int) -> c_int;
+}
+
+#[cfg(feature = "wayland")]
+#[link(name = "wayland-egl")]
+unsafe extern "C" {
+    fn wl_egl_window_create(surface: *mut c_void, width: c_int, height: c_int) -> *mut c_void;
+    fn wl_egl_window_destroy(window: *mut c_void);
+    fn wl_egl_window_resize(window: *mut c_void, width: c_int, height: c_int, dx: c_int, dy: c_int);
 }
 
 // }}}
@@ -386,23 +396,24 @@ impl EglWindowSurface {
             )?;
         }
 
-        let (surface, context, api) = match unsafe { try_desktop(display, native_window) } {
-            Ok((surface, context)) => (surface, context, GlApi::OpenGl),
-            Err(_) => {
-                unsafe {
-                    let _ = eglBindAPI(EGL_OPENGL_ES_API);
-                }
-                match unsafe { try_gles(display, native_window) } {
-                    Ok((surface, context)) => (surface, context, GlApi::OpenGlEs3),
-                    Err(error) => {
-                        unsafe {
-                            let _ = eglTerminate(display);
+        let (surface, context, api) =
+            match unsafe { try_desktop(display, native_window as *mut c_void) } {
+                Ok((surface, context)) => (surface, context, GlApi::OpenGl),
+                Err(_) => {
+                    unsafe {
+                        let _ = eglBindAPI(EGL_OPENGL_ES_API);
+                    }
+                    match unsafe { try_gles(display, native_window as *mut c_void) } {
+                        Ok((surface, context)) => (surface, context, GlApi::OpenGlEs3),
+                        Err(error) => {
+                            unsafe {
+                                let _ = eglTerminate(display);
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
                     }
                 }
-            }
-        };
+            };
 
         if unsafe { eglMakeCurrent(display, surface, surface, context) } != EGL_TRUE {
             let error = EglError::last("eglMakeCurrent");
@@ -604,6 +615,342 @@ impl EglWindowSurface {
     }
 }
 
+// {{{ Wayland EGL surface
+
+/// An EGL window surface bound to a [`WaylandWindow`](crate::WaylandWindow).
+///
+/// This uses `EGL_PLATFORM_WAYLAND_KHR`, a `wl_egl_window` and the same
+/// clear/swap/readback helpers as the X11 surface. The surface must be dropped
+/// before the window that created it.
+#[cfg(feature = "wayland")]
+pub struct EglWaylandSurface {
+    display: EGLDisplay,
+    egl_window: *mut c_void,
+    surface: EGLSurface,
+    context: EGLContext,
+    gl: GlFns,
+    api: GlApi,
+    native_display: *mut c_void,
+    wayland_surface: *mut c_void,
+    width: u32,
+    height: u32,
+    egl_version: (i32, i32),
+    gl_version: Option<String>,
+    gl_renderer: Option<String>,
+    terminated: bool,
+}
+
+#[cfg(feature = "wayland")]
+impl EglWaylandSurface {
+    /// Create an RGB8 EGL surface for a Wayland window, using GL 3.3 core and
+    /// falling back to OpenGL ES 3.
+    pub fn new(window: &crate::WaylandWindow) -> Result<Self, EglError> {
+        let native_display = window.display_ptr();
+        let wayland_surface = window.wl_surface_ptr();
+        if native_display.is_null() || wayland_surface.is_null() {
+            return Err(EglError {
+                code: EGL_BAD_NATIVE_WINDOW,
+                operation: "WaylandWindow",
+            });
+        }
+        let (width, height) = window.size();
+        let egl_window = unsafe {
+            wl_egl_window_create(
+                wayland_surface,
+                width.max(1) as c_int,
+                height.max(1) as c_int,
+            )
+        };
+        if egl_window.is_null() {
+            return Err(EglError {
+                code: EGL_BAD_NATIVE_WINDOW,
+                operation: "wl_egl_window_create",
+            });
+        }
+        let display = unsafe {
+            let display =
+                eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, native_display, ptr::null());
+            if !display.is_null() {
+                display
+            } else {
+                let ext: Option<
+                    unsafe extern "C" fn(EGLenum, *mut c_void, *const EGLint) -> EGLDisplay,
+                > = load_proc(c"eglGetPlatformDisplayEXT").ok();
+                if let Some(ext) = ext {
+                    let display = ext(EGL_PLATFORM_WAYLAND_KHR, native_display, ptr::null());
+                    if !display.is_null() {
+                        display
+                    } else {
+                        eglGetDisplay(native_display)
+                    }
+                } else {
+                    eglGetDisplay(native_display)
+                }
+            }
+        };
+        if display.is_null() {
+            unsafe {
+                wl_egl_window_destroy(egl_window);
+            }
+            return Err(EglError::last("eglGetPlatformDisplay"));
+        }
+
+        let mut major = 0;
+        let mut minor = 0;
+        unsafe {
+            EglError::check(
+                eglInitialize(display, &mut major, &mut minor),
+                "eglInitialize",
+            )?;
+        }
+
+        let (surface, context, api) = match unsafe { try_desktop(display, egl_window) } {
+            Ok((surface, context)) => (surface, context, GlApi::OpenGl),
+            Err(_) => {
+                unsafe {
+                    let _ = eglBindAPI(EGL_OPENGL_ES_API);
+                }
+                match unsafe { try_gles(display, egl_window) } {
+                    Ok((surface, context)) => (surface, context, GlApi::OpenGlEs3),
+                    Err(error) => {
+                        unsafe {
+                            let _ = eglTerminate(display);
+                            wl_egl_window_destroy(egl_window);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        };
+
+        if unsafe { eglMakeCurrent(display, surface, surface, context) } != EGL_TRUE {
+            let error = EglError::last("eglMakeCurrent");
+            unsafe {
+                let _ = eglDestroyContext(display, context);
+                let _ = eglDestroySurface(display, surface);
+                let _ = eglTerminate(display);
+                wl_egl_window_destroy(egl_window);
+            }
+            return Err(error);
+        }
+
+        let gl = match unsafe { GlFns::load() } {
+            Ok(gl) => gl,
+            Err(error) => {
+                unsafe {
+                    let _ = eglMakeCurrent(
+                        display,
+                        EGL_NO_SURFACE_VALUE,
+                        EGL_NO_SURFACE_VALUE,
+                        EGL_NO_CONTEXT_VALUE,
+                    );
+                    let _ = eglDestroyContext(display, context);
+                    let _ = eglDestroySurface(display, surface);
+                    let _ = eglTerminate(display);
+                    wl_egl_window_destroy(egl_window);
+                }
+                return Err(error);
+            }
+        };
+        let (width, height) = unsafe { query_surface_size(display, surface, width, height) };
+        Ok(Self {
+            display,
+            egl_window,
+            surface,
+            context,
+            gl,
+            api,
+            native_display,
+            wayland_surface,
+            width,
+            height,
+            egl_version: (major, minor),
+            gl_version: gl.version_string(),
+            gl_renderer: gl.renderer_string(),
+            terminated: false,
+        })
+    }
+
+    pub fn display_ptr(&self) -> *mut c_void {
+        self.display
+    }
+
+    pub fn native_display(&self) -> *mut c_void {
+        self.native_display
+    }
+
+    pub fn wl_surface_ptr(&self) -> *mut c_void {
+        self.wayland_surface
+    }
+
+    pub fn api(&self) -> GlApi {
+        self.api
+    }
+
+    pub fn gl_fns(&self) -> GlFns {
+        self.gl
+    }
+
+    pub fn egl_version(&self) -> (i32, i32) {
+        self.egl_version
+    }
+
+    pub fn gl_version_string(&self) -> Option<&str> {
+        self.gl_version.as_deref()
+    }
+
+    pub fn gl_renderer_string(&self) -> Option<&str> {
+        self.gl_renderer.as_deref()
+    }
+
+    pub fn egl_vendor(&self) -> String {
+        query_egl_string(self.display, EGL_VENDOR).unwrap_or_default()
+    }
+
+    pub fn egl_version_string(&self) -> String {
+        query_egl_string(self.display, EGL_VERSION).unwrap_or_default()
+    }
+
+    pub fn egl_client_apis(&self) -> String {
+        query_egl_string(self.display, EGL_CLIENT_APIS).unwrap_or_default()
+    }
+
+    pub fn make_current(&self) -> Result<(), EglError> {
+        unsafe {
+            EglError::check(
+                eglMakeCurrent(self.display, self.surface, self.surface, self.context),
+                "eglMakeCurrent",
+            )
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn refresh_size(&mut self) -> (u32, u32) {
+        // `wl_egl_window_resize` is authoritative; eglQuerySurface on Wayland
+        // can keep reporting the previous size until the next buffer swap.
+        (self.width, self.height)
+    }
+
+    /// Resize the `wl_egl_window` and update the cached surface size.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), EglError> {
+        let width = width.max(1);
+        let height = height.max(1);
+        unsafe {
+            wl_egl_window_resize(self.egl_window, width as c_int, height as c_int, 0, 0);
+        }
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    pub fn swap_buffers(&self) -> Result<(), EglError> {
+        unsafe { EglError::check(eglSwapBuffers(self.display, self.surface), "eglSwapBuffers") }
+    }
+
+    pub fn set_swap_interval(&self, interval: i32) -> Result<(), EglError> {
+        unsafe { EglError::check(eglSwapInterval(self.display, interval), "eglSwapInterval") }
+    }
+
+    pub fn clear(&mut self, color: [f32; 4]) -> Result<(), EglError> {
+        self.make_current()?;
+        self.refresh_size();
+        self.gl
+            .viewport(0, 0, self.width as i32, self.height as i32);
+        self.gl.clear_color(color[0], color[1], color[2], color[3]);
+        self.gl.clear();
+        let error = self.gl.get_error();
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(EglError {
+                code: error as EGLint,
+                operation: "glClear",
+            })
+        }
+    }
+
+    /// Swap buffers after a clear. This is the normal per-frame entry point for
+    /// a Wayland window using EGL.
+    pub fn swap_after_clear(&mut self, color: [f32; 4]) -> Result<(), EglError> {
+        self.clear(color)?;
+        self.swap_buffers()
+    }
+
+    pub fn read_pixels(&mut self) -> Result<Vec<u8>, EglError> {
+        self.make_current()?;
+        self.refresh_size();
+        self.gl
+            .viewport(0, 0, self.width as i32, self.height as i32);
+        self.gl.finish();
+        let mut pixels = vec![0u8; self.width as usize * self.height as usize * 4];
+        unsafe {
+            self.gl
+                .read_rgba(self.width, self.height, pixels.as_mut_ptr().cast());
+        }
+        let error = self.gl.get_error();
+        if error == 0 {
+            Ok(pixels)
+        } else {
+            Err(EglError {
+                code: error as EGLint,
+                operation: "glReadPixels",
+            })
+        }
+    }
+
+    pub fn read_pixel(&mut self, x: u32, y: u32) -> Result<[u8; 4], EglError> {
+        let pixels = self.read_pixels()?;
+        if x >= self.width || y >= self.height {
+            return Err(EglError {
+                code: EGL_BAD_PARAMETER,
+                operation: "read_pixel",
+            });
+        }
+        let index = ((y * self.width + x) * 4) as usize;
+        Ok([
+            pixels[index],
+            pixels[index + 1],
+            pixels[index + 2],
+            pixels[index + 3],
+        ])
+    }
+}
+
+#[cfg(feature = "wayland")]
+impl Drop for EglWaylandSurface {
+    fn drop(&mut self) {
+        if self.terminated {
+            return;
+        }
+        unsafe {
+            let _ = eglMakeCurrent(
+                self.display,
+                EGL_NO_SURFACE_VALUE,
+                EGL_NO_SURFACE_VALUE,
+                EGL_NO_CONTEXT_VALUE,
+            );
+            if !self.surface.is_null() {
+                let _ = eglDestroySurface(self.display, self.surface);
+                self.surface = ptr::null_mut();
+            }
+            if !self.context.is_null() {
+                let _ = eglDestroyContext(self.display, self.context);
+                self.context = ptr::null_mut();
+            }
+            let _ = eglTerminate(self.display);
+            if !self.egl_window.is_null() {
+                wl_egl_window_destroy(self.egl_window);
+                self.egl_window = ptr::null_mut();
+            }
+        }
+        self.terminated = true;
+    }
+}
+
+// }}}
 impl Drop for EglWindowSurface {
     fn drop(&mut self) {
         if self.terminated {
@@ -632,7 +979,7 @@ impl Drop for EglWindowSurface {
 
 unsafe fn try_desktop(
     display: EGLDisplay,
-    native_window: u64,
+    native_window: *mut c_void,
 ) -> Result<(EGLSurface, EGLContext), EglError> {
     unsafe {
         EglError::check(eglBindAPI(EGL_OPENGL_API), "eglBindAPI")?;
@@ -665,7 +1012,7 @@ unsafe fn try_desktop(
 
 unsafe fn try_gles(
     display: EGLDisplay,
-    native_window: u64,
+    native_window: *mut c_void,
 ) -> Result<(EGLSurface, EGLContext), EglError> {
     let config = unsafe { choose_config(display, EGL_OPENGL_ES3_BIT_KHR)? };
     let context_attribs = [
@@ -758,11 +1105,9 @@ unsafe fn choose_config(display: EGLDisplay, renderable: EGLint) -> Result<EGLCo
 unsafe fn create_window_surface(
     display: EGLDisplay,
     config: EGLConfig,
-    native_window: u64,
+    native_window: *mut c_void,
 ) -> Result<EGLSurface, EglError> {
-    let surface = unsafe {
-        eglCreateWindowSurface(display, config, native_window as *mut c_void, ptr::null())
-    };
+    let surface = unsafe { eglCreateWindowSurface(display, config, native_window, ptr::null()) };
     if surface.is_null() {
         Err(EglError::last("eglCreateWindowSurface"))
     } else {

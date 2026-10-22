@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=kitr
+GenericName=Terminal emulator
+Comment=Rust port of the kitty terminal emulator
+TryExec=kitr
+Exec=kitr
+Icon=kitr
+Terminal=false
+StartupNotify=true
+Categories=System;TerminalEmulator;
+Keywords=terminal;console;shell;kitty;
+X-TerminalArgExec=--
+X-TerminalArgTitle=--title
