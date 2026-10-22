@@ -691,13 +691,13 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `freetype.c` | `kitty-fonts/src/freetype.rs` | in progress (metrics/glyph lookup; rendering/variable axes pending) |
 | `freetype_render_ui_text.c` | `kitty-fonts/src/ui_text.rs` | planned |
 | `gl.c` | `kitty-render/src/{egl,gl_backend}.rs` | in progress (headless EGL/GL 3.3 core backend; window/presentation pending) |
-| `glfw.c` | `kitty-os/src/glfw.rs` | planned |
-| `glfw-wrapper.c` | `kitty-os/src/glfw.rs` | planned |
+| `glfw.c` | `kitty-window/src/lib.rs` | in progress (Linux X11 backend; Wayland/Cocoa pending) |
+| `glfw-wrapper.c` | `kitty-window/src/lib.rs` | in progress (X11/EGL equivalent backend) |
 | `gl-wrapper.c` | `kitty-render/src/egl.rs` | in progress (function loading via eglGetProcAddress) |
 | `glyph-cache.c` | `kitty-render/src/atlas.rs` | in progress (CPU atlas; shaped-run sprites pending) |
 | `graphics.c` | `kitty-graphics/src/graphics.rs` | in progress (protocol parser + image pipeline; Screen/GPU integration pending) |
 | `history.c` | `kitty-core/src/history.rs` | **ported** (core ring; pager/rewrap pending) |
-| `hyperlink.c` | `kitty-screen/src/hyperlink.rs` | planned |
+| `hyperlink.c` | `kitty-screen/src/hyperlink.rs` | **ported** |
 | `key_encoding.c` | `kitty-input/src/key_encoding.rs` | **ported** |
 | `keys.c` | `kitty-input/src/keys.rs` | **ported** (key map + dispatch; Screen/options integration pending) |
 | `kittens.c` | `kitty-kittens/src/lib.rs` | planned |
@@ -710,7 +710,7 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `monotonic.c` | `kitty-os/src/monotonic.rs` | **ported** |
 | `mouse.c` | `kitty-input/src/mouse.rs` | **ported** (protocols/tracking; Screen selection integration pending) |
 | `png-reader.c` | `kitty-graphics/src/png_reader.rs` | **ported** (no ICC/lcms color management) |
-| `resize.c` | `kitty-screen/src/resize.rs` | planned |
+| `resize.c` | `kitty-screen/src/screen.rs` (rewrap) | **ported** |
 | `rowcolumn-diacritics.c` | `kitty-vt/src/diacritics.rs` | planned |
 | `screen.c` | `kitty-screen/src/screen.rs` | in progress (draw/cursor/edit/scroll/alt-screen/CSI subset; graphics/resize/mouse/DnD/OSC mutations pending) |
 | `shaders.c` | `kitty-render/src/gl_shaders.rs` | in progress (functional GLSL subset; kitty Slang programs pending) |

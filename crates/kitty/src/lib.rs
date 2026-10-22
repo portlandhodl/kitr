@@ -37,6 +37,9 @@ const INPUT_CHUNK: usize = 64 * 1024;
 const MAX_PENDING_INPUT: usize = 4 * 1024 * 1024;
 const DEFAULT_SCROLLBACK: u32 = 10_000;
 
+#[cfg(feature = "gui")]
+pub mod gui;
+
 static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Parsed command line options.
@@ -50,6 +53,28 @@ pub struct Options {
     pub command: Vec<OsString>,
     /// True when the command followed `--`/`-e`; disables the `-c` shortcut.
     pub use_separator: bool,
+    /// Whether to use the GUI, the headless runner, or decide from `$DISPLAY`.
+    pub gui: GuiMode,
+    /// Explicit `--config` path.
+    pub config: Option<OsString>,
+    /// Window title override.
+    pub title: Option<String>,
+    /// Render then write a top-down PPM and exit.
+    pub screenshot: Option<std::path::PathBuf>,
+    /// True when `--scrollback` was given on the command line.
+    pub scrollback_explicit: bool,
+}
+
+/// Frontend selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GuiMode {
+    /// GUI when `$DISPLAY` is set (unless `--dump-screen` is used).
+    #[default]
+    Auto,
+    /// Force the old headless runner.
+    Headless,
+    /// Force the X11/EGL frontend.
+    Gui,
 }
 
 impl Default for Options {
@@ -61,6 +86,11 @@ impl Default for Options {
             timeout: None,
             command: Vec::new(),
             use_separator: false,
+            gui: GuiMode::Auto,
+            config: None,
+            title: None,
+            screenshot: None,
+            scrollback_explicit: false,
         }
     }
 }
@@ -132,21 +162,27 @@ impl RunOutcome {
 }
 
 const HELP: &str = "\
-kitr - headless terminal\n\
+kitr - terminal\n\
 \n\
 Usage: kitr [OPTIONS] [-e|--] [COMMAND [ARGS...]]\n\
 \n\
 Options:\n\
   --size COLSxROWS   Initial PTY and screen size (default: terminal size or 80x24)\n\
   --scrollback N     Scrollback capacity in lines (default: 10000)\n\
-  --dump-screen      Write the final screen as text to stdout\n\
+  --dump-screen      Write the final screen as text to stdout (headless unless --gui)\n\
   --timeout SECONDS  Kill the child after SECONDS (fractional values allowed)\n\
+  --headless         Force the old headless runner\n\
+  --gui              Force the X11/EGL window frontend\n\
+  --config PATH      Load configuration from PATH\n\
+  --title TITLE      Set the window title\n\
+  --screenshot FILE  Render a few frames, write FILE as PPM (P6), then exit\n\
   -h, --help         Show this help\n\
   -V, --version      Show the version\n\
 \n\
-If no command is given, $SHELL (or /bin/sh) is started. Everything after\n\
--e or -- is passed through as argv without further option parsing. The\n\
-shortcut `kitr -c 'script'` runs the default shell with -c.\n";
+The GUI is used by default when $DISPLAY is set. If no command is given,\n\
+$SHELL (or /bin/sh) is started. Everything after -e or -- is passed through\n\
+as argv without further option parsing. The shortcut `kitr -c 'script'`\n\
+runs the default shell with -c.\n";
 
 /// Parse `kitr` arguments.
 pub fn parse_args<I, S>(args: I) -> Result<CliAction, ArgError>
@@ -162,6 +198,20 @@ where
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
             "--dump-screen" => options.dump_screen = true,
+            "--headless" => options.gui = GuiMode::Headless,
+            "--gui" => options.gui = GuiMode::Gui,
+            "--config" => {
+                let value = iter.next().ok_or(ArgError::MissingValue("--config"))?;
+                options.config = Some(value);
+            }
+            "--title" => {
+                let value = iter.next().ok_or(ArgError::MissingValue("--title"))?;
+                options.title = Some(value.to_string_lossy().into_owned());
+            }
+            "--screenshot" => {
+                let value = iter.next().ok_or(ArgError::MissingValue("--screenshot"))?;
+                options.screenshot = Some(std::path::PathBuf::from(value));
+            }
             "-e" | "--" => {
                 options.use_separator = true;
                 options.command = iter.collect();
@@ -179,6 +229,7 @@ where
             "--scrollback" => {
                 let value = iter.next().ok_or(ArgError::MissingValue("--scrollback"))?;
                 options.scrollback = parse_u32("--scrollback", &value.to_string_lossy())?;
+                options.scrollback_explicit = true;
             }
             "--timeout" => {
                 let value = iter.next().ok_or(ArgError::MissingValue("--timeout"))?;
@@ -187,11 +238,21 @@ where
             _ if text.starts_with("--size=") => {
                 options.size = Some(parse_size(&text["--size=".len()..])?);
             }
-            _ if text.starts_with("--scrollback=") => {
-                options.scrollback = parse_u32("--scrollback", &text["--scrollback=".len()..])?;
-            }
             _ if text.starts_with("--timeout=") => {
                 options.timeout = Some(parse_timeout(&text["--timeout=".len()..])?);
+            }
+            _ if text.starts_with("--config=") => {
+                options.config = Some(OsString::from(&text["--config=".len()..]));
+            }
+            _ if text.starts_with("--title=") => {
+                options.title = Some(text["--title=".len()..].to_string());
+            }
+            _ if text.starts_with("--screenshot=") => {
+                options.screenshot = Some(std::path::PathBuf::from(&text["--screenshot=".len()..]));
+            }
+            _ if text.starts_with("--scrollback=") => {
+                options.scrollback = parse_u32("--scrollback", &text["--scrollback=".len()..])?;
+                options.scrollback_explicit = true;
             }
             _ if text.starts_with('-') && text != "-" => {
                 return Err(ArgError::UnknownOption(text.into_owned()));
@@ -249,6 +310,17 @@ fn parse_timeout(value: &str) -> Result<Duration, ArgError> {
     Ok(Duration::from_secs_f64(seconds))
 }
 
+fn use_gui(options: &Options) -> bool {
+    match options.gui {
+        GuiMode::Gui => true,
+        GuiMode::Headless => false,
+        GuiMode::Auto => {
+            !options.dump_screen
+                && (options.screenshot.is_some() || std::env::var_os("DISPLAY").is_some())
+        }
+    }
+}
+
 /// Run `kitr` with process stdio and return the process exit code.
 pub fn run<I, S>(args: I) -> io::Result<ExitCode>
 where
@@ -271,7 +343,22 @@ where
             Ok(ExitCode::SUCCESS)
         }
         CliAction::Run(options) => {
-            let outcome = run_options(&options, Input::Inherit)?;
+            let gui = use_gui(&options);
+            let outcome = if gui {
+                #[cfg(feature = "gui")]
+                {
+                    gui::run_gui(&options, Input::Inherit)?
+                }
+                #[cfg(not(feature = "gui"))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "this build has no GUI support (rebuild with the gui feature)",
+                    ));
+                }
+            } else {
+                run_options(&options, Input::Inherit)?
+            };
             if options.dump_screen {
                 let text = dump_screen(&outcome.screen);
                 let mut stdout = io::stdout().lock();
@@ -846,6 +933,42 @@ mod tests {
         assert!(command.len() >= 3);
         assert_eq!(command[1], "-c");
         assert_eq!(command[2], "printf hi");
+    }
+
+    #[test]
+    fn parses_gui_frontend_options() {
+        let action = parse_args([
+            "--gui",
+            "--config",
+            "/tmp/kitty.conf",
+            "--title=hello",
+            "--screenshot",
+            "/tmp/out.ppm",
+            "--scrollback",
+            "42",
+        ])
+        .unwrap();
+        let CliAction::Run(options) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.gui, GuiMode::Gui);
+        assert_eq!(
+            options.config.as_deref(),
+            Some(OsStr::new("/tmp/kitty.conf"))
+        );
+        assert_eq!(options.title.as_deref(), Some("hello"));
+        assert_eq!(
+            options.screenshot.as_deref(),
+            Some(std::path::Path::new("/tmp/out.ppm"))
+        );
+        assert_eq!(options.scrollback, 42);
+        assert!(options.scrollback_explicit);
+
+        let action = parse_args(["--headless"]).unwrap();
+        let CliAction::Run(options) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(options.gui, GuiMode::Headless);
     }
 
     #[test]

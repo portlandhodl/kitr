@@ -95,7 +95,7 @@ fn main() {
         backend.renderer().trim(),
         backend.vendor().trim(),
         {
-            let (major, minor) = backend.context().egl_version();
+            let (major, minor) = backend.context().expect("owned EGL context").egl_version();
             format!("{major}.{minor}")
         },
         backend.shading_language_version()

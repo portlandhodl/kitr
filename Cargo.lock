@@ -6,10 +6,16 @@ version = 4
 name = "kitty"
 version = "0.1.0"
 dependencies = [
+ "kitty-config",
  "kitty-core",
+ "kitty-fonts",
+ "kitty-input",
  "kitty-os",
+ "kitty-render",
  "kitty-screen",
+ "kitty-unicode",
  "kitty-vt",
+ "kitty-window",
 ]
 
 [[package]]

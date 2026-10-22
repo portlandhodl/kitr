@@ -10,8 +10,31 @@ description = "kitr terminal binary"
 name = "kitr"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# X11 + EGL/GL window, fonts, configuration and keyboard/mouse input.
+gui = [
+    "dep:kitty-window",
+    "dep:kitty-render",
+    "dep:kitty-fonts",
+    "dep:kitty-config",
+    "dep:kitty-input",
+    "dep:kitty-unicode",
+    "kitty-render/gl",
+]
+
 [dependencies]
 kitty-core = { path = "../kitty-core" }
 kitty-vt = { path = "../kitty-vt" }
 kitty-screen = { path = "../kitty-screen" }
 kitty-os = { path = "../kitty-os" }
+kitty-window = { path = "../kitty-window", optional = true }
+kitty-render = { path = "../kitty-render", optional = true }
+kitty-fonts = { path = "../kitty-fonts", optional = true }
+kitty-config = { path = "../kitty-config", optional = true }
+kitty-input = { path = "../kitty-input", optional = true }
+kitty-unicode = { path = "../kitty-unicode", optional = true }
+
+[[example]]
+name = "bench_gui"
+required-features = ["gui"]

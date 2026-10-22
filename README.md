@@ -11,10 +11,11 @@ derivative work of kitty and is licensed under **GPL-3.0-or-later**. See
 
 ## Status
 
-This is an early, incomplete port. It is **not** a usable GUI terminal yet: the
-windowing layer, OpenGL renderer, full graphics/remote-control integration and
-Python kittens are not ported. A headless `kitr` binary can spawn a shell in a
-PTY, maintain a screen and dump text. Do not treat any subsystem as complete until
+This is an early but usable Linux/X11 port. `kitr` opens a real EGL/OpenGL
+window, runs a shell, renders background/text/cursor/underlines, handles
+keyboard, mouse, clipboard, resize and scrollback, and can write a PPM
+screenshot. Wayland, macOS, IME, tabs/layouts, kitty graphics images, remote
+control and kittens are not integrated yet. Do not treat any subsystem as complete until
 it is marked **ported** in [PORTING.md](PORTING.md).
 
 | Crate | Ported from | Status |
@@ -23,16 +24,17 @@ it is marked **ported** in [PORTING.md](PORTING.md).
 | `kitty-vt` | `vt-parser.c`, `charsets.c` | parser state machine ported; Screen dispatch in `kitty-screen` |
 | `kitty-simd` | `simd-string*.c` | scalar + SSE2/AVX2/AVX-512, runtime dispatched |
 | `kitty-unicode` | `char-props.c`, `char-props-data.h`, `wcswidth.c` | ported, Unicode 17 tables generated and checked in |
-| `kitty-screen` | `screen.c`, `cursor.c`, `line.c`, `lineops.h` | core screen/cursor/lineops subset ported |
+| `kitty-screen` | `screen.c`, `cursor.c`, `line.c`, `lineops.h`, `resize.c`, `hyperlink.c` | screen/cursor/lineops, rewrap resize, OSC 8 hyperlinks, selection, placements and OSC colors |
 | `kitty-input` | `keys.c`, `key_encoding.c`, `mouse.c` | keyboard, kitty protocol, mouse protocols ported |
 | `kitty-os` | `child.c`, `child-monitor.c`, `loop-utils.c`, `monotonic.c` | Linux PTY/fork/exec, poll loop, SIGCHLD monitor ported |
 | `kitty-config` | `shlex.c`, `state.c`, `config.py`, `options/*` | shlex, typed options, colors, includes and overrides ported; advanced options pending |
 | `kitty-fonts` | `fonts.c`, `freetype.c`, `fontconfig.c`, `font-names.c`, `shaped-run-cache.c` | FreeType/HarfBuzz/Fontconfig FFI, metrics, fallback, shaping, glyph rasterization and cache |
 | `kitty-graphics` | `graphics.c`, `png-reader.c`, `mime-cache.c`, graphics parser | PNG decode, MIME, base64, graphics command parser and image pipeline; Screen/GPU integration pending |
 | `kitty-remote` | `crypto.c`, protocol half of `data-types.c`, `fast-file-copy.c` | X25519/ECDH, AES-256-GCM, base64/base85, DCS framing, file-copy primitives |
-| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | CPU core: damage, atlas, instances, decorations; headless EGL/GL backend (`--features gl`, llvmpipe verified); window presentation and full shader parity pending |
+| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | CPU core plus EGL/GL 3.3 backend, damage, atlas, instances, decorations; window presentation wired; full Slang shader parity pending |
 | `kitty-kittens` | `kittens.c`, Python/Go kittens | scaffold only |
-| `kitty` (binary) | `main.py`, launcher | headless PTY terminal (`kitr`); no window/renderer yet |
+| `kitty-window` | GLFW window/event layer | Linux X11 backend: window/events, XKB keys, mouse, clipboard, EGL surface; Wayland/Cocoa pending |
+| `kitty` (binary) | `main.py`, launcher | headless and X11 GUI terminal (`kitr`), run loop, config, font/render integration |
 
 [PORTING.md](PORTING.md) contains the complete C/Python inventory, the crate
 dependency graph, the phase plan, per-file mapping, performance plan and risk
@@ -51,7 +53,14 @@ cargo build --release
 Headless terminal:
 
 ```sh
-cargo run --release -p kitty -- --size 120x40 --dump-screen -- /bin/sh -c 'echo hello'
+cargo run --release -p kitty -- --headless --size 120x40 --dump-screen -- /bin/sh -c 'echo hello'
+```
+
+GUI terminal (Linux/X11, needs a display; use `xvfb-run` for headless testing):
+
+```sh
+cargo run --release -p kitty -- --size 100x30 -- /bin/sh
+xvfb-run -a cargo run --release -p kitty -- --screenshot shot.ppm --timeout 2 -- /bin/sh -c 'printf "hello\n"'
 ```
 
 Examples (no external dependencies):

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Headless OpenGL backend for the CPU instance stream.
 //!
-//! [`GlBackend`] owns an EGL pbuffer context, two shader programs, one shared
-//! VAO/VBO pair and a GPU texture per atlas page. It consumes the [`Frame`]
-//! produced by [`crate::RendererCore`]:
+//! [`GlBackend`] owns two shader programs, one shared VAO/VBO pair and a GPU
+//! texture per atlas page. [`GlBackend::new`] creates a headless EGL pbuffer
+//! context; [`GlBackend::with_loader`] instead draws into a caller-owned
+//! current EGL context (for example a window surface supplied by a windowing
+//! crate). It consumes the [`Frame`] produced by [`crate::RendererCore`]:
 //!
 //! ```no_run
 //! # #[cfg(feature = "gl")] {
@@ -74,9 +76,9 @@ use crate::egl::{
     GL_ARRAY_BUFFER, GL_BLEND, GL_CLAMP_TO_EDGE, GL_COLOR_BUFFER_BIT, GL_COMPILE_STATUS,
     GL_CULL_FACE, GL_DEPTH_TEST, GL_DYNAMIC_DRAW, GL_FALSE, GL_FLOAT, GL_FRAGMENT_SHADER,
     GL_INFO_LOG_LENGTH, GL_LINEAR, GL_LINK_STATUS, GL_NEAREST, GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
-    GL_R8, GL_RED, GL_RGBA, GL_RGBA8, GL_SCISSOR_TEST, GL_STATIC_DRAW, GL_TEXTURE0, GL_TEXTURE_2D,
-    GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
-    GL_TRIANGLE_STRIP, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE, GL_VERTEX_SHADER,
+    GL_PACK_ALIGNMENT, GL_R8, GL_RED, GL_RGBA, GL_RGBA8, GL_SCISSOR_TEST, GL_STATIC_DRAW,
+    GL_TEXTURE0, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S,
+    GL_TEXTURE_WRAP_T, GL_TRIANGLE_STRIP, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE, GL_VERTEX_SHADER,
 };
 use crate::geom::Rect;
 use crate::gl_shaders;
@@ -573,7 +575,7 @@ unsafe fn create_geometry(gl: &GlFns) -> Result<(u32, u32, u32), GlError> {
 // }}}
 // {{{ Backend
 
-/// A headless OpenGL renderer.
+/// A headless or caller-owned OpenGL renderer.
 pub struct GlBackend {
     config: GlBackendConfig,
     gl: GlFns,
@@ -590,17 +592,50 @@ pub struct GlBackend {
     height: u32,
     last_stats: RenderStats,
     // Keep the context last: Rust drops fields in declaration order, so all
-    // GL resources are released while the context is still alive.
-    context: GlContext,
+    // GL resources are released while an owned context is still alive.
+    // `None` means the caller owns and manages the current EGL context.
+    context: Option<GlContext>,
 }
 
 impl GlBackend {
-    /// Create a context and all GPU resources.
+    /// Create a headless pbuffer context and all GPU resources.
     pub fn new(config: GlBackendConfig) -> Result<Self, GlBackendError> {
         let context = GlContext::new(config.context)?;
         context.make_current()?;
         // SAFETY: a context is current.
         let gl = unsafe { GlFns::load()? };
+        let (width, height) = context.size();
+        Self::from_parts(gl, width, height, config, Some(context))
+    }
+
+    /// Build a backend that draws into the caller's current EGL surface.
+    ///
+    /// The caller must have made its EGL context current on this thread and
+    /// must keep it current whenever [`render`](Self::render),
+    /// [`sync_atlas`](Self::sync_atlas), [`clear`](Self::clear) or
+    /// [`read_pixels`](Self::read_pixels) is called, and while this value is
+    /// dropped.
+    pub fn with_loader(gl: GlFns, width: u32, height: u32) -> Result<Self, GlBackendError> {
+        Self::with_loader_config(gl, width, height, GlBackendConfig::default())
+    }
+
+    /// [`with_loader`](Self::with_loader) with an explicit configuration.
+    pub fn with_loader_config(
+        gl: GlFns,
+        width: u32,
+        height: u32,
+        config: GlBackendConfig,
+    ) -> Result<Self, GlBackendError> {
+        Self::from_parts(gl, width.max(1), height.max(1), config, None)
+    }
+
+    fn from_parts(
+        gl: GlFns,
+        width: u32,
+        height: u32,
+        config: GlBackendConfig,
+        context: Option<GlContext>,
+    ) -> Result<Self, GlBackendError> {
         gl.check("load entry points")?;
 
         let version = gl
@@ -627,9 +662,10 @@ impl GlBackend {
         }
 
         let programs = Programs::new(&gl, config.context.api)?;
-        // SAFETY: a context is current.
+        // SAFETY: the caller guarantees a current context.
         let (vao, quad_vbo, instance_vbo) = unsafe { create_geometry(&gl)? };
-        let (width, height) = context.size();
+        let width = width.max(1);
+        let height = height.max(1);
         // SAFETY: setting state for the current context.
         unsafe {
             (gl.glViewport)(0, 0, width as i32, height as i32);
@@ -661,10 +697,17 @@ impl GlBackend {
         })
     }
 
-    /// The underlying EGL context.
+    /// The underlying EGL context, if this backend owns one.
     #[inline]
-    pub fn context(&self) -> &GlContext {
-        &self.context
+    pub fn context(&self) -> Option<&GlContext> {
+        self.context.as_ref()
+    }
+
+    fn ensure_current(&self) -> Result<(), GlBackendError> {
+        if let Some(context) = &self.context {
+            context.make_current()?;
+        }
+        Ok(())
     }
 
     /// Current drawable size in pixels.
@@ -705,7 +748,10 @@ impl GlBackend {
 
     /// Attributes of the selected EGL config.
     pub fn config_attribs(&self) -> ConfigAttribs {
-        self.context.config_attribs()
+        self.context
+            .as_ref()
+            .map(GlContext::config_attribs)
+            .unwrap_or_default()
     }
 
     /// Statistics from the most recent render.
@@ -720,16 +766,32 @@ impl GlBackend {
         self.atlas_pages.len()
     }
 
-    /// Resize the pbuffer and keep the GPU resources.
+    /// Resize the owned pbuffer (if any) and keep the GPU resources.
+    ///
+    /// A caller-owned window surface is resized by the caller; this only
+    /// updates the viewport and scissor geometry it uses.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), GlBackendError> {
-        self.context.resize(width, height)?;
-        self.context.make_current()?;
-        let (width, height) = self.context.size();
-        self.width = width;
-        self.height = height;
+        if let Some(context) = &mut self.context {
+            context.resize(width, height)?;
+            context.make_current()?;
+            let (width, height) = context.size();
+            self.set_size(width, height)?;
+        } else {
+            self.set_size(width, height)?;
+        }
+        Ok(())
+    }
+
+    /// Set the drawable size without touching an owned surface.
+    ///
+    /// Use this after resizing a caller-provided EGL window surface.
+    pub fn set_size(&mut self, width: u32, height: u32) -> Result<(), GlBackendError> {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.ensure_current()?;
         // SAFETY: a context is current.
         unsafe {
-            (self.gl.glViewport)(0, 0, width as i32, height as i32);
+            (self.gl.glViewport)(0, 0, self.width as i32, self.height as i32);
         }
         self.gl.check("resize")?;
         Ok(())
@@ -737,7 +799,7 @@ impl GlBackend {
 
     /// Clear the whole drawable to `color`.
     pub fn clear(&mut self, color: Rgba8) -> Result<(), GlBackendError> {
-        self.context.make_current()?;
+        self.ensure_current()?;
         let color = self.storage_color(color);
         // SAFETY: a context is current and the viewport matches the pbuffer.
         unsafe {
@@ -760,7 +822,7 @@ impl GlBackend {
         atlas: &GlyphAtlas,
         frame: &Frame,
     ) -> Result<AtlasSyncStats, GlBackendError> {
-        self.context.make_current()?;
+        self.ensure_current()?;
         let mut stats = AtlasSyncStats::default();
 
         let mut changed: BTreeSet<u32> = BTreeSet::new();
@@ -942,7 +1004,7 @@ impl GlBackend {
         frame: &Frame,
         config: &RenderConfig,
     ) -> Result<RenderStats, GlBackendError> {
-        self.context.make_current()?;
+        self.ensure_current()?;
         let scissors = self.scissor_rects(frame, config);
 
         self.instances.clear();
@@ -968,8 +1030,26 @@ impl GlBackend {
 
     /// Read the framebuffer as tightly packed RGBA8, top-left origin.
     pub fn read_pixels(&mut self) -> Result<Vec<u8>, GlBackendError> {
-        self.context.make_current()?;
-        let mut pixels = self.context.read_pixels(&self.gl)?;
+        self.ensure_current()?;
+        let width = self.width;
+        let height = self.height;
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        // SAFETY: the buffer is exactly width*height RGBA8 and a context is
+        // current. GL returns rows bottom-up, which is flipped below.
+        unsafe {
+            (self.gl.glPixelStorei)(GL_PACK_ALIGNMENT, 1);
+            (self.gl.glReadPixels)(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                pixels.as_mut_ptr().cast(),
+            );
+            (self.gl.glFinish)();
+        }
+        self.gl.check("glReadPixels")?;
         let stride = self.width as usize * 4;
         if stride > 0 {
             let mut scratch = vec![0u8; stride];
@@ -1310,13 +1390,17 @@ impl GlBackend {
 
 impl Drop for GlBackend {
     fn drop(&mut self) {
-        if self.context.make_current().is_err() {
-            // No current context: make sure Programs::drop does not call GL.
-            self.programs.glyph = 0;
-            self.programs.solid = 0;
-            return;
+        if let Some(context) = &self.context {
+            if context.make_current().is_err() {
+                // No current context: make sure Programs::drop does not call GL.
+                self.programs.glyph = 0;
+                self.programs.solid = 0;
+                return;
+            }
         }
-        // SAFETY: all ids are owned by this backend and the context is current.
+        // With a caller-owned context we assume the caller kept it current.
+        // SAFETY: all ids are owned by this backend and a context is current
+        // (owned here, or supplied and kept current by the caller).
         unsafe {
             if self.instance_vbo != 0 {
                 (self.gl.glDeleteBuffers)(1, &self.instance_vbo);

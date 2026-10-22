@@ -15,6 +15,7 @@ use kitty_os::pty;
 
 fn base_args<'a>(size: &'a str, script: &'a str) -> Vec<&'a str> {
     vec![
+        "--headless",
         "--size",
         size,
         "--dump-screen",
@@ -136,6 +137,7 @@ fn timeout_kills_a_running_child() {
     let started = Instant::now();
     let output = run_kitr(
         &[
+            "--headless",
             "--size",
             "20x5",
             "--timeout",

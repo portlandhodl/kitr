@@ -68,7 +68,9 @@
 //!   adaptation) for glyph quads, solid backgrounds/decorations/cursors and
 //!   rounded-rectangle SDFs, plus optional gamma conversion;
 //! * [`gl_backend`] — instanced drawing, per-page atlas textures, scissor-based
-//!   damage, premultiplied blending and `read_pixels()`.
+//!   damage, premultiplied blending and `read_pixels()`. `GlBackend::new`
+//!   creates its own headless pbuffer context; `GlBackend::with_loader` reuses
+//!   a caller-provided current EGL window context.
 //!
 //! The shaders are a functional subset, not a line-for-line port of
 //! `kitty/shaders/*.slang` (see [`gl_shaders`]).
