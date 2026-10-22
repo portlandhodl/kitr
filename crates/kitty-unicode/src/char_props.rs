@@ -340,9 +340,17 @@ pub fn char_props_for(ch: CharType) -> CharProps {
     let diff = (ch as i64) - (MAX_UNICODE as i64 + 1);
     let mask = (diff >> 63) as u32;
     let ch = ch & mask;
-    let t1 = CHAR_PROPS_T1[(ch >> CHAR_PROPS_SHIFT) as usize] as usize;
-    let index = (t1 << CHAR_PROPS_SHIFT) + (ch & CHAR_PROPS_MASK) as usize;
-    CHAR_PROPS_T3[CHAR_PROPS_T2[index] as usize]
+    // Safety: ch <= MAX_UNICODE here, so the t1 index is < CHAR_PROPS_T1.len().
+    // The generator verified that every t1 entry points at a complete block in
+    // t2 and every t2 entry is a valid t3 index.
+    unsafe {
+        let t1 = *CHAR_PROPS_T1.get_unchecked((ch >> CHAR_PROPS_SHIFT) as usize) as usize;
+        let index = (t1 << CHAR_PROPS_SHIFT) + (ch & CHAR_PROPS_MASK) as usize;
+        debug_assert!(index < CHAR_PROPS_T2.len());
+        let t3 = *CHAR_PROPS_T2.get_unchecked(index) as usize;
+        debug_assert!(t3 < CHAR_PROPS_T3.len());
+        *CHAR_PROPS_T3.get_unchecked(t3)
+    }
 }
 
 /// `wcwidth_std()` from char-props.h.
@@ -464,10 +472,16 @@ pub fn grapheme_segmentation_step(
     ch: CharProps,
 ) -> GraphemeSegmentationResult {
     let key = ((r.state() as usize) << 7) | ch.grapheme_segmentation_property() as usize;
-    let t1 = (GRAPHEME_SEGMENTATION_RESULT_T1[key >> GRAPHEME_SEGMENTATION_RESULT_SHIFT] as usize)
-        << GRAPHEME_SEGMENTATION_RESULT_SHIFT;
-    let index = t1 + (key & GRAPHEME_SEGMENTATION_RESULT_MASK as usize);
-    GRAPHEME_SEGMENTATION_RESULT_T2[index]
+    // Safety: key is at most 16 bits, so key >> shift is in t1. The generator
+    // verified that every t1 entry points at a complete t2 block.
+    unsafe {
+        let t1 = (*GRAPHEME_SEGMENTATION_RESULT_T1
+            .get_unchecked(key >> GRAPHEME_SEGMENTATION_RESULT_SHIFT) as usize)
+            << GRAPHEME_SEGMENTATION_RESULT_SHIFT;
+        let index = t1 + (key & GRAPHEME_SEGMENTATION_RESULT_MASK as usize);
+        debug_assert!(index < GRAPHEME_SEGMENTATION_RESULT_T2.len());
+        *GRAPHEME_SEGMENTATION_RESULT_T2.get_unchecked(index)
+    }
 }
 
 // Keep the compiler honest about the generated table geometry (the generated

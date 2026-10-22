@@ -145,16 +145,25 @@ impl UTF8Decoder {
 /// Scalar decode helper used by the SIMD implementations for their slow path.
 /// Returns the number of bytes consumed.
 pub fn decode_all_scalar(d: &mut UTF8Decoder, src: &[u8]) -> usize {
+    d.ensure_capacity(src.len());
+    let out = d.output_ptr();
+    let mut out_pos = d.output_len();
     let mut pos = 0;
     while pos < src.len() {
         let ch = src[pos];
         pos += 1;
         match decode_utf8(&mut d.cur, &mut d.codep, ch) {
-            UTF8_ACCEPT => d.push_codepoint(d.codep),
+            UTF8_ACCEPT => {
+                // SAFETY: capacity for src.len() codepoints was reserved.
+                unsafe { out.add(out_pos).write(d.codep) };
+                out_pos += 1;
+            }
             UTF8_REJECT => {
                 let prev_was_accept = d.prev == UTF8_ACCEPT;
                 d.reset();
-                d.push_codepoint(0xfffd);
+                // SAFETY: as above.
+                unsafe { out.add(out_pos).write(0xfffd) };
+                out_pos += 1;
                 if !prev_was_accept {
                     pos -= 1;
                     continue; // so that prev is correct
@@ -164,6 +173,7 @@ pub fn decode_all_scalar(d: &mut UTF8Decoder, src: &[u8]) -> usize {
         }
         d.prev = d.cur;
     }
+    d.set_output_len(out_pos);
     pos
 }
 
@@ -171,16 +181,25 @@ pub fn decode_all_scalar(d: &mut UTF8Decoder, src: &[u8]) -> usize {
 /// partial sequence at the start of an input. Returns the number of bytes
 /// consumed.
 pub fn decode_to_accept_scalar(d: &mut UTF8Decoder, src: &[u8]) -> usize {
+    d.ensure_capacity(src.len());
+    let out = d.output_ptr();
+    let mut out_pos = d.output_len();
     let mut pos = 0;
     while pos < src.len() && d.cur != UTF8_ACCEPT {
         let ch = src[pos];
         pos += 1;
         match decode_utf8(&mut d.cur, &mut d.codep, ch) {
-            UTF8_ACCEPT => d.push_codepoint(d.codep),
+            UTF8_ACCEPT => {
+                // SAFETY: capacity for src.len() codepoints was reserved.
+                unsafe { out.add(out_pos).write(d.codep) };
+                out_pos += 1;
+            }
             UTF8_REJECT => {
                 let prev_was_accept = d.prev == UTF8_ACCEPT;
                 d.reset();
-                d.push_codepoint(0xfffd);
+                // SAFETY: as above.
+                unsafe { out.add(out_pos).write(0xfffd) };
+                out_pos += 1;
                 if !prev_was_accept {
                     pos -= 1;
                     continue;
@@ -190,6 +209,7 @@ pub fn decode_to_accept_scalar(d: &mut UTF8Decoder, src: &[u8]) -> usize {
         }
         d.prev = d.cur;
     }
+    d.set_output_len(out_pos);
     pos
 }
 
@@ -198,22 +218,33 @@ pub fn decode_to_accept_scalar(d: &mut UTF8Decoder, src: &[u8]) -> usize {
 pub fn decode_to_esc_scalar(d: &mut UTF8Decoder, src: &[u8]) -> bool {
     d.begin_call();
     d.ensure_capacity(src.len());
+    let out = d.output_ptr();
+    let mut out_pos = 0usize;
     while d.num_consumed < src.len() {
         let ch = src[d.num_consumed];
         d.num_consumed += 1;
         if ch == 0x1b {
             if d.cur != UTF8_ACCEPT {
-                d.push_codepoint(0xfffd);
+                // SAFETY: capacity for src.len() codepoints was reserved.
+                unsafe { out.add(out_pos).write(0xfffd) };
+                out_pos += 1;
             }
+            d.set_output_len(out_pos);
             d.reset();
             return true;
         } else {
             match decode_utf8(&mut d.cur, &mut d.codep, ch) {
-                UTF8_ACCEPT => d.push_codepoint(d.codep),
+                UTF8_ACCEPT => {
+                    // SAFETY: as above.
+                    unsafe { out.add(out_pos).write(d.codep) };
+                    out_pos += 1;
+                }
                 UTF8_REJECT => {
                     let prev_was_accept = d.prev == UTF8_ACCEPT;
                     d.reset();
-                    d.push_codepoint(0xfffd);
+                    // SAFETY: as above.
+                    unsafe { out.add(out_pos).write(0xfffd) };
+                    out_pos += 1;
                     if !prev_was_accept {
                         d.num_consumed -= 1;
                         continue; // so that prev is correct
@@ -224,5 +255,6 @@ pub fn decode_to_esc_scalar(d: &mut UTF8Decoder, src: &[u8]) -> bool {
         }
         d.prev = d.cur;
     }
+    d.set_output_len(out_pos);
     false
 }

@@ -40,15 +40,16 @@ fn detected_level() -> u32 {
                 && std::is_x86_feature_detected!("avx512bw")
                 && std::is_x86_feature_detected!("avx512vl")
                 && std::is_x86_feature_detected!("avx512vbmi2")
+                && std::is_x86_feature_detected!("popcnt")
             {
                 return 512;
             }
-            if std::is_x86_feature_detected!("avx2") {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("popcnt") {
                 return 256;
             }
             // The 128-bit port uses SSE4.1 and SSSE3 instructions; like the C
             // code we gate it on SSE4.2, which implies both.
-            if std::is_x86_feature_detected!("sse4.2") {
+            if std::is_x86_feature_detected!("sse4.2") && std::is_x86_feature_detected!("popcnt") {
                 return 128;
             }
             0

@@ -17,28 +17,6 @@ unsafe fn set1_epi8(x: u8) -> __m128i {
 }
 
 #[inline(always)]
-unsafe fn shift_left_by_bytes(a: __m128i, n: u32) -> __m128i {
-    match n {
-        1 => _mm_srli_si128::<1>(a),
-        2 => _mm_srli_si128::<2>(a),
-        3 => _mm_srli_si128::<3>(a),
-        4 => _mm_srli_si128::<4>(a),
-        5 => _mm_srli_si128::<5>(a),
-        6 => _mm_srli_si128::<6>(a),
-        7 => _mm_srli_si128::<7>(a),
-        8 => _mm_srli_si128::<8>(a),
-        9 => _mm_srli_si128::<9>(a),
-        10 => _mm_srli_si128::<10>(a),
-        11 => _mm_srli_si128::<11>(a),
-        12 => _mm_srli_si128::<12>(a),
-        13 => _mm_srli_si128::<13>(a),
-        14 => _mm_srli_si128::<14>(a),
-        15 => _mm_srli_si128::<15>(a),
-        _ => a,
-    }
-}
-
-#[inline(always)]
 unsafe fn shift_right_by_one_byte(a: __m128i) -> __m128i {
     _mm_slli_si128::<1>(a)
 }
@@ -58,32 +36,43 @@ unsafe fn shift_right_by_eight_bytes(a: __m128i) -> __m128i {
     _mm_slli_si128::<8>(a)
 }
 
+const fn make_zero_last_masks() -> [[u8; 16]; 17] {
+    let mut masks = [[0u8; 16]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let mut i = 0;
+        while i < 16 - n {
+            masks[n][i] = 0xff;
+            i += 1;
+        }
+        n += 1;
+    }
+    masks
+}
+
+static ZERO_LAST_MASKS: [[u8; 16]; 17] = make_zero_last_masks();
+
 #[inline(always)]
 unsafe fn zero_last_n_bytes(vec: __m128i, n: u32) -> __m128i {
-    let mask = shift_left_by_bytes(_mm_set1_epi64x(-1), n);
+    let mask = _mm_loadu_si128(ZERO_LAST_MASKS[n as usize].as_ptr() as *const __m128i);
     _mm_and_si128(mask, vec)
 }
 
 #[inline(always)]
 unsafe fn is_zero(a: __m128i) -> bool {
-    _mm_testz_si128(a, a) != 0
+    // stdarch's _mm_testz_si128 is implemented with portable SIMD and lowers
+    // to far more instructions than the pcmpeqb+pmovmskb pair. The comparison
+    // vectors here are always 0x00 or 0xff per byte.
+    _mm_movemask_epi8(_mm_cmpeq_epi8(a, _mm_setzero_si128())) == 0xffff
 }
 
 #[inline(always)]
 unsafe fn bytes_to_first_match(vec: __m128i) -> i32 {
-    if is_zero(vec) {
+    let mask = _mm_movemask_epi8(vec) as u32;
+    if mask == 0 {
         -1
     } else {
-        (_mm_movemask_epi8(vec) as u32).trailing_zeros() as i32
-    }
-}
-
-#[inline(always)]
-fn low_bits(n: u32) -> u32 {
-    if n >= 32 {
-        u32::MAX
-    } else {
-        (1u32 << n) - 1
+        mask.trailing_zeros() as i32
     }
 }
 
@@ -100,6 +89,22 @@ pub unsafe fn find_either_of_two_bytes(haystack: &[u8], a: u8, b: u8) -> Option<
     let a_vec = set1_epi8(a);
     let b_vec = set1_epi8(b);
     let mut i = 0;
+    // Two 16-byte chunks per branch, same trick as the AVX2 path.
+    while i + 2 * LANES_BYTES <= haystack.len() {
+        let c0 = _mm_loadu_si128(haystack.as_ptr().add(i) as *const __m128i);
+        let c1 = _mm_loadu_si128(haystack.as_ptr().add(i + LANES_BYTES) as *const __m128i);
+        let t0 = _mm_or_si128(_mm_cmpeq_epi8(c0, a_vec), _mm_cmpeq_epi8(c0, b_vec));
+        let t1 = _mm_or_si128(_mm_cmpeq_epi8(c1, a_vec), _mm_cmpeq_epi8(c1, b_vec));
+        if _mm_movemask_epi8(_mm_or_si128(t0, t1)) != 0 {
+            let m0 = _mm_movemask_epi8(t0) as u32;
+            if m0 != 0 {
+                return Some(i + m0.trailing_zeros() as usize);
+            }
+            let m1 = _mm_movemask_epi8(t1) as u32;
+            return Some(i + LANES_BYTES + m1.trailing_zeros() as usize);
+        }
+        i += 2 * LANES_BYTES;
+    }
     while i + LANES_BYTES <= haystack.len() {
         let chunk = _mm_loadu_si128(haystack.as_ptr().add(i) as *const __m128i);
         let test = _mm_or_si128(_mm_cmpeq_epi8(chunk, a_vec), _mm_cmpeq_epi8(chunk, b_vec));
@@ -115,7 +120,7 @@ pub unsafe fn find_either_of_two_bytes(haystack: &[u8], a: u8, b: u8) -> Option<
         tmp[..tail].copy_from_slice(&haystack[i..]);
         let chunk = _mm_loadu_si128(tmp.as_ptr() as *const __m128i);
         let test = _mm_or_si128(_mm_cmpeq_epi8(chunk, a_vec), _mm_cmpeq_epi8(chunk, b_vec));
-        let mask = (_mm_movemask_epi8(test) as u32) & low_bits(tail as u32);
+        let mask = (_mm_movemask_epi8(test) as u32) & ((1u32 << tail) - 1);
         if mask != 0 {
             return Some(i + mask.trailing_zeros() as usize);
         }
@@ -184,6 +189,28 @@ pub unsafe fn printable_ascii_run_length(chars: &[u32]) -> usize {
     let upper = _mm_set1_epi32((126u32 ^ 0x8000_0000) as i32);
     let lanes = 4;
     let mut i = 0;
+    while i + 2 * lanes <= chars.len() {
+        let c0 = _mm_loadu_si128(chars.as_ptr().add(i) as *const __m128i);
+        let c1 = _mm_loadu_si128(chars.as_ptr().add(i + lanes) as *const __m128i);
+        let n0 = _mm_or_si128(
+            _mm_cmpgt_epi32(lower, _mm_xor_si128(c0, sign)),
+            _mm_cmpgt_epi32(_mm_xor_si128(c0, sign), upper),
+        );
+        let n1 = _mm_or_si128(
+            _mm_cmpgt_epi32(lower, _mm_xor_si128(c1, sign)),
+            _mm_cmpgt_epi32(_mm_xor_si128(c1, sign), upper),
+        );
+        if _mm_movemask_epi8(_mm_or_si128(n0, n1)) != 0 {
+            let m0 = _mm_movemask_epi8(n0) as u32;
+            let n = if m0 != 0 {
+                m0.trailing_zeros()
+            } else {
+                16 + (_mm_movemask_epi8(n1) as u32).trailing_zeros()
+            };
+            return i + n as usize / 4;
+        }
+        i += 2 * lanes;
+    }
     while i + lanes <= chars.len() {
         let chunk = _mm_loadu_si128(chars.as_ptr().add(i) as *const __m128i);
         let chunk = _mm_xor_si128(chunk, sign);
@@ -393,32 +420,31 @@ pub unsafe fn composite_alpha_mask(dst: &mut [u32], mask: &[u8], color_rgb: u32)
 // UTF-8 {{{
 
 #[inline(always)]
-unsafe fn output_plain_ascii(d: &mut UTF8Decoder, mut vec: __m128i, src_sz: usize) {
-    let pos = d.output_len();
-    let limit = pos + src_sz;
-    let out = d.output_ptr();
-    let mut p = pos;
+unsafe fn output_plain_ascii(out: *mut u32, pos: &mut usize, mut vec: __m128i, src_sz: usize) {
+    let start = *pos;
+    let limit = start + src_sz;
+    let mut p = start;
     while p < limit {
         let unpacked = _mm_cvtepu8_epi32(vec);
         _mm_storeu_si128(out.add(p) as *mut __m128i, unpacked);
         vec = _mm_srli_si128::<4>(vec);
         p += 4;
     }
-    d.set_output_len(pos + src_sz);
+    *pos = start + src_sz;
 }
 
 #[inline(always)]
 unsafe fn output_unicode(
-    d: &mut UTF8Decoder,
+    out: *mut u32,
+    pos: &mut usize,
     mut output1: __m128i,
     mut output2: __m128i,
     mut output3: __m128i,
     num_codepoints: usize,
 ) {
-    let pos = d.output_len();
-    let limit = pos + num_codepoints;
-    let out = d.output_ptr();
-    let mut p = pos;
+    let start = *pos;
+    let limit = start + num_codepoints;
+    let mut p = start;
     while p < limit {
         let unpacked1 = _mm_cvtepu8_epi32(output1);
         let unpacked2 = _mm_slli_si128::<1>(_mm_cvtepu8_epi32(output2));
@@ -430,10 +456,10 @@ unsafe fn output_unicode(
         output3 = _mm_srli_si128::<4>(output3);
         p += 4;
     }
-    d.set_output_len(pos + num_codepoints);
+    *pos = start + num_codepoints;
 }
 
-#[target_feature(enable = "sse2,ssse3,sse4.1,sse4.2")]
+#[target_feature(enable = "sse2,ssse3,sse4.1,sse4.2,popcnt")]
 /// # Safety
 ///
 /// The CPU must support every instruction set enabled on this function (see
@@ -443,14 +469,17 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
     d.begin_call();
     let mut src_data = src;
     let mut src_len = src.len();
+    let mut consumed = 0usize;
     if d.cur != UTF8_ACCEPT {
         d.ensure_capacity(src_len);
         let n = decode_to_accept_scalar(d, src_data);
-        d.num_consumed = n;
+        consumed = n;
         src_data = &src_data[n..];
         src_len -= n;
     }
     d.ensure_capacity(src_len + 64);
+    let mut out = d.output_ptr();
+    let mut out_pos = d.output_len();
     let esc_vec = set1_epi8(0x1b);
     let zero = _mm_setzero_si128();
     let one = set1_epi8(1);
@@ -476,9 +505,9 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
                 if _mm_movemask_epi8(esc_or_non_ascii) != 0 {
                     break;
                 }
-                output_plain_ascii(d, v1, LANES_BYTES);
-                output_plain_ascii(d, v2, LANES_BYTES);
-                d.num_consumed += 2 * LANES_BYTES;
+                output_plain_ascii(out, &mut out_pos, v1, LANES_BYTES);
+                output_plain_ascii(out, &mut out_pos, v2, LANES_BYTES);
+                consumed += 2 * LANES_BYTES;
                 p += 2 * LANES_BYTES;
             }
             if p >= limit {
@@ -499,34 +528,77 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
         let mut ascii_mask = _mm_movemask_epi8(vec) as u32;
         let mut esc_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(vec, esc_vec)) as u32;
         if chunk_src_sz < LANES_BYTES {
-            let chunk_mask = low_bits(chunk_src_sz as u32);
+            let chunk_mask = (1u32 << chunk_src_sz) - 1;
             ascii_mask &= chunk_mask;
             esc_mask &= chunk_mask;
         }
         if esc_mask != 0 {
             sentinel_found = true;
             chunk_src_sz = esc_mask.trailing_zeros() as usize;
-            ascii_mask &= low_bits(chunk_src_sz as u32);
-            d.num_consumed += chunk_src_sz + 1;
+            ascii_mask &= (1u32 << chunk_src_sz) - 1;
+            consumed += chunk_src_sz + 1;
             if chunk_src_sz == 0 {
                 continue;
             }
         } else {
-            d.num_consumed += chunk_src_sz;
+            consumed += chunk_src_sz;
         }
 
         let mut num_of_trailing_bytes = 0usize;
-        let mut check_for_trailing_bytes = !sentinel_found;
         let mut stop = false;
+        if !sentinel_found {
+            // Determine the incomplete trailing sequence (if any) directly
+            // from the input bytes before classifying the chunk. For a chunk
+            // that ends inside a UTF-8 sequence this is equivalent to the C
+            // counts-based check, but avoids a second classification pass.
+            let last = start_of_current_chunk + chunk_src_sz - 1;
+            // SAFETY: last < start_of_current_chunk + chunk_src_sz <= limit,
+            // and the last three accesses are guarded by chunk_src_sz.
+            let at = |i: usize| unsafe { *src_data.get_unchecked(i) };
+            if at(last) >= 0xc0 {
+                num_of_trailing_bytes = 1;
+            } else if chunk_src_sz > 1 && at(last - 1) >= 0xe0 {
+                num_of_trailing_bytes = 2;
+            } else if chunk_src_sz > 2 && at(last - 2) >= 0xf0 {
+                num_of_trailing_bytes = 3;
+            }
+            if num_of_trailing_bytes != 0 {
+                chunk_src_sz -= num_of_trailing_bytes;
+                consumed -= num_of_trailing_bytes;
+                if chunk_src_sz == 0 {
+                    d.set_output_len(out_pos);
+                    d.num_consumed = consumed;
+                    decode_all_scalar(
+                        d,
+                        &src_data[start_of_current_chunk
+                            ..start_of_current_chunk + num_of_trailing_bytes],
+                    );
+                    out_pos = d.output_len();
+                    out = d.output_ptr();
+                    consumed += num_of_trailing_bytes;
+                    stop = true;
+                } else {
+                    ascii_mask &= (1u32 << chunk_src_sz) - 1;
+                }
+            }
+        }
+        if stop {
+            break;
+        }
 
+        #[allow(clippy::never_loop)]
         loop {
             if ascii_mask == 0 {
-                output_plain_ascii(d, vec, chunk_src_sz);
+                output_plain_ascii(out, &mut out_pos, vec, chunk_src_sz);
                 prev_chunk_was_all_ascii = true;
                 if num_of_trailing_bytes != 0 {
                     if p >= limit {
+                        d.set_output_len(out_pos);
+                        d.num_consumed = consumed;
                         decode_all_scalar(d, &src_data[p - num_of_trailing_bytes..p]);
-                        d.num_consumed += num_of_trailing_bytes;
+                        out_pos = d.output_len();
+                        out = d.output_ptr();
+                        consumed += num_of_trailing_bytes;
                         stop = true;
                     } else {
                         p -= num_of_trailing_bytes;
@@ -552,42 +624,6 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             let count_subs1 = _mm_subs_epu8(count, one);
             let mut counts = _mm_add_epi8(count, shift_right_by_one_byte(count_subs1));
             counts = _mm_add_epi8(counts, shift_right_by_two_bytes(_mm_subs_epu8(counts, two)));
-            if check_for_trailing_bytes
-                && !is_zero(_mm_cmplt_epi8(
-                    one,
-                    _mm_and_si128(
-                        counts,
-                        _mm_cmpeq_epi8(numbered, _mm_set1_epi8((chunk_src_sz - 1) as i8)),
-                    ),
-                ))
-            {
-                check_for_trailing_bytes = false;
-                let last = start_of_current_chunk + chunk_src_sz - 1;
-                if src_data[last] >= 0xc0 {
-                    num_of_trailing_bytes = 1;
-                } else if chunk_src_sz > 1 && src_data[last - 1] >= 0xe0 {
-                    num_of_trailing_bytes = 2;
-                } else if chunk_src_sz > 2 && src_data[last - 2] >= 0xf0 {
-                    num_of_trailing_bytes = 3;
-                }
-                if num_of_trailing_bytes != 0 {
-                    chunk_src_sz -= num_of_trailing_bytes;
-                    d.num_consumed -= num_of_trailing_bytes;
-                    if chunk_src_sz == 0 {
-                        decode_all_scalar(
-                            d,
-                            &src_data[start_of_current_chunk
-                                ..start_of_current_chunk + num_of_trailing_bytes],
-                        );
-                        d.num_consumed += num_of_trailing_bytes;
-                        stop = true;
-                        break;
-                    }
-                    ascii_mask &= low_bits(chunk_src_sz as u32);
-                    vec = zero_last_n_bytes(vec, (LANES_BYTES - chunk_src_sz) as u32);
-                }
-                continue;
-            }
 
             let ascii_sequence_count_mismatches =
                 ascii_mask ^ (_mm_movemask_epi8(_mm_cmpgt_epi8(counts, zero)) as u32);
@@ -645,12 +681,16 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
                 ),
             );
             if !is_zero(chunk_is_invalid) {
+                d.set_output_len(out_pos);
+                d.num_consumed = consumed;
                 decode_all_scalar(
                     d,
                     &src_data[start_of_current_chunk
                         ..start_of_current_chunk + chunk_src_sz + num_of_trailing_bytes],
                 );
-                d.num_consumed += num_of_trailing_bytes;
+                out_pos = d.output_len();
+                out = d.output_ptr();
+                consumed += num_of_trailing_bytes;
                 stop = true;
                 break;
             }
@@ -749,17 +789,19 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             output2 = _mm_shuffle_epi8(output2, shifts);
             output3 = _mm_shuffle_epi8(output3, shifts);
 
-            let mut kept_mask = !(_mm_movemask_epi8(discarded_locations) as u32);
-            if chunk_src_sz < 32 {
-                kept_mask &= low_bits(chunk_src_sz as u32);
-            }
+            let kept_mask =
+                !(_mm_movemask_epi8(discarded_locations) as u32) & ((1u32 << chunk_src_sz) - 1);
             let num_codepoints = kept_mask.count_ones() as usize;
-            output_unicode(d, output1, output2, output3, num_codepoints);
+            output_unicode(out, &mut out_pos, output1, output2, output3, num_codepoints);
 
             if num_of_trailing_bytes != 0 {
                 if p >= limit {
+                    d.set_output_len(out_pos);
+                    d.num_consumed = consumed;
                     decode_all_scalar(d, &src_data[p - num_of_trailing_bytes..p]);
-                    d.num_consumed += num_of_trailing_bytes;
+                    out_pos = d.output_len();
+                    out = d.output_ptr();
+                    consumed += num_of_trailing_bytes;
                     stop = true;
                 } else {
                     p -= num_of_trailing_bytes;
@@ -771,6 +813,8 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             break;
         }
     }
+    d.set_output_len(out_pos);
+    d.num_consumed = consumed;
     if sentinel_found && d.cur != UTF8_ACCEPT {
         d.ensure_capacity(1);
         d.push_codepoint(0xfffd);

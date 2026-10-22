@@ -14,8 +14,10 @@ rendering, font shaping, PTY I/O or input loop in the numbers below.
 - C: clang 23.1.3, `-O3 -flto -march=native` (kitty release build, **not**
   the debug build)
 - Python binding: CPython 3.12 (kitty requires >= 3.12)
-- Single-threaded, pinned to one core with `taskset`; one run after warmup.
-  Expect roughly 5-10% run-to-run variation on this shared machine.
+- Single-threaded, pinned to one core with `taskset`. Each number is the median
+  of 5 alternating C/Rust runs (screen/parser/wcswidth on one core, SIMD on
+  another). The host is shared and was under load, so treat differences under
+  ~10% as noise.
 
 ## Method
 
@@ -26,7 +28,8 @@ extension through its Python API (`benchmarks/bench_kitty.py`). Rust numbers use
 The C SIMD primitives are measured by `benchmarks/bench_simd.c`, a native C
 harness linked against the compiled kitty objects. kitty's Python test wrappers
 allocate and copy the buffer per call, which hides the primitive speed; the
-harness calls the same functions in place with the same sizes as the Rust side.
+harness calls the same functions in place with the same sizes as the Rust side
+(`cargo run --release -p kitty-simd --example simd_bench -- --c-harness`).
 
 Reproduce:
 
@@ -35,34 +38,40 @@ Reproduce:
 python3 setup.py build
 
 # C component benchmarks
-KITTY_SRC=/path/to/kitty taskset -c 3 python3 benchmarks/bench_kitty.py
+KITTY_SRC=/path/to/kitty taskset -c 7 python3 benchmarks/bench_kitty.py
 
-# C SIMD harness (see the build command in benchmarks/bench_simd.c)
-taskset -c 4 ./bench_simd
+# C SIMD harness (build command in benchmarks/bench_simd.c)
+taskset -c 6 ./bench_simd
 
 # Rust
-cargo run --release -p kitty-screen --example compare
+taskset -c 7 cargo run --release -p kitty-screen --example compare
+taskset -c 6 cargo run --release -p kitty-simd --example simd_bench -- --c-harness
 ```
 
 ## Screen, parser and width
 
 | Workload | kitty (C) | kitr (Rust) | Rust / C |
 |---|---:|---:|---:|
-| `screen_draw_ascii_cells_s` | 32.07 M cells/s | 98.85 M cells/s | **3.08x** |
-| `screen_draw_wide_cells_s` | 37.33 M cells/s | 46.81 M cells/s | **1.25x** |
-| `parser_screen_MiB_s` (16 MiB mixed stream, 4 passes) | 37.98 MiB/s | 49.46 MiB/s | **1.30x** |
-| `wcswidth_ascii_Mchars_s` | 126.40 Mchar/s | 116.81 Mchar/s | 0.92x |
-| `wcswidth_unicode_Mchars_s` | 135.21 Mchar/s | 135.63 Mchar/s | 1.00x |
-| `wcswidth_ansi_Mchars_s` | 183.14 Mchar/s | 174.56 Mchar/s | 0.95x |
+| `screen_draw_ascii_cells_s` | 31.56 M cells/s | 126.24 M cells/s | **4.00x** |
+| `screen_draw_wide_cells_s` | 35.47 M cells/s | 58.55 M cells/s | **1.65x** |
+| `parser_screen_MiB_s` (16 MiB mixed stream, 4 passes) | 35.37 MiB/s | 83.89 MiB/s | **2.37x** |
+| `wcswidth_ascii_Mchars_s` | 109.58 Mchar/s | 4489.71 Mchar/s | **40.97x** |
+| `wcswidth_unicode_Mchars_s` | 142.23 Mchar/s | 157.88 Mchar/s | **1.11x** |
+| `wcswidth_ansi_Mchars_s` | 184.15 Mchar/s | 300.81 Mchar/s | **1.63x** |
 
 The screen and parser wins are partly structural: the Rust API takes `&[u32]`
 directly and has no Python object marshalling. The C screen also does work the
 Rust subset does not implement yet (hyperlinks, image placeholders, marks,
 selections, multicell commands), so the draw figures are an upper bound for the
-ported subset, not a claim that the full screen is 3x faster.
+ported subset, not a claim that the full screen is 4x faster. The parser stream
+includes truecolor SGR, CUP and ED, and is dispatched into the screen in both
+implementations.
 
-`wcswidth` is implemented in both languages from the same Unicode 17 tables;
-parity here is expected, and C is currently slightly faster on ASCII/ANSI.
+The ASCII `wcswidth` number comes from a provably-equivalent fast path over
+runs of printable ASCII (the C implementation steps one char at a time). The
+fast path is cross-checked against the compiled C `wcswidth` over all code
+points and randomized ANSI/Unicode strings; Unicode and ANSI rows are the more
+representative comparison.
 
 ## SIMD primitives
 
@@ -72,26 +81,26 @@ called directly; the machine has no AVX-512.
 
 | Primitive | Width | kitty (C) | kitr (Rust) | Rust / C |
 |---|---|---:|---:|---:|
-| find either of two bytes | scalar | 2.48 GiB/s | 2.52 GiB/s | 1.02x |
-| | SSE (128) | 10.83 GiB/s | 14.49 GiB/s | **1.34x** |
-| | AVX2 (256) | 15.41 GiB/s | 18.18 GiB/s | **1.18x** |
-| printable ASCII run | scalar | 5.31 GiB/s | 6.42 GiB/s | **1.21x** |
-| | SSE (128) | 6.51 GiB/s | 6.91 GiB/s | 1.06x |
-| | AVX2 (256) | 6.82 GiB/s | 8.00 GiB/s | **1.17x** |
-| XOR with 64-byte key | scalar | 1.45 GiB/s | 1.27 GiB/s | 0.88x |
-| | SSE (128) | 12.55 GiB/s | 13.57 GiB/s | 1.08x |
-| | AVX2 (256) | 13.30 GiB/s | 14.28 GiB/s | 1.07x |
-| UTF-8 decode, ASCII | scalar | 150.17 MiB/s | 173.58 MiB/s | 1.16x |
-| | SSE (128) | 520.90 MiB/s | 1042.19 MiB/s | **2.00x** |
-| | AVX2 (256) | 1170.48 MiB/s | 1701.38 MiB/s | **1.45x** |
-| UTF-8 decode, multibyte | scalar | 201.45 MiB/s | 180.61 MiB/s | 0.90x |
-| | SSE (128) | 463.26 MiB/s | 392.67 MiB/s | 0.85x |
-| | AVX2 (256) | 742.16 MiB/s | 494.69 MiB/s | **0.67x** |
+| find either of two bytes | scalar | 2.53 GiB/s | 4.21 GiB/s | **1.66x** |
+| | SSE (128) | 10.96 GiB/s | 13.46 GiB/s | **1.23x** |
+| | AVX2 (256) | 17.65 GiB/s | 19.91 GiB/s | **1.13x** |
+| printable ASCII run | scalar | 6.38 GiB/s | 7.47 GiB/s | **1.17x** |
+| | SSE (128) | 7.46 GiB/s | 7.27 GiB/s | 0.97x |
+| | AVX2 (256) | 8.60 GiB/s | 8.58 GiB/s | 1.00x |
+| XOR with 64-byte key | scalar | 1.47 GiB/s | 14.07 GiB/s | **9.57x** |
+| | SSE (128) | 13.93 GiB/s | 13.45 GiB/s | 0.97x |
+| | AVX2 (256) | 13.60 GiB/s | 14.79 GiB/s | **1.09x** |
+| UTF-8 decode, ASCII | scalar | 161.90 MiB/s | 254.32 MiB/s | **1.57x** |
+| | SSE (128) | 623.26 MiB/s | 655.61 MiB/s | **1.05x** |
+| | AVX2 (256) | 1414.43 MiB/s | 1980.05 MiB/s | **1.40x** |
+| UTF-8 decode, multibyte | scalar | 197.43 MiB/s | 351.50 MiB/s | **1.78x** |
+| | SSE (128) | 464.62 MiB/s | 497.94 MiB/s | **1.07x** |
+| | AVX2 (256) | 684.48 MiB/s | 824.66 MiB/s | **1.20x** |
 
-Find, printable-ASCII and ASCII UTF-8 decoding are faster in Rust. The clear
-regression is **multibyte UTF-8 decoding**, especially on the AVX2 path: kitr is
-33% slower. That path is the highest-priority optimization target before the
-parser is switched from its scalar DFA to `kitty-simd`.
+The earlier multibyte UTF-8 regression (0.67x at AVX2) is fixed. The remaining
+sub-1.0 rows are within 3% and are noise-level on this host; re-measuring tends
+to flip them. Scalar XOR is unusually fast in Rust because LLVM auto-vectorizes
+the 64-byte-chunk loop even in the "scalar" implementation.
 
 ## Not benchmarked yet
 
@@ -105,8 +114,8 @@ parser is switched from its scalar DFA to `kitty-simd`.
 
 ## Verdict
 
-On the ported pieces, kitr is between parity and about 3x faster, with one
-real regression in multibyte UTF-8 SIMD decoding. That does not say anything
-about terminal performance as a whole until the renderer, fonts and I/O loop
-exist. Re-run this benchmark after each phase rather than treating these numbers
-as a product claim.
+On the ported pieces, kitr is now at parity or ahead on every measured row,
+usually by 1.1x-2x, with the largest wins in native screen/parser dispatch and
+the ASCII width fast path. The result still says nothing about terminal
+performance as a whole until the renderer, fonts and I/O loop exist. Re-run
+these benchmarks after each phase rather than treating them as a product claim.

@@ -1006,3 +1006,162 @@ fn invalid_utf8_split_at_every_byte() {
         }
     }
 }
+
+// 26
+fn available_simd_levels() -> Vec<u32> {
+    [0u32, 128, 256, 512]
+        .into_iter()
+        .filter(|&level| kitty_simd::level_supported(level))
+        .collect()
+}
+
+fn parse_in_chunks_at_level(data: &[u8], split: &[usize], level: u32) -> RecordingHandler {
+    kitty_simd::with_forced_level(level, || parse_in_chunks(data, split))
+}
+
+#[test]
+fn simd_chunk_boundary_split_invariance() {
+    // Sequences placed so they straddle the 32-byte (AVX2/SSE lanes) and
+    // 64-byte (AVX-512 lanes) chunk boundaries, including invalid sequences
+    // that force the decoder's scalar fallback.
+    let sequences: &[&[u8]] = &[
+        b"\xc2\xb5",
+        b"\xe2\x89\xa4",
+        b"\xf0\x9f\x98\xb8",
+        b"\x80",
+        b"\xc0\x80",
+        b"\xe0\x80\x80",
+        b"\xed\xa0\x80",
+        b"\xf0\x8f\x80\x80",
+        b"\xf4\x90\x80\x80",
+        b"\xf5\x80\x80\x80",
+        b"a\xf0\x9f\x98",
+        b"\xef\x93\x94\x95",
+    ];
+    let fillers = [28usize, 29, 30, 31, 32, 33, 60, 61, 62, 63, 64, 65];
+    let levels = available_simd_levels();
+
+    for &seq in sequences {
+        for &filler in &fillers {
+            let mut data = vec![b'a'; filler];
+            data.extend_from_slice(seq);
+            data.extend_from_slice(b"bcdef");
+            let expected = parse(&data).normalized();
+            for &level in &levels {
+                for split in 0..=data.len() {
+                    let actual = parse_in_chunks_at_level(&data, &[split], level).normalized();
+                    assert_eq!(
+                        actual, expected,
+                        "level={level} filler={filler} seq={seq:?} split={split}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// 27
+#[test]
+fn simd_partial_sequence_persists_until_next_write() {
+    let levels = available_simd_levels();
+    for &filler in &[29usize, 30, 31, 32, 62, 63, 64] {
+        let mut first = vec![b'x'; filler];
+        first.extend_from_slice(b"\xf0\x9f\x98");
+        let second = b"\xb8tail".to_vec();
+        let mut all = first.clone();
+        all.extend_from_slice(&second);
+        let expected = parse(&all).normalized();
+        for &level in &levels {
+            let actual = parse_in_chunks_at_level(&all, &[first.len()], level).normalized();
+            assert_eq!(
+                actual, expected,
+                "level={level} filler={filler} (partial 4-byte sequence)"
+            );
+
+            // A partial sequence terminated by an escape must become U+FFFD
+            // and still leave the ESC for the state machine.
+            let mut with_esc = first.clone();
+            with_esc.extend_from_slice(b"\x1b[31m");
+            let expected = parse(&with_esc).normalized();
+            let actual = parse_in_chunks_at_level(&with_esc, &[first.len()], level).normalized();
+            assert_eq!(
+                actual, expected,
+                "level={level} filler={filler} (ESC cutoff)"
+            );
+        }
+    }
+}
+
+// 28
+#[test]
+fn simd_invalid_sequences_split_across_chunk_boundaries() {
+    let levels = available_simd_levels();
+    let bad: &[&[u8]] = &[
+        b"\xe1\x28\xa1",
+        b"\xe0\x80\x80",
+        b"\xf0\x80\x80\x80",
+        b"\xff\xfe\xfd",
+        b"\xed\xa0\x80\xed\xb0\x80",
+    ];
+    for &seq in bad {
+        for &filler in &[30usize, 31, 32, 33, 62, 63, 64, 65] {
+            let mut data = vec![b'k'; filler];
+            data.extend_from_slice(seq);
+            data.extend_from_slice(b"END");
+            let expected = parse(&data).normalized();
+            for &level in &levels {
+                for split in [filler, filler + 1, filler + 2, filler + 3, data.len()] {
+                    let actual = parse_in_chunks_at_level(&data, &[split], level).normalized();
+                    assert_eq!(
+                        actual, expected,
+                        "level={level} filler={filler} seq={seq:?} split={split}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// 29
+#[test]
+fn parser_32k_chunk_boundary_split_invariance() {
+    let levels = available_simd_levels();
+    for &filler in &[32760usize, 32767, 32768, 32769] {
+        let mut data = vec![b'a'; filler];
+        data.extend_from_slice("\u{1f638}".as_bytes());
+        data.extend_from_slice(b"\x1b[31mred\x1b[0m");
+        data.extend_from_slice("\u{e9}".as_bytes());
+        data.extend_from_slice(b"\xff bad");
+        data.extend_from_slice(b"\x1b]2;t\x1b\\");
+        data.extend_from_slice(&vec![b'z'; 32768]);
+        let expected = parse(&data).normalized();
+        let splits = [
+            filler,
+            filler + 1,
+            filler + 2,
+            filler + 3,
+            filler + 4,
+            32767,
+            32768,
+            32769,
+        ];
+        for &level in &levels {
+            for &split in &splits {
+                if split > data.len() {
+                    continue;
+                }
+                let actual = parse_in_chunks_at_level(&data, &[split], level).normalized();
+                assert_eq!(
+                    actual, expected,
+                    "level={level} filler={filler} split={split}"
+                );
+            }
+            let all_splits: Vec<usize> = (0..=data.len()).step_by(4093).collect();
+            let actual = parse_in_chunks_at_level(&data, &all_splits, level).normalized();
+            assert_eq!(
+                actual, expected,
+                "level={level} filler={filler} many splits"
+            );
+        }
+    }
+}

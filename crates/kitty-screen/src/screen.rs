@@ -11,15 +11,13 @@ use kitty_core::{
 };
 use kitty_simd::printable_ascii_run_length;
 use kitty_unicode::{
-    char_props_for, grapheme_segmentation_reset, grapheme_segmentation_step, wcswidth_std,
+    char_props_for, grapheme_segmentation_reset, grapheme_segmentation_step, wcwidth_std,
     CharProps, GraphemeBreakProperty, GraphemeSegmentationResult,
 };
 
 use crate::charset::CharsetState;
 use crate::cursor::Cursor;
-use crate::lineops::{
-    apply_sgr_to_cells, line_apply_cursor, line_as_ansi, line_as_text, line_clear_text,
-};
+use crate::lineops::{apply_sgr_to_cells, line_apply_cursor, line_as_ansi, line_as_text};
 use crate::modes::{self, Modes};
 
 /// `CSI_REP_MAX_REPETITIONS`.
@@ -120,6 +118,19 @@ fn none_seg() -> GraphemeSegmentationResult {
     GraphemeSegmentationResult::from_bits((GraphemeBreakProperty::GBP_None as u16) << 7)
 }
 
+/// Width of a single code point with a freshly reset `wcswidth` state.
+///
+/// This is exactly what `wcswidth_std(&[ch])` computes for one character, but
+/// reuses the `CharProps` the caller already looked up.
+#[inline]
+fn single_char_width(cp: CharProps) -> i32 {
+    match wcwidth_std(cp) {
+        -1 | 0 => 0,
+        2 => 2,
+        _ => 1,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PrevCell {
     x: u32,
@@ -177,6 +188,7 @@ pub struct Screen {
     alt_tabstops: Vec<bool>,
     main_savepoint: Savepoint,
     alt_savepoint: Savepoint,
+    history_scratch: Line,
 }
 
 impl Screen {
@@ -224,6 +236,7 @@ impl Screen {
             alt_tabstops: tabstops,
             main_savepoint: Savepoint::default(),
             alt_savepoint: Savepoint::default(),
+            history_scratch: Line::new(columns as usize),
         };
         screen.cursor.x = 0;
         screen.cursor.y = 0;
@@ -546,10 +559,27 @@ impl Screen {
         let bottom = self.margin_bottom as usize;
         self.lb_mut().index(top, bottom);
         if add_to_history {
-            if let Ok(line) = self.lb().create_line_copy(bottom) {
-                self.historybuf.add_line(&line);
-                self.history_line_added_count += 1;
+            // Reuse one owned line instead of allocating (and zeroing) a new
+            // one for every scroll. `LineBuf::create_line_copy` did both.
+            let mut line = core::mem::take(&mut self.history_scratch);
+            {
+                let lb = self.lb();
+                let xnum = lb.xnum as usize;
+                if line.cpu_cells.len() != xnum {
+                    line.cpu_cells.resize(xnum, CpuCell::new());
+                }
+                if line.gpu_cells.len() != xnum {
+                    line.gpu_cells.resize(xnum, GpuCell::default());
+                }
+                line.cpu_cells
+                    .copy_from_slice(lb.cpu_cells_for_line(bottom));
+                line.gpu_cells
+                    .copy_from_slice(lb.gpu_cells_for_line(bottom));
+                line.attrs = lb.line_attrs(bottom);
             }
+            self.historybuf.add_line(&line);
+            self.history_scratch = line;
+            self.history_line_added_count += 1;
         }
         self.lb_mut().clear_line(bottom, true);
         self.is_dirty = true;
@@ -1174,7 +1204,7 @@ impl Screen {
             }
         } else if st.seg.grapheme_break() == GraphemeBreakProperty::GBP_SpacingMark
             && !cell.is_multicell()
-            && wcswidth_std(&[ch]) > 0
+            && single_char_width(char_props_for(ch)) > 0
         {
             self.widen_cell_to_two(xpos, st.prev.y);
         }
@@ -1352,28 +1382,27 @@ impl Screen {
                     let y0 = self.cursor.y;
                     let limit = (chars.len() - i).min((self.columns - x0) as usize);
                     let mut n = printable_ascii_run_length(&chars[i..i + limit]);
+                    let start = x0 as usize;
                     if n > 0 {
-                        // A multicell cell under the run requires the scalar path.
-                        let mut m = 0usize;
-                        while m < n && !self.cpu_cell(x0 + m as u32, y0).is_multicell() {
-                            m += 1;
+                        // Fuse the multicell check with the cell writes: stop at
+                        // the first multicell cell, which needs the scalar path.
+                        let mut written = 0usize;
+                        let cp = self.lb_mut().cpu_cells_for_line_mut(y0 as usize);
+                        for (dst, &raw) in cp[start..start + n].iter_mut().zip(&chars[i..i + n]) {
+                            if dst.is_multicell() {
+                                break;
+                            }
+                            let mut c = cpu_template;
+                            c.set_char(raw);
+                            *dst = c;
+                            written += 1;
                         }
-                        n = m;
+                        n = written;
                     }
                     if n > 0 {
                         {
-                            let cp = self.lb_mut().cpu_cells_for_line_mut(y0 as usize);
-                            for (j, &raw) in chars[i..i + n].iter().enumerate() {
-                                let mut c = cpu_template;
-                                c.set_char(raw);
-                                cp[x0 as usize + j] = c;
-                            }
-                        }
-                        {
                             let gp = self.lb_mut().gpu_cells_for_line_mut(y0 as usize);
-                            for j in 0..n {
-                                gp[x0 as usize + j] = gpu_template;
-                            }
+                            gp[start..start + n].fill(gpu_template);
                         }
                         self.last_graphic_char = chars[i + n - 1];
                         let x = x0 + n as u32;
@@ -1403,7 +1432,7 @@ impl Screen {
                     i += 1;
                     continue;
                 }
-                let mut w = wcswidth_std(&[ch]) as i32;
+                let mut w = single_char_width(cp);
                 if w < 1 {
                     if w == 0 {
                         if st.prev.valid {
@@ -1417,11 +1446,17 @@ impl Screen {
                 w as u32
             };
 
-            // Remove/relocate a multicell cell under the cursor.
+            // Remove/relocate a multicell cell under the cursor. A width-2
+            // multicell starting here will be fully overwritten by the wide
+            // character below, so clearing it first is redundant.
+            let mut skip_wide_pair_clear = false;
             if self.cursor.x < self.columns {
                 let c = self.cpu_cell(self.cursor.x, self.cursor.y);
                 if c.is_multicell() {
-                    self.nuke_multicell_char_at(self.cursor.x, self.cursor.y, c.x() != 0);
+                    skip_wide_pair_clear = char_width == 2 && c.x() == 0 && c.mcd_x_limit() == 2;
+                    if !skip_wide_pair_clear {
+                        self.nuke_multicell_char_at(self.cursor.x, self.cursor.y, c.x() != 0);
+                    }
                 }
             }
 
@@ -1437,9 +1472,11 @@ impl Screen {
                 } else {
                     self.cursor.x = self.columns - char_width;
                 }
-                let c = self.cpu_cell(self.cursor.x, self.cursor.y);
-                if c.is_multicell() {
-                    self.nuke_multicell_char_at(self.cursor.x, self.cursor.y, c.x() > 0);
+                if !skip_wide_pair_clear {
+                    let c = self.cpu_cell(self.cursor.x, self.cursor.y);
+                    if c.is_multicell() {
+                        self.nuke_multicell_char_at(self.cursor.x, self.cursor.y, c.x() > 0);
+                    }
                 }
             }
 
@@ -1450,7 +1487,7 @@ impl Screen {
             let x = self.cursor.x;
             let y = self.cursor.y;
             if char_width == 2 {
-                if x + 1 < self.columns {
+                if x + 1 < self.columns && !skip_wide_pair_clear {
                     let second = self.cpu_cell(x + 1, y);
                     if second.is_multicell() {
                         self.nuke_multicell_char_at(x + 1, y, true);
@@ -1510,13 +1547,20 @@ impl Screen {
         c.set_y(0);
         let mut second = c;
         second.set_x(1);
-        self.set_cpu_cell(x, y, c);
-        if x + 1 < self.columns {
-            self.set_cpu_cell(x + 1, y, second);
+        let start = x as usize;
+        {
+            let cpu = self.lb_mut().cpu_cells_for_line_mut(y as usize);
+            cpu[start] = c;
+            if start + 1 < cpu.len() {
+                cpu[start + 1] = second;
+            }
         }
-        self.set_gpu_cell(x, y, gpu_template);
-        if x + 1 < self.columns {
-            self.set_gpu_cell(x + 1, y, gpu_template);
+        {
+            let gpu = self.lb_mut().gpu_cells_for_line_mut(y as usize);
+            gpu[start] = gpu_template;
+            if start + 1 < gpu.len() {
+                gpu[start + 1] = gpu_template;
+            }
         }
     }
 
@@ -1574,14 +1618,12 @@ impl Screen {
             }
             x += 1;
         }
-        if let Some(line) = self.line(y) {
-            let mut line = line;
-            if private {
-                line_clear_text(&mut line, s as usize, n as usize, 0);
-            } else {
-                line_apply_cursor(&mut line, &self.cursor, s as usize, n as usize, true);
-            }
-            self.lb_mut().copy_line_to(&line, y as usize);
+        let start = s as usize;
+        let end = (s + n) as usize;
+        self.lb_mut().cpu_cells_for_line_mut(y as usize)[start..end].fill(CpuCell::new());
+        if !private {
+            let template = self.cursor.sgr.as_gpu_cell();
+            self.lb_mut().gpu_cells_for_line_mut(y as usize)[start..end].fill(template);
         }
         self.lb_mut().mark_line_dirty(y as usize);
         self.is_dirty = true;
@@ -1589,21 +1631,18 @@ impl Screen {
     }
 
     fn clear_line_private(&mut self, y: u32) {
-        if let Some(mut line) = self.line(y) {
-            line_clear_text(&mut line, 0, self.columns as usize, 0);
-            self.lb_mut().copy_line_to(&line, y as usize);
-        }
-        self.lb_mut()
-            .set_last_char_as_continuation(y as usize, false);
-        self.lb_mut().clear_attrs_and_dirty(y as usize);
+        let y = y as usize;
+        self.lb_mut().cpu_cells_for_line_mut(y).fill(CpuCell::new());
+        self.lb_mut().set_last_char_as_continuation(y, false);
+        self.lb_mut().clear_attrs_and_dirty(y);
     }
 
     fn clear_line_with_cursor(&mut self, y: u32) {
-        if let Some(mut line) = self.line(y) {
-            line_apply_cursor(&mut line, &self.cursor, 0, self.columns as usize, true);
-            self.lb_mut().copy_line_to(&line, y as usize);
-        }
-        self.lb_mut().clear_attrs_and_dirty(y as usize);
+        let y = y as usize;
+        let template = self.cursor.sgr.as_gpu_cell();
+        self.lb_mut().cpu_cells_for_line_mut(y).fill(CpuCell::new());
+        self.lb_mut().gpu_cells_for_line_mut(y).fill(template);
+        self.lb_mut().clear_attrs_and_dirty(y);
     }
 
     /// `screen_erase_in_display()`.

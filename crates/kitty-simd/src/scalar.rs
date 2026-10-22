@@ -7,21 +7,77 @@
 
 /// Return the index of the first byte equal to `a` or `b`.
 pub fn find_either_of_two_bytes(haystack: &[u8], a: u8, b: u8) -> Option<usize> {
-    haystack.iter().position(|&ch| ch == a || ch == b)
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    const REPEAT: u64 = 0x0101_0101_0101_0101;
+    #[inline(always)]
+    fn zero_byte_mask(x: u64) -> u64 {
+        // Classic SWAR has-zero-byte test: high bits set exactly at zero bytes.
+        x.wrapping_sub(ONES) & !x & HIGHS
+    }
+    let len = haystack.len();
+    let mut i = 0usize;
+    if len >= 8 {
+        let a_vec = (a as u64).wrapping_mul(REPEAT);
+        let b_vec = (b as u64).wrapping_mul(REPEAT);
+        let ptr = haystack.as_ptr();
+        while i + 8 <= len {
+            // SAFETY: i + 8 <= len, unaligned load is fine for u8 data.
+            let word = u64::from_le_bytes(unsafe {
+                core::ptr::read_unaligned(ptr.add(i) as *const [u8; 8])
+            });
+            let matches = zero_byte_mask(word ^ a_vec) | zero_byte_mask(word ^ b_vec);
+            if matches != 0 {
+                return Some(i + matches.trailing_zeros() as usize / 8);
+            }
+            i += 8;
+        }
+    }
+    while i < len {
+        let ch = haystack[i];
+        if ch == a || ch == b {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// XOR `data` with the 64 byte key, repeating the key.
 pub fn xor_data64(key: &[u8; 64], data: &mut [u8]) {
-    for (i, byte) in data.iter_mut().enumerate() {
-        *byte ^= key[i & 63];
+    // Semantically identical to the C scalar loop data[i] ^= key[i & 63],
+    // split so LLVM can vectorize the full 64-byte groups.
+    let (chunks, remainder) = data.as_chunks_mut::<64>();
+    for chunk in chunks {
+        for (d, k) in chunk.iter_mut().zip(key.iter()) {
+            *d ^= *k;
+        }
+    }
+    for (d, k) in remainder.iter_mut().zip(key.iter()) {
+        *d ^= *k;
     }
 }
 
 /// Length of the prefix of `chars` containing only printable ASCII
 /// codepoints (32 <= ch <= 126).
 pub fn printable_ascii_run_length(chars: &[u32]) -> usize {
-    let mut n = 0;
-    while n < chars.len() && chars[n].wrapping_sub(32) < 95 {
+    // Mirrors the tight C scalar loop; indexing through a raw pointer avoids
+    // re-checking the slice bound on every iteration.
+    let len = chars.len();
+    let mut n = 0usize;
+    // Check eight codepoints at a time with a fixed-length inner loop so LLVM
+    // can vectorize it, then fall back to the tight one-at-a-time loop.
+    while n + 8 <= len {
+        let mut bad = 0u32;
+        for k in 0..8 {
+            bad |= (chars[n + k].wrapping_sub(32) >= 95) as u32;
+        }
+        if bad != 0 {
+            break;
+        }
+        n += 8;
+    }
+    while n < len && chars[n].wrapping_sub(32) < 95 {
         n += 1;
     }
     n

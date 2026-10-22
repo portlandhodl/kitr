@@ -2,8 +2,8 @@
 //! The VT escape code parser state machine, ported from `kitty/vt-parser.c`.
 
 use kitty_core::CharType;
+use kitty_simd::{find_either_of_two_bytes, printable_ascii_run_length, UTF8Decoder, UTF8_ACCEPT};
 
-use crate::charsets::UTF8_DFA;
 use crate::params::{CsiParams, MAX_CSI_PARAMS};
 
 /// Size of the C parser's input buffer (`BUF_SZ`).
@@ -12,6 +12,12 @@ pub const BUFFER_SIZE: usize = 1024 * 1024;
 pub const MAX_ESCAPE_CODE_LENGTH: usize = BUFFER_SIZE / 4;
 
 const MAX_CSI_DIGITS: u8 = 16;
+
+/// Maximum number of input bytes handed to the SIMD UTF-8 decoder at once.
+/// Keeping the decoded output (four bytes per codepoint) inside L2 avoids
+/// turning a long ASCII run into a 4x expansion stream through memory, while
+/// still being large enough to amortize the per-call decoder setup.
+const NORMAL_DECODE_CHUNK: usize = 32 * 1024;
 
 const BEL: u8 = 0x07;
 const BS: u8 = 0x08;
@@ -31,9 +37,6 @@ const ESC_ST: u8 = b'\\';
 const ESC_PM: u8 = b'^';
 const ESC_APC: u8 = b'_';
 const ESC_SOS: u8 = b'X';
-
-const UTF8_ACCEPT: u32 = 0;
-const UTF8_REJECT: u32 = 1;
 
 /// The VTE parser states used by kitty (`VTEState` in the C source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,36 +189,16 @@ impl ParsedCsi {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Utf8State {
-    cur: u32,
-    prev: u32,
-    codep: u32,
-}
-
-impl Utf8State {
-    #[inline]
-    fn decode(&mut self, byte: u8) -> u32 {
-        let typ = UTF8_DFA[byte as usize] as u32;
-        self.codep = if self.cur != UTF8_ACCEPT {
-            (byte as u32 & 0x3f) | (self.codep << 6)
-        } else {
-            (0xffu32 >> typ) & byte as u32
-        };
-        self.cur = UTF8_DFA[256 + self.cur as usize * 16 + typ as usize] as u32;
-        self.cur
-    }
-}
-
 /// The incremental VT escape code parser.
 pub struct Parser {
     state: VteState,
-    utf8: Utf8State,
+    utf8: UTF8Decoder,
     csi: ParsedCsi,
     text: Vec<CharType>,
     string: Vec<u8>,
     string_pending_esc: bool,
     esc_intermediate: Option<u8>,
+    plain_scan_until: usize,
 }
 
 impl Default for Parser {
@@ -229,12 +212,13 @@ impl Parser {
     pub fn new() -> Self {
         Self {
             state: VteState::Normal,
-            utf8: Utf8State::default(),
+            utf8: UTF8Decoder::new(),
             csi: ParsedCsi::new(),
             text: Vec::new(),
             string: Vec::new(),
             string_pending_esc: false,
             esc_intermediate: None,
+            plain_scan_until: 0,
         }
     }
 
@@ -249,12 +233,13 @@ impl Parser {
     /// not the parser.
     pub fn reset(&mut self) {
         self.state = VteState::Normal;
-        self.utf8 = Utf8State::default();
+        self.utf8.reset();
         self.csi.reset();
         self.text.clear();
         self.string.clear();
         self.string_pending_esc = false;
         self.esc_intermediate = None;
+        self.plain_scan_until = 0;
     }
 
     /// Feed bytes to the parser.
@@ -262,6 +247,7 @@ impl Parser {
     /// The input may be split at any byte boundary; parser state (including
     /// partial UTF-8, escape and string sequences) is carried across calls.
     pub fn parse<H: Handler + ?Sized>(&mut self, input: &[u8], handler: &mut H) {
+        self.plain_scan_until = 0;
         let mut pos = 0;
         while pos < input.len() {
             match self.state {
@@ -269,18 +255,7 @@ impl Parser {
                 VteState::Esc => self.consume_esc(input, &mut pos, handler),
                 VteState::Csi => {
                     if self.consume_csi(input, &mut pos, handler) {
-                        self.state = VteState::Normal;
-                        if self.csi.is_valid {
-                            self.flush_text(handler);
-                            let secondary = self.csi.params.secondary();
-                            let intermediates: &[u8] = if secondary != 0 {
-                                std::slice::from_ref(&secondary)
-                            } else {
-                                &[]
-                            };
-                            let action = self.csi.params.trailer();
-                            handler.csi_dispatch(&self.csi.params, intermediates, action);
-                        }
+                        self.finish_csi(handler);
                     }
                 }
                 VteState::Osc | VteState::Dcs | VteState::Apc | VteState::Pm | VteState::Sos => {
@@ -298,53 +273,166 @@ impl Parser {
         handler: &mut H,
     ) {
         while *pos < input.len() {
+            if self.utf8.cur == UTF8_ACCEPT && self.consume_plain_chunk(input, pos, handler) {
+                if self.state != VteState::Normal {
+                    return;
+                }
+                continue;
+            }
+            self.consume_normal_decoder(input, pos, handler);
+            if self.state != VteState::Normal {
+                return;
+            }
+        }
+    }
+
+    /// Fast path for a chunk containing no ESC. The whole chunk is decoded by
+    /// the SIMD decoder in one call, so long text runs (ASCII or not) amortize
+    /// the decoder setup and are flushed to `Handler::draw` in chunks. Chunks
+    /// that contain an escape sequence use the incremental path instead, which
+    /// stops the decoder before the sentinel.
+    fn consume_plain_chunk<H: Handler + ?Sized>(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        handler: &mut H,
+    ) -> bool {
+        let start = *pos;
+        if start < self.plain_scan_until {
+            return false;
+        }
+        let end = (start + NORMAL_DECODE_CHUNK).min(input.len());
+        if find_either_of_two_bytes(&input[start..end], ESC, ESC).is_some() {
+            self.plain_scan_until = end;
+            return false;
+        }
+        let found = self.utf8.decode_to_esc(&input[start..end]);
+        let consumed = self.utf8.num_consumed;
+        self.emit_decoded(handler);
+        *pos = start + consumed;
+        if found {
+            // The caller guaranteed no ESC was present; treat defensively.
+            debug_assert!(!found, "decoder found an ESC in an ESC-free chunk");
+            self.flush_text(handler);
+            self.state = VteState::Esc;
+        }
+        true
+    }
+
+    /// Incremental decoder path used for non-ASCII chunks and for completing a
+    /// partial UTF-8 sequence carried in from a previous call.
+    fn consume_normal_decoder<H: Handler + ?Sized>(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        handler: &mut H,
+    ) {
+        while *pos < input.len() {
             if self.utf8.cur == UTF8_ACCEPT {
                 let start = *pos;
+                let ch = input[start];
+                if ch < 0x20 && ch != ESC {
+                    // C0 controls are single ASCII bytes; dispatch them
+                    // directly instead of paying for a decoder call.
+                    self.emit_char(ch as u32, handler);
+                    *pos += 1;
+                    continue;
+                }
                 let mut end = start;
-                while end < input.len() && (b' '..=b'~').contains(&input[end]) {
+                while end < input.len() && (b' '..=0x7f).contains(&input[end]) {
                     end += 1;
                 }
                 if end > start {
                     self.text
-                        .extend(input[start..end].iter().map(|&byte| u32::from(byte)));
+                        .extend(input[start..end].iter().map(|&b| u32::from(b)));
                     *pos = end;
-                    continue;
+                    if *pos >= input.len() {
+                        return;
+                    }
                 }
             }
-            let ch = input[*pos];
-            *pos += 1;
-            if ch == ESC {
+
+            let start = *pos;
+            if input[start] == ESC {
+                // Adjacent escape sequences are common in real streams. Avoid
+                // paying the SIMD decoder setup just to rediscover the
+                // sentinel.
                 if self.utf8.cur != UTF8_ACCEPT {
                     self.emit_char(0xfffd, handler);
                 }
-                self.utf8 = Utf8State::default();
+                self.utf8.reset();
+                *pos += 1;
                 self.flush_text(handler);
                 self.state = VteState::Esc;
                 return;
             }
-            self.decode_byte(ch, handler);
+            let end = (start + NORMAL_DECODE_CHUNK).min(input.len());
+            let found = self.utf8.decode_to_esc(&input[start..end]);
+            let consumed = self.utf8.num_consumed;
+            self.emit_decoded(handler);
+            *pos = start + consumed;
+
+            if found {
+                // The decoder consumed the sentinel but left it out of the
+                // output. The parser's Esc state expects the introducer to
+                // have been consumed already, matching the per-byte path.
+                self.flush_text(handler);
+                self.state = VteState::Esc;
+                return;
+            }
         }
     }
 
-    fn decode_byte<H: Handler + ?Sized>(&mut self, ch: u8, handler: &mut H) {
-        loop {
-            match self.utf8.decode(ch) {
-                UTF8_ACCEPT => {
-                    let codep = self.utf8.codep;
-                    self.emit_char(codep, handler);
+    fn finish_csi<H: Handler + ?Sized>(&mut self, handler: &mut H) {
+        self.state = VteState::Normal;
+        if self.csi.is_valid {
+            self.flush_text(handler);
+            let secondary = self.csi.params.secondary();
+            let intermediates: &[u8] = if secondary != 0 {
+                std::slice::from_ref(&secondary)
+            } else {
+                &[]
+            };
+            let action = self.csi.params.trailer();
+            handler.csi_dispatch(&self.csi.params, intermediates, action);
+        }
+    }
+
+    /// Route codepoints from the most recent decode call through the same
+    /// dispatch logic the per-byte path used.
+    fn emit_decoded<H: Handler + ?Sized>(&mut self, handler: &mut H) {
+        let decoded = std::mem::take(&mut self.utf8.output);
+        self.emit_slice(&decoded, handler);
+        self.utf8.output = decoded;
+    }
+
+    /// Dispatch a slice of decoded codepoints. Printable runs are handed to
+    /// `Handler::draw` directly from the decoder's buffer so the common
+    /// all-ASCII case does not make a second copy through [`Parser::text`]. If
+    /// text is already pending (a run continued from a previous decoder call
+    /// within this `parse`), the run is appended to keep pending text together.
+    fn emit_slice<H: Handler + ?Sized>(&mut self, decoded: &[u32], handler: &mut H) {
+        let mut i = 0;
+        while i < decoded.len() {
+            let ch = decoded[i];
+            let start = i;
+            if (b' ' as u32..=b'~' as u32).contains(&ch) {
+                i += printable_ascii_run_length(&decoded[i..]);
+            } else if ch >= ' ' as u32 {
+                i += 1;
+                while i < decoded.len() && decoded[i] >= ' ' as u32 {
+                    i += 1;
                 }
-                UTF8_REJECT => {
-                    let prev_was_accept = self.utf8.prev == UTF8_ACCEPT;
-                    self.utf8 = Utf8State::default();
-                    self.emit_char(0xfffd, handler);
-                    if !prev_was_accept {
-                        continue;
-                    }
-                }
-                _ => {}
+            } else {
+                self.emit_char(ch, handler);
+                i += 1;
+                continue;
             }
-            self.utf8.prev = self.utf8.cur;
-            break;
+            if self.text.is_empty() {
+                handler.draw(&decoded[start..i]);
+            } else {
+                self.text.extend_from_slice(&decoded[start..i]);
+            }
         }
     }
 

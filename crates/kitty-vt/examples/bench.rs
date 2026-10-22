@@ -46,6 +46,23 @@ fn make_input(target: usize) -> Vec<u8> {
     out
 }
 
+/// The exact stream used by `crates/kitty-screen/examples/compare.rs` (and
+/// `kitty/bench_c.py`), for direct comparison with the C parser numbers.
+fn make_compare_stream(target: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(target + 256);
+    let line =
+        b"\x1b[38;2;255;128;0mThe quick brown fox jumps over the lazy dog 0123456789\x1b[0m\r\n";
+    let mut lines = 0u32;
+    while out.len() < target {
+        out.extend_from_slice(line);
+        if lines.is_multiple_of(64) {
+            out.extend_from_slice(b"\x1b[1;1H\x1b[2J");
+        }
+        lines += 1;
+    }
+    out
+}
+
 fn run(name: &str, input: &[u8]) -> f64 {
     let iterations = 16u32;
     let mut parser = Parser::new();
@@ -76,6 +93,9 @@ fn main() {
         input.len() / (1024 * 1024)
     );
     run("mixed xterm stream", &input);
+
+    let compare_stream = make_compare_stream(16 * 1024 * 1024);
+    run("compare.rs mixed stream", &compare_stream);
 
     let ascii: Vec<u8> = (0..16 * 1024 * 1024u32)
         .map(|i| b' ' + (i % 95) as u8)

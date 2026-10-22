@@ -270,22 +270,25 @@ pub unsafe fn blend_over_straight(dst: &mut [u8], src: &[u8]) {
 // UTF-8 {{{
 
 #[inline(always)]
-unsafe fn output_plain_ascii_from_memory(d: &mut UTF8Decoder, src: *const u8, src_sz: usize) {
-    let base = d.output_len();
-    let out = d.output_ptr();
+unsafe fn output_plain_ascii_from_memory(
+    out: *mut u32,
+    pos: &mut usize,
+    src: *const u8,
+    src_sz: usize,
+) {
+    let base = *pos;
     let mut i = 0;
     while i < src_sz {
         let v = _mm512_cvtepu8_epi32(_mm_loadu_si128(src.add(i) as *const __m128i));
         _mm512_storeu_si512(out.add(base + i) as *mut __m512i, v);
         i += 16;
     }
-    d.set_output_len(base + src_sz);
+    *pos = base + src_sz;
 }
 
 #[inline(always)]
-unsafe fn output_plain_ascii(d: &mut UTF8Decoder, vec: __m512i, src_sz: usize) {
-    let base = d.output_len();
-    let out = d.output_ptr();
+unsafe fn output_plain_ascii(out: *mut u32, pos: &mut usize, vec: __m512i, src_sz: usize) {
+    let base = *pos;
     _mm512_storeu_si512(
         out.add(base) as *mut __m512i,
         _mm512_cvtepu8_epi32(_mm512_castsi512_si128(vec)),
@@ -308,19 +311,19 @@ unsafe fn output_plain_ascii(d: &mut UTF8Decoder, vec: __m512i, src_sz: usize) {
             }
         }
     }
-    d.set_output_len(base + src_sz);
+    *pos = base + src_sz;
 }
 
 #[inline(always)]
 unsafe fn output_unicode(
-    d: &mut UTF8Decoder,
+    out: *mut u32,
+    pos: &mut usize,
     mut output1: __m512i,
     mut output2: __m512i,
     mut output3: __m512i,
     num_codepoints: usize,
 ) {
-    let base = d.output_len();
-    let out = d.output_ptr();
+    let base = *pos;
     let zero = _mm512_setzero_si512();
     let mut i = 0;
     while i < num_codepoints {
@@ -338,10 +341,10 @@ unsafe fn output_unicode(
         output3 = _mm512_alignr_epi64::<2>(zero, output3);
         i += 16;
     }
-    d.set_output_len(base + num_codepoints);
+    *pos = base + num_codepoints;
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,popcnt")]
 /// # Safety
 ///
 /// The CPU must support every instruction set enabled on this function (see
@@ -351,14 +354,17 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
     d.begin_call();
     let mut src_data = src;
     let mut src_len = src.len();
+    let mut consumed = 0usize;
     if d.cur != UTF8_ACCEPT {
         d.ensure_capacity(src_len);
         let n = decode_to_accept_scalar(d, src_data);
-        d.num_consumed = n;
+        consumed = n;
         src_data = &src_data[n..];
         src_len -= n;
     }
     d.ensure_capacity(src_len + 64);
+    let mut out = d.output_ptr();
+    let mut out_pos = d.output_len();
     let esc_vec = set1_epi8(0x1b);
     let zero = _mm512_setzero_si512();
     let one = set1_epi8(1);
@@ -381,8 +387,8 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
                 if bad != 0 {
                     break;
                 }
-                output_plain_ascii_from_memory(d, src_data.as_ptr().add(p), 128);
-                d.num_consumed += 128;
+                output_plain_ascii_from_memory(out, &mut out_pos, src_data.as_ptr().add(p), 128);
+                consumed += 128;
                 p += 128;
             }
             if p >= limit {
@@ -403,26 +409,66 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             let kept_bits = low_bits64(chunk_src_sz as u32);
             ascii_mask &= kept_bits;
             vec = _mm512_maskz_mov_epi8(kept_bits, vec);
-            d.num_consumed += chunk_src_sz + 1;
+            consumed += chunk_src_sz + 1;
             if chunk_src_sz == 0 {
                 continue;
             }
         } else {
-            d.num_consumed += chunk_src_sz;
+            consumed += chunk_src_sz;
         }
 
         let mut num_of_trailing_bytes = 0usize;
-        let mut check_for_trailing_bytes = !sentinel_found;
         let mut stop = false;
+        if !sentinel_found {
+            // Direct trailing-byte check, equivalent to the C discarded-count
+            // check but without a second classification pass.
+            let last = start_of_current_chunk + chunk_src_sz - 1;
+            if src_data[last] >= 0xc0 {
+                num_of_trailing_bytes = 1;
+            } else if chunk_src_sz > 1 && src_data[last - 1] >= 0xe0 {
+                num_of_trailing_bytes = 2;
+            } else if chunk_src_sz > 2 && src_data[last - 2] >= 0xf0 {
+                num_of_trailing_bytes = 3;
+            }
+            if num_of_trailing_bytes != 0 {
+                chunk_src_sz -= num_of_trailing_bytes;
+                consumed -= num_of_trailing_bytes;
+                if chunk_src_sz == 0 {
+                    d.set_output_len(out_pos);
+                    d.num_consumed = consumed;
+                    decode_all_scalar(
+                        d,
+                        &src_data[start_of_current_chunk
+                            ..start_of_current_chunk + num_of_trailing_bytes],
+                    );
+                    out_pos = d.output_len();
+                    out = d.output_ptr();
+                    consumed += num_of_trailing_bytes;
+                    stop = true;
+                } else {
+                    let kept_bits = low_bits64(chunk_src_sz as u32);
+                    ascii_mask &= kept_bits;
+                    vec = _mm512_maskz_mov_epi8(kept_bits, vec);
+                }
+            }
+        }
+        if stop {
+            break;
+        }
 
+        #[allow(clippy::never_loop)]
         loop {
             if ascii_mask == 0 {
-                output_plain_ascii(d, vec, chunk_src_sz);
+                output_plain_ascii(out, &mut out_pos, vec, chunk_src_sz);
                 prev_chunk_was_all_ascii = true;
                 if num_of_trailing_bytes != 0 {
                     if p >= limit {
+                        d.set_output_len(out_pos);
+                        d.num_consumed = consumed;
                         decode_all_scalar(d, &src_data[p - num_of_trailing_bytes..p]);
-                        d.num_consumed += num_of_trailing_bytes;
+                        out_pos = d.output_len();
+                        out = d.output_ptr();
+                        consumed += num_of_trailing_bytes;
                         stop = true;
                     } else {
                         p -= num_of_trailing_bytes;
@@ -451,36 +497,6 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             );
 
             let discarded_locations = _mm512_cmpgt_epu8_mask(counts, one);
-            if check_for_trailing_bytes && ((discarded_locations >> (chunk_src_sz - 1)) & 1) != 0 {
-                check_for_trailing_bytes = false;
-                let last = start_of_current_chunk + chunk_src_sz - 1;
-                if src_data[last] >= 0xc0 {
-                    num_of_trailing_bytes = 1;
-                } else if chunk_src_sz > 1 && src_data[last - 1] >= 0xe0 {
-                    num_of_trailing_bytes = 2;
-                } else if chunk_src_sz > 2 && src_data[last - 2] >= 0xf0 {
-                    num_of_trailing_bytes = 3;
-                }
-                if num_of_trailing_bytes != 0 {
-                    chunk_src_sz -= num_of_trailing_bytes;
-                    d.num_consumed -= num_of_trailing_bytes;
-                    if chunk_src_sz == 0 {
-                        decode_all_scalar(
-                            d,
-                            &src_data[start_of_current_chunk
-                                ..start_of_current_chunk + num_of_trailing_bytes],
-                        );
-                        d.num_consumed += num_of_trailing_bytes;
-                        stop = true;
-                        break;
-                    }
-                    let kept_bits = low_bits64(chunk_src_sz as u32);
-                    ascii_mask &= kept_bits;
-                    vec = _mm512_maskz_mov_epi8(kept_bits, vec);
-                }
-                continue;
-            }
-
             let mut chunk_is_invalid = ascii_mask ^ _mm512_cmpgt_epu8_mask(counts, zero);
             chunk_is_invalid |= _mm512_mask_cmplt_epu8_mask(starts_two, vec, set1_epi8(0xc2));
             chunk_is_invalid |= _mm512_cmpgt_epu8_mask(vec, set1_epi8(0xf4));
@@ -507,12 +523,16 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
                 set1_epi8(0x8f),
             );
             if chunk_is_invalid != 0 {
+                d.set_output_len(out_pos);
+                d.num_consumed = consumed;
                 decode_all_scalar(
                     d,
                     &src_data[start_of_current_chunk
                         ..start_of_current_chunk + chunk_src_sz + num_of_trailing_bytes],
                 );
-                d.num_consumed += num_of_trailing_bytes;
+                out_pos = d.output_len();
+                out = d.output_ptr();
+                consumed += num_of_trailing_bytes;
                 stop = true;
                 break;
             }
@@ -570,12 +590,16 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             let output2 = _mm512_maskz_compress_epi8(kept_locations, output2);
             let output3 = _mm512_maskz_compress_epi8(kept_locations, output3);
             let num_codepoints = kept_locations.count_ones() as usize;
-            output_unicode(d, output1, output2, output3, num_codepoints);
+            output_unicode(out, &mut out_pos, output1, output2, output3, num_codepoints);
 
             if num_of_trailing_bytes != 0 {
                 if p >= limit {
+                    d.set_output_len(out_pos);
+                    d.num_consumed = consumed;
                     decode_all_scalar(d, &src_data[p - num_of_trailing_bytes..p]);
-                    d.num_consumed += num_of_trailing_bytes;
+                    out_pos = d.output_len();
+                    out = d.output_ptr();
+                    consumed += num_of_trailing_bytes;
                     stop = true;
                 } else {
                     p -= num_of_trailing_bytes;
@@ -587,6 +611,8 @@ pub unsafe fn utf8_decode_to_esc(d: &mut UTF8Decoder, src: &[u8]) -> bool {
             break;
         }
     }
+    d.set_output_len(out_pos);
+    d.num_consumed = consumed;
     if sentinel_found && d.cur != UTF8_ACCEPT {
         d.ensure_capacity(1);
         d.push_codepoint(0xfffd);

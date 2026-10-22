@@ -64,35 +64,30 @@ impl ScreenHandler {
     }
 
     fn handle_sgr(&mut self, csi: &CsiParams) {
-        let mut params = csi.raw_params().to_vec();
-        let mut subs = csi.subparam_flags().to_vec();
+        let params = csi.raw_params();
         if params.is_empty() {
-            params.push(0);
-            subs.push(false);
+            self.screen.select_graphic_rendition(&[0], false);
+            return;
         }
-        match sgr_chunks(&params, &subs) {
-            Ok(chunks) => {
-                for (chunk, is_group) in chunks {
-                    self.screen.select_graphic_rendition(&chunk, is_group);
-                }
-            }
-            Err(msg) => self.report_error(&msg),
+        let subs = csi.subparam_flags();
+        let result = sgr_groups(params, subs, |chunk, is_group| {
+            self.screen.select_graphic_rendition(chunk, is_group);
+        });
+        if let Err(msg) = result {
+            self.report_error(&msg);
         }
     }
 }
 
-fn send_chunk(
-    chunks: &mut Vec<(Vec<i32>, bool)>,
+fn send_chunk<F: FnMut(&[i32], bool)>(
+    chunks: &mut F,
     params: &[i32],
     first: &mut usize,
     num: &mut usize,
     state: &mut u8,
 ) {
     if *num > 0 {
-        chunks.push((
-            params[*first..*first + *num].to_vec(),
-            *state != STATE_NORMAL,
-        ));
+        chunks(&params[*first..*first + *num], *state != STATE_NORMAL);
         *first += *num;
         *num = 0;
         *state = STATE_NORMAL;
@@ -106,8 +101,14 @@ const STATE_COLOR1: u8 = 3;
 const STATE_COLOR3: u8 = 4;
 
 /// The SGR grouping state machine from `_parse_sgr()` in `vt-parser.c`.
-fn sgr_chunks(params: &[i32], subs: &[bool]) -> Result<Vec<(Vec<i32>, bool)>, String> {
-    let mut chunks = Vec::new();
+///
+/// Groups are handed to `emit` as borrowed slices so the hot path does not
+/// allocate. This is the same state machine and error behavior as before.
+fn sgr_groups<F: FnMut(&[i32], bool)>(
+    params: &[i32],
+    subs: &[bool],
+    mut emit: F,
+) -> Result<(), String> {
     let mut first = 0usize;
     let mut num = 0usize;
     let mut state = STATE_NORMAL;
@@ -123,14 +124,14 @@ fn sgr_chunks(params: &[i32], subs: &[bool]) -> Result<Vec<(Vec<i32>, bool)>, St
                         );
                     }
                     num -= 1;
-                    send_chunk(&mut chunks, params, &mut first, &mut num, &mut state);
+                    send_chunk(&mut emit, params, &mut first, &mut num, &mut state);
                     state = STATE_SUB;
                     first = pos - 1;
                     num = 1;
                 }
                 match params[pos] {
                     38 | 48 | 58 => {
-                        send_chunk(&mut chunks, params, &mut first, &mut num, &mut state);
+                        send_chunk(&mut emit, params, &mut first, &mut num, &mut state);
                         state = STATE_COLOR;
                         first = pos;
                         num = 1;
@@ -142,7 +143,7 @@ fn sgr_chunks(params: &[i32], subs: &[bool]) -> Result<Vec<(Vec<i32>, bool)>, St
                 if subs[pos] {
                     num += 1;
                 } else {
-                    send_chunk(&mut chunks, params, &mut first, &mut num, &mut state);
+                    send_chunk(&mut emit, params, &mut first, &mut num, &mut state);
                     // Re-process this parameter in the normal state.
                     pos = pos.wrapping_sub(1);
                 }
@@ -164,20 +165,20 @@ fn sgr_chunks(params: &[i32], subs: &[bool]) -> Result<Vec<(Vec<i32>, bool)>, St
             },
             STATE_COLOR1 => {
                 num += 1;
-                send_chunk(&mut chunks, params, &mut first, &mut num, &mut state);
+                send_chunk(&mut emit, params, &mut first, &mut num, &mut state);
             }
             STATE_COLOR3 => {
                 num += 1;
                 if num >= 5 {
-                    send_chunk(&mut chunks, params, &mut first, &mut num, &mut state);
+                    send_chunk(&mut emit, params, &mut first, &mut num, &mut state);
                 }
             }
             _ => unreachable!(),
         }
         pos += 1;
     }
-    send_chunk(&mut chunks, params, &mut first, &mut num, &mut state);
-    Ok(chunks)
+    send_chunk(&mut emit, params, &mut first, &mut num, &mut state);
+    Ok(())
 }
 
 impl Handler for ScreenHandler {

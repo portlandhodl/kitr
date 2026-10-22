@@ -8,3 +8,4 @@ description = "VT escape code parser ported 1:1 from kitty's vt-parser.c"
 
 [dependencies]
 kitty-core = { path = "../kitty-core" }
+kitty-simd = { path = "../kitty-simd" }
