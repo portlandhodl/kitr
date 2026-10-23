@@ -246,6 +246,8 @@ pub enum GraphicsError {
         code: &'static str,
         message: String,
     },
+    /// A relative placement chain is invalid.
+    Placement(crate::placement::PlacementError),
 }
 
 impl GraphicsError {
@@ -264,6 +266,7 @@ impl GraphicsError {
             Self::NoPendingTransfer => "EILSEQ",
             Self::Parse(_) => "EINVAL",
             Self::Animation { code, .. } => code,
+            Self::Placement(error) => error.code(),
         }
     }
 }
@@ -312,11 +315,18 @@ impl core::fmt::Display for GraphicsError {
             }
             Self::Parse(e) => write!(f, "{e}"),
             Self::Animation { message, .. } => f.write_str(message),
+            Self::Placement(error) => error.fmt(f),
         }
     }
 }
 
 impl std::error::Error for GraphicsError {}
+
+impl From<crate::placement::PlacementError> for GraphicsError {
+    fn from(value: crate::placement::PlacementError) -> Self {
+        Self::Placement(value)
+    }
+}
 
 impl From<PngError> for GraphicsError {
     fn from(value: PngError) -> Self {

@@ -91,18 +91,20 @@
 //! * [`egl`] — raw `libEGL`/GL FFI, a surfaceless/pbuffer
 //!   [`GlContext`](egl::GlContext), an `eglGetProcAddress` function table,
 //!   version/extension queries, resize, swap and readback;
-//! * [`gl_shaders`] — embedded GLSL 330 core programs (with a GLES 3.00
-//!   adaptation) for glyph quads, solid backgrounds/decorations/cursors,
-//!   textured image quads and rounded-rectangle SDFs, plus optional gamma
-//!   conversion;
+//! * [`shaders`] — kitty's real Slang programs compiled to GLSL by
+//!   `scripts/generate_shaders.py`, with program variants, preprocessor
+//!   defines, uniform/attribute reflection and a user-shader compiler;
+//! * [`gl_shaders`] — compatibility helpers returning the generated programs
+//!   used for glyphs, solids and images;
 //! * [`gl_backend`] — instanced drawing, per-page atlas textures, an image
 //!   texture cache keyed by [`ImageKey`], scissor-based damage, premultiplied
 //!   blending and `read_pixels()`. `GlBackend::new` creates its own headless
 //!   pbuffer context; `GlBackend::with_loader` reuses a caller-provided current
 //!   EGL window context.
 //!
-//! The shaders are a functional subset, not a line-for-line port of
-//! `kitty/shaders/*.slang` (see [`gl_shaders`]).
+//! The GLSL is checked in under `src/shaders/generated` so a normal build does
+//! not need `slangc`; `SHADERS.md` records which programs the backend currently
+//! drives and which generated variants are deferred.
 //!
 //! ```text
 //! cargo test -p kitty-render                    # CPU only, no EGL linked
@@ -116,9 +118,10 @@
 //! # Renderer features not supported yet
 //!
 //! * Relative placement chains are resolved with cycle/depth checks and
-//!   descendant visibility rules; indexed protocol images are expanded through
-//!   the renderer's palette so `f=8`/`f=16` work with the same texture upload
-//!   path. Animation/composition state lives in `kitty-graphics`; the renderer
+//!   descendant visibility rules. Indexed protocol images are uploaded as
+//!   integer index textures and looked up in the live palette in the shader,
+//!   matching kitty. Animation pixels can be spilled to a private disk cache
+//!   that is removed when the renderer is dropped. Animation/composition state lives in `kitty-graphics`; the renderer
 //!   consumes its reconstructed current frame and exposes
 //!   [`RendererCore::tick_animations`].
 //! * The full cursor-trail corner animation and custom trail shaders. The
@@ -136,7 +139,8 @@
 //!   they do not alter text extraction.
 //! * Tab-bar scrolling, vertical tab bars, tab-bar margins/edge colours beyond
 //!   the simple [`TabBarSpec`] geometry, and tab icons/close buttons.
-//! * Custom user shaders and the full kitty shader pipeline.
+//! * Custom user shaders are compiled and linked, but kitty's animated
+//!   multi-group post-processing pipeline is not driven by frames yet.
 //! * Shaped runs are limited to at most [`SHAPED_RUN_MAX_CELLS`] contiguous
 //!   single-width cells with the same style, foreground, background and
 //!   hyperlink, and to 24 codepoints per key. Selected/hovered runs, wide
@@ -168,6 +172,7 @@ pub mod geom;
 pub mod images;
 pub mod instances;
 pub mod overlays;
+pub mod shaders;
 pub mod shaped;
 pub mod trail;
 
@@ -221,6 +226,10 @@ pub use overlays::{
     interval_contains, selection_intervals, HyperlinkHover, OverlayStats, SelectionCell,
     SelectionRange, TabBarColors, TabBarFrame, TabBarSpec, TabBarTab,
 };
+pub use shaders::{
+    cell_variant, default_variant, named_variant, variants, CustomShader, GeneratedMetadata,
+    GeneratedProgram, ProgramKind, ProgramSources, ShaderDialect, ShaderError, SlangCompiler,
+};
 pub use shaped::{
     shaped_run_hash, ShapedRunCluster, ShapedRunOutput, ShapedRunRequest, SHAPED_RUN_MAX_CELLS,
 };
@@ -230,6 +239,6 @@ pub use trail::{CursorTrail, CursorTrailConfig, TrailInstance};
 pub use egl::{ContextConfig, EglError, GlApi, GlContext, GlError, GlFns, GlVersion};
 #[cfg(feature = "gl")]
 pub use gl_backend::{
-    AtlasSyncStats, FilterMode, GammaMode, GlBackend, GlBackendConfig, GlBackendError,
-    ImageSyncStats, RenderStats,
+    validate_all_shader_variants, validate_builtin_programs, AtlasSyncStats, FilterMode, GammaMode,
+    GlBackend, GlBackendConfig, GlBackendError, ImageSyncStats, RenderStats,
 };

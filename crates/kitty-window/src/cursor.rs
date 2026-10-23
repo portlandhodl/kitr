@@ -11,6 +11,36 @@ use std::env;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
+use crate::types::PointerShape;
+
+/// Xcursor/Wayland cursor-theme name for a neutral pointer shape.
+pub fn shape_name(shape: PointerShape) -> &'static str {
+    match shape {
+        PointerShape::Default => "left_ptr",
+        PointerShape::Text => "xterm",
+        PointerShape::Pointer => "hand2",
+        PointerShape::Crosshair => "crosshair",
+        PointerShape::Move => "fleur",
+        PointerShape::Wait => "watch",
+        PointerShape::Progress => "left_ptr_watch",
+        PointerShape::ResizeN => "top_side",
+        PointerShape::ResizeS => "bottom_side",
+        PointerShape::ResizeE => "right_side",
+        PointerShape::ResizeW => "left_side",
+        PointerShape::ResizeNE => "top_right_corner",
+        PointerShape::ResizeNW => "top_left_corner",
+        PointerShape::ResizeSE => "bottom_right_corner",
+        PointerShape::ResizeSW => "bottom_left_corner",
+        PointerShape::NotAllowed => "not-allowed",
+        PointerShape::Help => "question_arrow",
+        PointerShape::Cell => "dotbox",
+        PointerShape::VerticalText => "sb_v_double_arrow",
+        PointerShape::ZoomIn => "zoom-in",
+        PointerShape::ZoomOut => "zoom-out",
+        PointerShape::ContextMenu => "context-menu",
+    }
+}
+
 /// Snapshot of the cursor theme configuration and on-disk state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CursorTheme {

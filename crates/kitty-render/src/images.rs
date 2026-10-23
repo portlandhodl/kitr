@@ -19,20 +19,22 @@
 //!
 //! Relative placements are resolved through `kitty_graphics::PlacementGraph`
 //! (cycles, depth limits, virtual-placeholder anchors, inherited z-index/source
-//! rectangles), and indexed-colour images are expanded through an
-//! [`IndexedPalette`] before texture upload. Unicode placeholder runs and
-//! animation frames are expanded here; the current animation frame takes
-//! precedence over the root image stored on the screen.
+//! rectangles). Indexed-colour images keep their palette indices in the upload;
+//! the GL shader performs a live palette lookup so colour changes do not
+//! re-upload textures. Unicode placeholder runs and animation frames are
+//! expanded here; the current animation frame takes precedence over the root
+//! image stored on the screen.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
 use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
 use kitty_graphics::{
     decode_png, AnimationManager, Image, ImageFormat, IndexedPalette, PlacementGraph, PlacementKey,
-    PlacementRecord, ResolvedPlacement, SourceRect, MAX_IMAGE_DIMENSION,
+    ResolvedPlacement, MAX_IMAGE_DIMENSION,
 };
 use kitty_screen::Screen;
 
@@ -180,9 +182,17 @@ pub struct ImageUpload {
     pub key: ImageKey,
     pub width: u32,
     pub height: u32,
+    /// RGBA8 for ordinary images, or tightly packed palette indices for
+    /// indexed protocol images (`f=8`/`f=16`).
     pub data: ImageData,
     pub filter: ImageFilter,
     pub wrap: ImageWrap,
+    /// Set for `f=8`/`f=16`; the backend samples it as an integer texture and
+    /// performs the palette lookup in the shader.
+    pub indexed_format: Option<ImageFormat>,
+    /// Palette snapshot used when the caller does not supply a live one on the
+    /// frame. Renderers normally put the current palette on [`Frame`].
+    pub palette: Option<IndexedPalette>,
     /// Cheap content fingerprint; the backend re-uploads only when it changes.
     pub fingerprint: u64,
 }
@@ -204,12 +214,15 @@ impl ImageUpload {
             data,
             filter,
             wrap,
+            indexed_format: None,
+            palette: None,
             fingerprint,
         }
     }
 
-    /// Build an RGBA upload from raw indexed samples and a palette. This is
-    /// the upload path used for `f=8`/`f=16` protocol images.
+    /// Build an upload from raw indexed samples. The index data is kept as-is;
+    /// the GPU shader performs the palette lookup so terminal colour changes
+    /// take effect without re-uploading the image.
     #[allow(clippy::too_many_arguments)]
     pub fn from_indexed(
         key: ImageKey,
@@ -228,15 +241,38 @@ impl ImageUpload {
         if raw.len() < expected {
             return None;
         }
-        let data = palette.expand(&raw[..expected], format, width, height);
-        Some(Self::new(key, width, height, Arc::new(data), filter, wrap))
+        let data: ImageData = Arc::new(raw[..expected].to_vec());
+        Some(Self {
+            key,
+            width,
+            height,
+            fingerprint: fingerprint(&data),
+            data,
+            filter,
+            wrap,
+            indexed_format: Some(format),
+            palette: Some(palette.clone()),
+        })
+    }
+
+    #[inline]
+    pub fn bytes_per_pixel(&self) -> usize {
+        self.indexed_format
+            .and_then(ImageFormat::bytes_per_pixel)
+            .unwrap_or(4)
+    }
+
+    #[inline]
+    pub fn is_indexed(&self) -> bool {
+        self.indexed_format.is_some()
     }
 
     #[inline]
     pub fn is_valid(&self) -> bool {
         self.width != 0
             && self.height != 0
-            && self.data.len() >= self.width as usize * self.height as usize * 4
+            && self.data.len()
+                >= self.width as usize * self.height as usize * self.bytes_per_pixel()
     }
 }
 
@@ -694,107 +730,7 @@ pub fn window_logo(
     Some((instance, upload))
 }
 
-/// Decode one of the row/column diacritics used by Unicode placeholders.
-///
-/// The table matches `kitty/rowcolumn-diacritics.c` (Unicode 17 combining
-/// marks of class 230 without decompositions).
-pub fn diacritic_to_num(code: u32) -> u32 {
-    match code {
-        0x305..=0x306 => code - 0x305 + 1,
-        0x30d..=0x30f => code - 0x30d + 2,
-        0x310..=0x311 => code - 0x310 + 4,
-        0x312..=0x313 => code - 0x312 + 5,
-        0x33d..=0x340 => code - 0x33d + 6,
-        0x346..=0x347 => code - 0x346 + 9,
-        0x34a..=0x34d => code - 0x34a + 10,
-        0x350..=0x353 => code - 0x350 + 13,
-        0x357..=0x358 => code - 0x357 + 16,
-        0x35b..=0x35c => code - 0x35b + 17,
-        0x363..=0x370 => code - 0x363 + 18,
-        0x483..=0x488 => code - 0x483 + 31,
-        0x592..=0x596 => code - 0x592 + 36,
-        0x597..=0x59a => code - 0x597 + 40,
-        0x59c..=0x5a2 => code - 0x59c + 43,
-        0x5a8..=0x5aa => code - 0x5a8 + 49,
-        0x5ab..=0x5ad => code - 0x5ab + 51,
-        0x5af..=0x5b0 => code - 0x5af + 53,
-        0x5c4..=0x5c5 => code - 0x5c4 + 54,
-        0x610..=0x618 => code - 0x610 + 55,
-        0x657..=0x65c => code - 0x657 + 63,
-        0x65d..=0x65f => code - 0x65d + 68,
-        0x6d6..=0x6dd => code - 0x6d6 + 70,
-        0x6df..=0x6e3 => code - 0x6df + 77,
-        0x6e4..=0x6e5 => code - 0x6e4 + 81,
-        0x6e7..=0x6e9 => code - 0x6e7 + 82,
-        0x6eb..=0x6ed => code - 0x6eb + 84,
-        0x730..=0x731 => code - 0x730 + 86,
-        0x732..=0x734 => code - 0x732 + 87,
-        0x735..=0x737 => code - 0x735 + 89,
-        0x73a..=0x73b => code - 0x73a + 91,
-        0x73d..=0x73e => code - 0x73d + 92,
-        0x73f..=0x742 => code - 0x73f + 93,
-        0x743..=0x744 => code - 0x743 + 96,
-        0x745..=0x746 => code - 0x745 + 97,
-        0x747..=0x748 => code - 0x747 + 98,
-        0x749..=0x74b => code - 0x749 + 99,
-        0x7eb..=0x7f2 => code - 0x7eb + 101,
-        0x7f3..=0x7f4 => code - 0x7f3 + 108,
-        0x816..=0x81a => code - 0x816 + 109,
-        0x81b..=0x824 => code - 0x81b + 113,
-        0x825..=0x828 => code - 0x825 + 122,
-        0x829..=0x82e => code - 0x829 + 125,
-        0x951..=0x952 => code - 0x951 + 130,
-        0x953..=0x955 => code - 0x953 + 131,
-        0xf82..=0xf84 => code - 0xf82 + 133,
-        0xf86..=0xf88 => code - 0xf86 + 135,
-        0x135d..=0x1360 => code - 0x135d + 137,
-        0x17dd..=0x17de => code - 0x17dd + 140,
-        0x193a..=0x193b => code - 0x193a + 141,
-        0x1a17..=0x1a18 => code - 0x1a17 + 142,
-        0x1a75..=0x1a7d => code - 0x1a75 + 143,
-        0x1b6b..=0x1b6c => code - 0x1b6b + 151,
-        0x1b6d..=0x1b74 => code - 0x1b6d + 152,
-        0x1cd0..=0x1cd3 => code - 0x1cd0 + 159,
-        0x1cda..=0x1cdc => code - 0x1cda + 162,
-        0x1ce0..=0x1ce1 => code - 0x1ce0 + 164,
-        0x1dc0..=0x1dc2 => code - 0x1dc0 + 165,
-        0x1dc3..=0x1dca => code - 0x1dc3 + 167,
-        0x1dcb..=0x1dcd => code - 0x1dcb + 174,
-        0x1dd1..=0x1de7 => code - 0x1dd1 + 176,
-        0x1dfe..=0x1dff => code - 0x1dfe + 198,
-        0x20d0..=0x20d2 => code - 0x20d0 + 199,
-        0x20d4..=0x20d8 => code - 0x20d4 + 201,
-        0x20db..=0x20dd => code - 0x20db + 205,
-        0x20e1..=0x20e2 => code - 0x20e1 + 207,
-        0x20e7..=0x20e8 => code - 0x20e7 + 208,
-        0x20e9..=0x20ea => code - 0x20e9 + 209,
-        0x20f0..=0x20f1 => code - 0x20f0 + 210,
-        0x2cef..=0x2cf2 => code - 0x2cef + 211,
-        0x2de0..=0x2e00 => code - 0x2de0 + 214,
-        0xa66f..=0xa670 => code - 0xa66f + 246,
-        0xa67c..=0xa67e => code - 0xa67c + 247,
-        0xa6f0..=0xa6f2 => code - 0xa6f0 + 249,
-        0xa8e0..=0xa8f2 => code - 0xa8e0 + 251,
-        0xaab0..=0xaab1 => code - 0xaab0 + 269,
-        0xaab2..=0xaab4 => code - 0xaab2 + 270,
-        0xaab7..=0xaab9 => code - 0xaab7 + 272,
-        0xaabe..=0xaac0 => code - 0xaabe + 274,
-        0xaac1..=0xaac2 => code - 0xaac1 + 276,
-        0xfe20..=0xfe27 => code - 0xfe20 + 277,
-        0x10a0f..=0x10a10 => code - 0x10a0f + 284,
-        0x10a38..=0x10a39 => code - 0x10a38 + 285,
-        0x1d185..=0x1d18a => code - 0x1d185 + 286,
-        0x1d1aa..=0x1d1ae => code - 0x1d1aa + 291,
-        0x1d242..=0x1d245 => code - 0x1d242 + 295,
-        _ => 0,
-    }
-}
-
-/// Extract the low 24 image-id bits from a packed cell colour.
-#[inline]
-pub fn color_to_image_id(color: u32) -> u32 {
-    (color >> 8) & 0x00ff_ffff
-}
+pub use kitty_screen::{color_to_image_id, diacritic_to_num};
 
 /// One horizontal run of `U+10EEEE` placeholder cells.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -811,152 +747,55 @@ pub struct PlaceholderRun {
     pub screen_columns: u32,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_placeholder_run(
-    runs: &mut Vec<PlaceholderRun>,
-    lower: u32,
-    placement_id: u32,
-    higher: u32,
-    row: u32,
-    column: u32,
-    start_x: u32,
-    screen_y: u32,
-    run_len: u32,
-    run_width: u32,
-) {
-    if run_len == 0 {
-        return;
-    }
-    let higher = higher.max(1);
-    let image_id = lower | ((higher - 1) << 24);
-    runs.push(PlaceholderRun {
-        image_id,
-        placement_id,
-        image_row: row.max(1) - 1,
-        image_column: column.saturating_sub(run_len),
-        screen_x: start_x,
-        screen_y,
-        columns: run_len,
-        screen_columns: run_width.max(1),
-    });
-}
-
 /// Expand all Unicode placeholder cells into image-space runs.
 pub fn expand_unicode_placeholders(screen: &Screen) -> Vec<PlaceholderRun> {
     let mut runs = Vec::new();
-    let tc = screen.text_cache().borrow();
-    for y in 0..screen.lines {
-        let mut run_len = 0u32;
-        let mut run_width = 0u32;
-        let mut run_start = 0u32;
-        let mut prev_lower = 0u32;
-        let mut prev_placement = 0u32;
-        let mut prev_higher = 0u32;
-        let mut prev_row = 0u32;
-        let mut prev_col = 0u32;
-        for x in 0..screen.columns {
-            let cpu = screen.cpu_cell(x, y);
-            let mut single = [0u32; 1];
-            let text: &[u32] = if cpu.ch_is_idx() {
-                tc.chars_at(cpu.ch())
-            } else if cpu.ch() != 0 {
-                single[0] = cpu.ch();
-                &single[..1]
-            } else {
-                &[]
-            };
-            let is_placeholder = text.first().copied() == Some(IMAGE_PLACEHOLDER_CHAR);
-            let mut lower = 0u32;
-            let mut placement = 0u32;
-            let mut higher = 0u32;
-            let mut row = 0u32;
-            let mut column = 0u32;
-            if is_placeholder {
-                let gpu = screen.gpu_cell(x, y);
-                lower = color_to_image_id(gpu.fg);
-                placement = color_to_image_id(gpu.decoration_fg);
-                if text.len() > 1 && text[1] != 0 {
-                    row = diacritic_to_num(text[1]);
-                }
-                if text.len() > 2 && text[2] != 0 {
-                    column = diacritic_to_num(text[2]);
-                }
-                if text.len() > 3 && text[3] != 0 {
-                    higher = diacritic_to_num(text[3]);
-                }
-            }
-            let span = if cpu.is_multicell() && cpu.width() > 0 {
-                cpu.mcd_x_limit().max(1).min(screen.columns - x)
-            } else {
-                1
-            };
-            let continues = run_len > 0
-                && is_placeholder
-                && lower == prev_lower
-                && placement == prev_placement
-                && (row == 0 || row == prev_row)
-                && (column == 0 || column == prev_col + 1)
-                && (higher == 0 || higher == prev_higher);
+    let mut run: Option<PlaceholderRun> = None;
+    let mut prev_row = 1u32;
+    let mut prev_column = 1u32;
+    let mut prev_high = 1u32;
+    for cell in screen.materialize_virtual_placements() {
+        if let Some(current) = run.as_mut() {
+            let continues = cell.screen_y == current.screen_y
+                && cell.screen_x == current.screen_x + current.screen_columns
+                && current.image_id == cell.image_id
+                && current.placement_id == cell.placement_id
+                && (cell.image_row == 0 || cell.image_row == prev_row)
+                && (cell.image_column == 0 || cell.image_column == prev_column + 1)
+                && (cell.image_id_high == 0 || cell.image_id_high == prev_high);
             if continues {
-                run_len += 1;
-                run_width += span;
-                row = prev_row.max(1);
-                column = prev_col + 1;
-                higher = prev_higher.max(1);
-            } else {
-                if run_len > 0 {
-                    push_placeholder_run(
-                        &mut runs,
-                        prev_lower,
-                        prev_placement,
-                        prev_higher,
-                        prev_row,
-                        prev_col,
-                        run_start,
-                        y,
-                        run_len,
-                        run_width,
-                    );
-                }
-                if is_placeholder {
-                    run_len = 1;
-                    run_width = span;
-                    run_start = x;
-                    if column == 0 {
-                        column = 1;
-                    }
-                    if row == 0 {
-                        row = 1;
-                    }
-                    if higher == 0 {
-                        higher = 1;
-                    }
-                } else {
-                    run_len = 0;
-                    run_width = 0;
-                }
+                current.columns += 1;
+                current.screen_columns += cell.screen_columns;
+                prev_row = prev_row.max(1);
+                prev_column += 1;
+                prev_high = prev_high.max(1);
+                continue;
             }
-            prev_lower = lower;
-            prev_placement = placement;
-            prev_higher = higher;
-            prev_row = row;
-            prev_col = column;
+            if let Some(finished) = run.take() {
+                runs.push(finished);
+            }
         }
-        if run_len > 0 {
-            push_placeholder_run(
-                &mut runs,
-                prev_lower,
-                prev_placement,
-                prev_higher,
-                prev_row,
-                prev_col,
-                run_start,
-                y,
-                run_len,
-                run_width,
-            );
-        }
+        let row = cell.image_row.max(1);
+        let column = cell.image_column.max(1);
+        let high = cell.image_id_high.max(1);
+        run = Some(PlaceholderRun {
+            image_id: cell.image_id,
+            placement_id: cell.placement_id,
+            image_row: row - 1,
+            image_column: column.saturating_sub(1),
+            screen_x: cell.screen_x,
+            screen_y: cell.screen_y,
+            columns: 1,
+            screen_columns: cell.screen_columns.max(1),
+        });
+        prev_row = row;
+        prev_column = column;
+        prev_high = high;
     }
+    if let Some(run) = run {
+        runs.push(run);
+    }
+    runs.retain(|run| run.columns > 0);
     runs
 }
 
@@ -965,64 +804,69 @@ fn image_pixels(
     image_id: u32,
     animations: Option<&AnimationManager>,
     palette: &IndexedPalette,
-) -> Option<(ImageData, u32, u32)> {
+) -> Option<(ImageData, u32, u32, Option<ImageFormat>)> {
     if let Some(animated) = animations.and_then(|manager| manager.image(image_id)) {
-        return Some((animated.current_data(), animated.width, animated.height));
+        return Some((
+            animated.current_data(),
+            animated.width,
+            animated.height,
+            None,
+        ));
     }
     if image.width == 0 || image.height == 0 {
         return None;
     }
     if let Some(rgba) = image.rgba.as_ref() {
-        return Some((Arc::new(rgba.clone()), image.width, image.height));
+        return Some((Arc::new(rgba.clone()), image.width, image.height, None));
     }
     if image.format.is_indexed() {
-        let expanded = palette.expand_image(image).ok()?;
-        return Some((Arc::new(expanded), image.width, image.height));
+        // Keep palette indices raw; the GPU shader performs the live lookup.
+        return Some((
+            Arc::new(image.raw.clone()),
+            image.width,
+            image.height,
+            Some(image.format),
+        ));
     }
+    let _ = palette;
     None
+}
+
+fn protocol_upload(
+    key: ImageKey,
+    width: u32,
+    height: u32,
+    data: ImageData,
+    indexed_format: Option<ImageFormat>,
+    palette: &IndexedPalette,
+    filter: ImageFilter,
+) -> Option<ImageUpload> {
+    match indexed_format {
+        Some(format) => ImageUpload::from_indexed(
+            key,
+            width,
+            height,
+            &data,
+            format,
+            palette,
+            filter,
+            ImageWrap::Clamp,
+        ),
+        None => Some(ImageUpload::new(
+            key,
+            width,
+            height,
+            data,
+            filter,
+            ImageWrap::Clamp,
+        )),
+    }
 }
 
 /// Build the relative-placement graph for a screen, including anchors for
 /// virtual placements derived from their placeholder cells.
-fn placement_graph(screen: &Screen, runs: &[PlaceholderRun]) -> PlacementGraph {
-    let records = screen.placements().iter().map(|placement| {
-        let p = &placement.placement;
-        let record = PlacementRecord::new(
-            PlacementKey::new(placement.image_id, placement.placement_id),
-            placement.anchor_x,
-            placement.anchor_y,
-        )
-        .with_parent(p.parent_id, p.parent_placement_id)
-        .with_offset(p.offset_from_parent_x, p.offset_from_parent_y)
-        .with_source(SourceRect::new(p.x_offset, p.y_offset, p.width, p.height))
-        .with_z_index(p.z_index)
-        .inheriting(p.parent_id != 0 && p.z_index == 0, p.parent_id != 0);
-        if p.unicode_placement {
-            record.as_virtual()
-        } else {
-            record
-        }
-    });
-    let mut graph = PlacementGraph::new();
-    for record in records {
-        let virtual_placement = record.virtual_placement;
-        let key = record.key;
-        let _ = graph.insert(record);
-        if virtual_placement {
-            let anchor = runs
-                .iter()
-                .filter(|run| {
-                    run.image_id == key.image_id
-                        && (key.placement_id == 0 || run.placement_id == key.placement_id)
-                })
-                .map(|run| (run.screen_x, run.screen_y))
-                .min();
-            if let Some((x, y)) = anchor {
-                graph.set_anchor(key, x, y);
-            }
-        }
-    }
-    graph
+fn placement_graph(screen: &Screen, _runs: &[PlaceholderRun]) -> PlacementGraph {
+    screen.placement_graph()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,6 +876,8 @@ fn protocol_placement(
     data: ImageData,
     image_width: u32,
     image_height: u32,
+    indexed_format: Option<ImageFormat>,
+    palette: &IndexedPalette,
     geometry: &GridGeometry,
     viewport_width: f32,
     viewport_height: f32,
@@ -1087,14 +933,15 @@ fn protocol_placement(
     };
     let (rect, uv) = clip_rect_uv(rect, uv, viewport_width, viewport_height)?;
     let key = ImageKey::Protocol(placement.image_id);
-    let upload = ImageUpload::new(
+    let upload = protocol_upload(
         key,
         image_width,
         image_height,
         data,
+        indexed_format,
+        palette,
         filter,
-        ImageWrap::Clamp,
-    );
+    )?;
     let instance = ImageInstance::new(key, rect)
         .with_uv(uv)
         .with_z_index(resolved.z_index);
@@ -1242,8 +1089,8 @@ pub fn collect_protocol_images_with_animations(
     );
 }
 
-/// Like [`collect_protocol_images_with_animations`], but expands indexed
-/// protocol images through `palette` and resolves relative placements.
+/// Like [`collect_protocol_images_with_animations`], but attaches the live
+/// `palette` to indexed protocol uploads and resolves relative placements.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_protocol_images_with_palette(
     screen: &Screen,
@@ -1276,7 +1123,7 @@ pub fn collect_protocol_images_with_palette(
         let Some(image) = screen.image(placement.image_id) else {
             continue;
         };
-        let Some((data, width, height)) =
+        let Some((data, width, height, indexed_format)) =
             image_pixels(image, placement.image_id, animations, palette)
         else {
             continue;
@@ -1287,6 +1134,8 @@ pub fn collect_protocol_images_with_palette(
             data,
             width,
             height,
+            indexed_format,
+            palette,
             geometry,
             viewport_width,
             viewport_height,
@@ -1322,7 +1171,8 @@ pub fn collect_protocol_images_with_palette(
         }) else {
             continue;
         };
-        let Some((data, width, height)) = image_pixels(image, run.image_id, animations, palette)
+        let Some((data, width, height, indexed_format)) =
+            image_pixels(image, run.image_id, animations, palette)
         else {
             continue;
         };
@@ -1335,14 +1185,7 @@ pub fn collect_protocol_images_with_palette(
             None
         } else {
             seen_uploads.push(key);
-            Some(ImageUpload::new(
-                key,
-                width,
-                height,
-                data,
-                filter,
-                ImageWrap::Clamp,
-            ))
+            protocol_upload(key, width, height, data, indexed_format, palette, filter)
         };
         let instance = ImageInstance::new(key, rect).with_uv(uv).with_z_index(-1);
         collected.push((

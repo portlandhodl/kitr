@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Flatpak manifest skeleton. The source list is intentionally local-only:
+# generate the two Cargo source entries with `flatpak-cargo-generator.py`
+# before publishing a reproducible build. This manifest is validated by
+# `make package`, which does not require network access.
+app-id: io.github.portlandhodl.kitr
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: kitr
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=home
+  - --talk-name=org.freedesktop.Notifications
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/kitr/cargo
+  test-args:
+    - --share=network
+
+modules:
+  - name: kitr
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --workspace --offline
+      - make install DESTDIR=${FLATPAK_DEST} PREFIX=/app
+    sources:
+      - type: dir
+        path: ../..
+      - type: file
+        path: cargo-sources.json
+        dest: cargo-sources.json

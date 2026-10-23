@@ -43,8 +43,10 @@
 //! * HiDPI scale factors: `Xft.dpi` on X11, `wl_output.scale`,
 //!   `wl_surface.preferred_buffer_scale` and `fractional-scale-v1` on Wayland;
 //! * cursor theme snapshots with hot reload and a per-window cursor scale.
-//!   X11 loads size-specific images through `libXcursor`; Wayland tracks the
-//!   same theme/scale state so a compositor cursor layer can reload it;
+//!   X11 loads size-specific images through `libXcursor`; Wayland loads the
+//!   same themes through `libwayland-cursor` and paints a cursor surface with
+//!   `wl_pointer.set_cursor`, falling back to compositor selection if the
+//!   helper library is unavailable;
 //! * independent EGL window surfaces with an RGB8 config, GL 3.3 core (falling
 //!   back to GLES 3), clear/swap/readback and RAII teardown. The X11 path uses
 //!   `EGL_PLATFORM_X11_KHR`; the Wayland path uses
@@ -58,10 +60,11 @@
 //!
 //! macOS/Cocoa is not implemented. Tablet-tool proximity, pressure curves and
 //! tilt from `zwp_tablet_v2` are not modelled; `wl_touch` uses unit pressure
-//! because the core protocol carries no pressure axis. X11 cursor themes load
-//! size-specific images through `libXcursor` when present and fall back to the
-//! cursor font otherwise; Wayland tracks theme hot-reload state but expects the
-//! caller's compositor cursor layer to paint it. Wayland window position is
+//! because the core protocol carries no pressure axis, while X11 maps the
+//! `Abs MT Pressure`/`Abs Pressure` valuator through its advertised range.
+//! X11 cursor themes load size-specific images through `libXcursor` when
+//! present and fall back to the cursor font otherwise; Wayland uses
+//! `libwayland-cursor` when present. Wayland window position is
 //! compositor-owned, so `position` is only bookkeeping. Fractional scaling
 //! falls back to the integer output scale when `viewporter` is unavailable. The
 //! X11 input-method tests exercise callback state directly because `Xvfb`

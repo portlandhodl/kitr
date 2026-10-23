@@ -1,0 +1,15 @@
+{
+  "fragment_inputs": {
+    "0": "texcoord_0"
+  },
+  "input_locations": {},
+  "loose_uniforms": {
+    "background": "background_0",
+    "image": "image_0",
+    "positions": "positions_0",
+    "sizes": "sizes_0",
+    "tiled": "tiled_0"
+  },
+  "uniform_struct_names": {},
+  "uniform_structs": {}
+}

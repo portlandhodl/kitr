@@ -1,0 +1,22 @@
+{
+  "fragment_inputs": {
+    "0": "texcoord_0"
+  },
+  "input_locations": {},
+  "loose_uniforms": {
+    "dest_rect": "dest_rect_0",
+    "extra_alpha": "extra_alpha_0",
+    "gamma_lut": "gamma_lut_0[0]",
+    "has_alpha": "has_alpha_0",
+    "image": "image_0",
+    "src_rect": "src_rect_0"
+  },
+  "uniform_struct_names": {
+    "ColorTable": "block_ColorTable_0"
+  },
+  "uniform_structs": {
+    "ColorTable": {
+      "color_table": "color_table_0[0]"
+    }
+  }
+}

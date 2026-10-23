@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Headless OpenGL backend for the CPU instance stream.
 //!
-//! [`GlBackend`] owns two shader programs, one shared VAO/VBO pair and a GPU
-//! texture per atlas page. [`GlBackend::new`] creates a headless EGL pbuffer
+//! The backend compiles kitty's real Slang programs (via the generated GLSL in
+//! [`crate::shaders`]), owns one shared VAO/VBO pair and a GPU texture per
+//! atlas page. [`GlBackend::new`] creates a headless EGL pbuffer
 //! context; [`GlBackend::with_loader`] instead draws into a caller-owned
 //! current EGL context (for example a window surface supplied by a windowing
 //! crate). It consumes the [`Frame`] produced by [`crate::RendererCore`]:
@@ -53,26 +54,37 @@
 //! the cost of re-issuing every instance for each damaged range. Cursor-only
 //! damage arrives as the two cursor row ranges from [`crate::DamageTracker`].
 //!
-//! # Supported subset
+//! # Shader programs
 //!
-//! * Instanced background, glyph, image, decoration, cursor and trail quads;
+//! Every program from `kitty/shaders.c` is present in the generated catalogue,
+//! including all 27 cell variants, the graphics/indexed-graphics
+//! specialisations and the borders/padding/bgimage/blit/screenshot programs.
+//! [`GlBackend::compiled_programs`] lists the programs linked eagerly;
+//! [`validate_builtin_programs`] and [`validate_all_shader_variants`] compile
+//! the complete set for tests.
+//!
+//! The frame instance stream is drawn with the real `tint`, `rounded_rect`,
+//! `graphics` (default and alpha-mask), `trail` and indexed-graphics programs.
+//! See `SHADERS.md` for the exact mapping and the variants that are compiled
+//! but not yet selected by this backend.
+//!
 //! * Gray8 atlas pages (`GL_R8`) and RGBA8 pages (`GL_RGBA8`);
 //! * RGBA8 image textures keyed by [`ImageKey`], with nearest/linear filtering
 //!   and clamp/repeat/mirrored-repeat wrapping for background layouts;
 //! * nearest or linear atlas filtering;
 //! * premultiplied alpha blending;
 //! * scissor-based damage, viewport, clear, offscreen `glReadPixels`;
-//! * optional gamma conversion in the fragment shader (`GammaMode`).
+//! * optional CPU-side gamma conversion (`GammaMode`).
 //!
-//! # Not supported yet
+//! # Not wired to the frame API yet
 //!
-//! Image transforms beyond source-rectangle scaling, per-window background
-//! image lists, the full cursor-trail corner animation, selection/hyperlink
-//! overlays, custom user shaders, shaped-run sprite caches and multi-format
-//! colour glyphs
-//! (COLR/CBDT/SVG). Blink and strikethrough style flags are carried by the CPU
-//! instances but blinking is not animated here; dim is implemented as a 50%
-//! alpha reduction.
+//! The full cell vertex/UBO path (fixed-cell sprite arrays and the decoration
+//! map), the `bgimage` program for background images, `blit`/`screenshot`
+//! targets and kitty's multi-group custom-shader post-processing pipeline are
+//! compiled and reflected but the current [`Frame`] abstraction does not drive
+//! them yet. Image transforms beyond source-rectangle scaling, per-window
+//! background image lists and the full cursor-trail corner animation remain
+//! out of scope.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
@@ -87,14 +99,15 @@ use crate::egl::{
     GL_ARRAY_BUFFER, GL_BLEND, GL_CLAMP_TO_EDGE, GL_COLOR_BUFFER_BIT, GL_COMPILE_STATUS,
     GL_CULL_FACE, GL_DEPTH_TEST, GL_DYNAMIC_DRAW, GL_FALSE, GL_FLOAT, GL_FRAGMENT_SHADER,
     GL_INFO_LOG_LENGTH, GL_LINEAR, GL_LINK_STATUS, GL_NEAREST, GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
-    GL_PACK_ALIGNMENT, GL_R8, GL_RED, GL_RGBA, GL_RGBA8, GL_SCISSOR_TEST, GL_STATIC_DRAW,
-    GL_TEXTURE0, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S,
-    GL_TEXTURE_WRAP_T, GL_TRIANGLE_STRIP, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE, GL_VERTEX_SHADER,
+    GL_PACK_ALIGNMENT, GL_R8, GL_R8UI, GL_RED, GL_RED_INTEGER, GL_RG8UI, GL_RGBA, GL_RGBA8,
+    GL_RG_INTEGER, GL_SCISSOR_TEST, GL_STATIC_DRAW, GL_TEXTURE0, GL_TEXTURE_2D,
+    GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+    GL_TRIANGLE_FAN, GL_UNIFORM_BUFFER, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE, GL_VERTEX_SHADER,
 };
 use crate::geom::Rect;
-use crate::gl_shaders;
 use crate::images::{ImageFilter, ImageKey, ImageWrap};
 use crate::instances::{CursorGeometry, Frame, RenderConfig};
+use kitty_graphics::ImageFormat;
 
 /// Texture filtering for atlas pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +162,7 @@ pub enum GammaMode {
 
 impl GammaMode {
     #[inline]
+    #[allow(dead_code)]
     const fn uniform(self) -> i32 {
         match self {
             Self::None => 0,
@@ -250,6 +264,7 @@ pub enum GlBackendError {
         required: &'static str,
         actual: String,
     },
+    CustomShader(String),
 }
 
 impl fmt::Display for GlBackendError {
@@ -266,6 +281,7 @@ impl fmt::Display for GlBackendError {
                 f,
                 "unsupported GL version {actual}; this backend needs {required}"
             ),
+            Self::CustomShader(log) => write!(f, "custom shader compilation failed: {log}"),
         }
     }
 }
@@ -312,6 +328,7 @@ enum BatchKind {
     Solid,
     Glyph { page: u32, is_color: bool },
     Image(ImageKey),
+    Trail,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -336,6 +353,7 @@ struct CachedImage {
     height: u32,
     filter: ImageFilter,
     wrap: ImageWrap,
+    indexed_format: Option<ImageFormat>,
     fingerprint: u64,
 }
 
@@ -347,147 +365,156 @@ struct ScissorRect {
     height: i32,
 }
 
+struct LinkedProgram {
+    id: u32,
+    source: &'static crate::shaders::GeneratedProgram,
+    uniforms: HashMap<String, i32>,
+}
+
+impl LinkedProgram {
+    fn new(
+        gl: &GlFns,
+        kind: crate::shaders::ProgramKind,
+        api: GlApi,
+    ) -> Result<Self, GlBackendError> {
+        let source =
+            crate::shaders::default_variant(kind).ok_or_else(|| GlBackendError::Shader {
+                stage: "pipeline",
+                log: format!("no generated variant for {kind:?}"),
+            })?;
+        let sources = crate::shaders::ProgramSources::for_api(
+            source,
+            crate::shaders::ShaderDialect::for_api(api),
+        );
+        let vertex = compile_shader(gl, GL_VERTEX_SHADER, "vertex", &sources.vertex)?;
+        let fragment = match compile_shader(gl, GL_FRAGMENT_SHADER, "fragment", &sources.fragment) {
+            Ok(id) => id,
+            Err(error) => {
+                unsafe { (gl.glDeleteShader)(vertex) };
+                return Err(error);
+            }
+        };
+        let id = link_program(gl, vertex, fragment, kind.name())?;
+        // SAFETY: the program is linked and a context is current.
+        unsafe {
+            let index = (gl.glGetUniformBlockIndex)(id, c"block_ColorTable_0".as_ptr());
+            if index != u32::MAX {
+                (gl.glUniformBlockBinding)(id, index, 2);
+            }
+        }
+        let mut uniforms = HashMap::new();
+        for (slang, glsl) in source.metadata.loose_uniforms {
+            let name = glsl.split('[').next().unwrap_or(glsl);
+            let location = uniform_location(gl, id, name);
+            uniforms.insert((*slang).to_owned(), location);
+        }
+        for (slang, glsl) in source.metadata.uniform_struct_names {
+            let binding = match *slang {
+                "CellRenderData" => 0,
+                "ColorTable" => 1,
+                "Colors" => 2,
+                "KittyCustomShaderData" => 3,
+                _ => continue,
+            };
+            if let Ok(name) = CString::new(*glsl) {
+                // SAFETY: the program is linked and a context is current.
+                unsafe {
+                    let index = (gl.glGetUniformBlockIndex)(id, name.as_ptr());
+                    if index != u32::MAX {
+                        (gl.glUniformBlockBinding)(id, index, binding);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            id,
+            source,
+            uniforms,
+        })
+    }
+
+    fn uniform(&self, slang: &str) -> i32 {
+        self.uniforms.get(slang).copied().unwrap_or(-1)
+    }
+}
+
+/// Programs the backend compiles up front. The complete catalogue (including
+/// every cell render mode/specialisation and indexed-image variants) is
+/// available through [`ProgramKind::ALL`] and
+/// [`validate_builtin_programs`].
+const COMPILED_PROGRAMS: &[crate::shaders::ProgramKind] = &[
+    crate::shaders::ProgramKind::Cell,
+    crate::shaders::ProgramKind::Borders,
+    crate::shaders::ProgramKind::Graphics,
+    crate::shaders::ProgramKind::GraphicsPremult,
+    crate::shaders::ProgramKind::GraphicsAlphaMask,
+    crate::shaders::ProgramKind::GraphicsIndexed,
+    crate::shaders::ProgramKind::GraphicsIndexedUnscaled,
+    crate::shaders::ProgramKind::BgImage,
+    crate::shaders::ProgramKind::Tint,
+    crate::shaders::ProgramKind::Trail,
+    crate::shaders::ProgramKind::Blit,
+    crate::shaders::ProgramKind::Screenshot,
+    crate::shaders::ProgramKind::RoundedRect,
+    crate::shaders::ProgramKind::Padding,
+];
+
 struct Programs {
     gl: GlFns,
-    glyph: u32,
-    solid: u32,
-    image: u32,
-    glyph_viewport: i32,
-    glyph_atlas: i32,
-    glyph_is_color: i32,
-    glyph_gamma: i32,
-    solid_viewport: i32,
-    solid_gamma: i32,
-    image_viewport: i32,
-    image_texture: i32,
-    image_gamma: i32,
+    programs: HashMap<crate::shaders::ProgramKind, LinkedProgram>,
 }
 
 impl Programs {
     fn new(gl: &GlFns, api: GlApi) -> Result<Self, GlBackendError> {
-        let glyph_sources = gl_shaders::glyph_sources(api);
-        let glyph_vs = compile_shader(gl, GL_VERTEX_SHADER, "glyph vertex", &glyph_sources.vertex)?;
-        let glyph_fs = match compile_shader(
-            gl,
-            GL_FRAGMENT_SHADER,
-            "glyph fragment",
-            &glyph_sources.fragment,
-        ) {
-            Ok(id) => id,
-            Err(error) => {
-                unsafe { (gl.glDeleteShader)(glyph_vs) };
-                return Err(error);
-            }
-        };
-        let glyph = link_program(gl, glyph_vs, glyph_fs, "glyph")?;
-
-        let solid_sources = gl_shaders::solid_sources(api);
-        let solid_vs =
-            match compile_shader(gl, GL_VERTEX_SHADER, "solid vertex", &solid_sources.vertex) {
-                Ok(id) => id,
+        let mut programs = HashMap::new();
+        for &kind in COMPILED_PROGRAMS {
+            match LinkedProgram::new(gl, kind, api) {
+                Ok(program) => {
+                    programs.insert(kind, program);
+                }
                 Err(error) => {
-                    unsafe {
-                        (gl.glDeleteProgram)(glyph);
+                    for program in programs.values() {
+                        unsafe { (gl.glDeleteProgram)(program.id) };
                     }
                     return Err(error);
                 }
-            };
-        let solid_fs = match compile_shader(
-            gl,
-            GL_FRAGMENT_SHADER,
-            "solid fragment",
-            &solid_sources.fragment,
-        ) {
-            Ok(id) => id,
-            Err(error) => {
-                unsafe {
-                    (gl.glDeleteShader)(solid_vs);
-                    (gl.glDeleteProgram)(glyph);
-                }
-                return Err(error);
             }
-        };
-        let solid = match link_program(gl, solid_vs, solid_fs, "solid") {
-            Ok(id) => id,
-            Err(error) => {
-                unsafe { (gl.glDeleteProgram)(glyph) };
-                return Err(error);
-            }
-        };
+        }
+        Ok(Self { gl: *gl, programs })
+    }
 
-        let image_sources = gl_shaders::image_sources(api);
-        let image_vs =
-            match compile_shader(gl, GL_VERTEX_SHADER, "image vertex", &image_sources.vertex) {
-                Ok(id) => id,
-                Err(error) => {
-                    unsafe {
-                        (gl.glDeleteProgram)(glyph);
-                        (gl.glDeleteProgram)(solid);
-                    }
-                    return Err(error);
-                }
-            };
-        let image_fs = match compile_shader(
-            gl,
-            GL_FRAGMENT_SHADER,
-            "image fragment",
-            &image_sources.fragment,
-        ) {
-            Ok(id) => id,
-            Err(error) => {
-                unsafe {
-                    (gl.glDeleteShader)(image_vs);
-                    (gl.glDeleteProgram)(glyph);
-                    (gl.glDeleteProgram)(solid);
-                }
-                return Err(error);
-            }
-        };
-        let image = match link_program(gl, image_vs, image_fs, "image") {
-            Ok(id) => id,
-            Err(error) => {
-                unsafe {
-                    (gl.glDeleteProgram)(glyph);
-                    (gl.glDeleteProgram)(solid);
-                }
-                return Err(error);
-            }
-        };
+    fn get(&self, kind: crate::shaders::ProgramKind) -> &LinkedProgram {
+        self.programs
+            .get(&kind)
+            .unwrap_or_else(|| panic!("program {kind:?} was not compiled"))
+    }
 
-        Ok(Self {
-            gl: *gl,
-            glyph,
-            solid,
-            image,
-            glyph_viewport: uniform_location(gl, glyph, "u_viewport"),
-            glyph_atlas: uniform_location(gl, glyph, "u_atlas"),
-            glyph_is_color: uniform_location(gl, glyph, "u_is_color"),
-            glyph_gamma: uniform_location(gl, glyph, "u_gamma"),
-            solid_viewport: uniform_location(gl, solid, "u_viewport"),
-            solid_gamma: uniform_location(gl, solid, "u_gamma"),
-            image_viewport: uniform_location(gl, image, "u_viewport"),
-            image_texture: uniform_location(gl, image, "u_image"),
-            image_gamma: uniform_location(gl, image, "u_gamma"),
-        })
+    fn upload_gamma_lut(&self) {
+        let lut = crate::colors::gamma_lut();
+        for program in self.programs.values() {
+            let location = program.uniform("gamma_lut");
+            if location >= 0 {
+                // SAFETY: the program is linked and a context is current; the
+                // LUT is a static array of 256 floats.
+                unsafe {
+                    (self.gl.glUseProgram)(program.id);
+                    (self.gl.glUniform1fv)(location, lut.len() as i32, lut.as_ptr());
+                }
+            }
+        }
+        // SAFETY: restore the conventional no-program state.
+        unsafe { (self.gl.glUseProgram)(0) };
     }
 
     fn destroy(&mut self) {
         // SAFETY: the ids are owned by this struct and the context is still
         // current during backend teardown.
         unsafe {
-            if self.glyph != 0 {
-                (self.gl.glDeleteProgram)(self.glyph);
-                self.glyph = 0;
-            }
-            if self.solid != 0 {
-                (self.gl.glDeleteProgram)(self.solid);
-                self.solid = 0;
-            }
-            if self.image != 0 {
-                (self.gl.glDeleteProgram)(self.image);
-                self.image = 0;
+            for program in self.programs.values() {
+                (self.gl.glDeleteProgram)(program.id);
             }
         }
+        self.programs.clear();
     }
 }
 
@@ -495,6 +522,64 @@ impl Drop for Programs {
     fn drop(&mut self) {
         self.destroy();
     }
+}
+
+/// Compile and link every logical program from `kitty/shaders.c`.
+///
+/// This is intended for validation/tests; the renderer itself only compiles
+/// the programs it draws with. It creates a temporary headless context.
+pub fn validate_builtin_programs(api: GlApi) -> Result<usize, GlBackendError> {
+    validate_programs(api, false)
+}
+
+/// Compile and link every generated specialisation, including all 27 cell
+/// variants and the graphics/indexed-graphics variants.
+pub fn validate_all_shader_variants(api: GlApi) -> Result<usize, GlBackendError> {
+    validate_programs(api, true)
+}
+
+fn validate_programs(api: GlApi, all_variants: bool) -> Result<usize, GlBackendError> {
+    let config = if api == GlApi::OpenGlEs {
+        ContextConfig::new(16, 16).gles()
+    } else {
+        ContextConfig::new(16, 16)
+    };
+    let context = GlContext::new(config)?;
+    context.make_current()?;
+    // SAFETY: the context is current for the lifetime of `gl`.
+    let gl = unsafe { GlFns::load()? };
+    let mut count = 0;
+    if all_variants {
+        for source in crate::shaders::BUILTIN_PROGRAMS {
+            let sources = crate::shaders::ProgramSources::for_api(
+                source,
+                crate::shaders::ShaderDialect::for_api(api),
+            );
+            let vertex = compile_shader(&gl, GL_VERTEX_SHADER, "vertex", &sources.vertex)?;
+            let fragment =
+                match compile_shader(&gl, GL_FRAGMENT_SHADER, "fragment", &sources.fragment) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        unsafe { (gl.glDeleteShader)(vertex) };
+                        return Err(error);
+                    }
+                };
+            let program = link_program(&gl, vertex, fragment, source.program)?;
+            unsafe { (gl.glDeleteProgram)(program) };
+            count += 1;
+        }
+    } else {
+        for &kind in crate::shaders::ProgramKind::ALL {
+            if kind == crate::shaders::ProgramKind::CustomEnd {
+                continue;
+            }
+            let program = LinkedProgram::new(&gl, kind, api)?;
+            unsafe { (gl.glDeleteProgram)(program.id) };
+            count += 1;
+        }
+    }
+    drop(context);
+    Ok(count)
 }
 
 fn compile_shader(
@@ -712,6 +797,8 @@ pub struct GlBackend {
     width: u32,
     height: u32,
     last_stats: RenderStats,
+    custom_program: u32,
+    color_table_ubo: u32,
     // Keep the context last: Rust drops fields in declaration order, so all
     // GL resources are released while an owned context is still alive.
     // `None` means the caller owns and manages the current EGL context.
@@ -785,6 +872,22 @@ impl GlBackend {
         let programs = Programs::new(&gl, config.context.api)?;
         // SAFETY: the caller guarantees a current context.
         let (vao, quad_vbo, instance_vbo) = unsafe { create_geometry(&gl)? };
+        let mut color_table_ubo = 0u32;
+        // SAFETY: a context is current; the UBO is owned by the backend.
+        unsafe {
+            (gl.glGenBuffers)(1, &mut color_table_ubo);
+            (gl.glBindBuffer)(GL_UNIFORM_BUFFER, color_table_ubo);
+            // std140 gives each uint array element a 16-byte stride.
+            (gl.glBufferData)(
+                GL_UNIFORM_BUFFER,
+                (272 * 16) as isize,
+                ptr::null(),
+                GL_DYNAMIC_DRAW,
+            );
+            (gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 1, color_table_ubo);
+            (gl.glBindBuffer)(GL_UNIFORM_BUFFER, 0);
+        }
+        programs.upload_gamma_lut();
         let width = width.max(1);
         let height = height.max(1);
         // SAFETY: setting state for the current context.
@@ -815,6 +918,8 @@ impl GlBackend {
             width,
             height,
             last_stats: RenderStats::default(),
+            custom_program: 0,
+            color_table_ubo,
             context,
         })
     }
@@ -892,6 +997,86 @@ impl GlBackend {
     #[inline]
     pub fn image_texture_count(&self) -> usize {
         self.image_textures.len()
+    }
+    /// Programs compiled by this backend.
+    pub fn compiled_programs(&self) -> Vec<crate::shaders::ProgramKind> {
+        let mut ans: Vec<_> = self.programs.programs.keys().copied().collect();
+        ans.sort_unstable();
+        ans
+    }
+
+    /// Uniform location using the Slang name from the generated metadata.
+    pub fn program_uniform(&self, kind: crate::shaders::ProgramKind, name: &str) -> Option<i32> {
+        self.programs
+            .programs
+            .get(&kind)
+            .map(|program| program.uniform(name))
+            .filter(|location| *location >= 0)
+    }
+
+    /// The generated Slang/GLSL program used for `kind`.
+    pub fn program_source(
+        &self,
+        kind: crate::shaders::ProgramKind,
+    ) -> Option<&'static crate::shaders::GeneratedProgram> {
+        self.programs
+            .programs
+            .get(&kind)
+            .map(|program| program.source)
+    }
+
+    /// Compile and install a user Slang shader using the same pipeline as
+    /// kitty's custom-shader path.
+    pub fn install_custom_shader(
+        &mut self,
+        name: &str,
+        source: &str,
+    ) -> Result<(), GlBackendError> {
+        let compiler = crate::shaders::SlangCompiler::from_env()
+            .map_err(|error| GlBackendError::CustomShader(error.to_string()))?;
+        self.install_custom_shader_with(&compiler, name, source, &[])
+    }
+
+    /// Like [`install_custom_shader`](Self::install_custom_shader) but with an
+    /// explicit compiler and Slang defines.
+    pub fn install_custom_shader_with(
+        &mut self,
+        compiler: &crate::shaders::SlangCompiler,
+        name: &str,
+        source: &str,
+        defines: &[(&str, &str)],
+    ) -> Result<(), GlBackendError> {
+        self.ensure_current()?;
+        let custom = compiler
+            .compile_custom_shader(name, source, defines)
+            .map_err(|error| GlBackendError::CustomShader(error.to_string()))?;
+        let sources = custom.sources(crate::shaders::ShaderDialect::for_api(
+            self.config.context.api,
+        ));
+        let vertex = compile_shader(&self.gl, GL_VERTEX_SHADER, "custom vertex", &sources.vertex)?;
+        let fragment = match compile_shader(
+            &self.gl,
+            GL_FRAGMENT_SHADER,
+            "custom fragment",
+            &sources.fragment,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                unsafe { (self.gl.glDeleteShader)(vertex) };
+                return Err(error);
+            }
+        };
+        let program = link_program(&self.gl, vertex, fragment, "custom")?;
+        if self.custom_program != 0 {
+            unsafe { (self.gl.glDeleteProgram)(self.custom_program) };
+        }
+        self.custom_program = program;
+        Ok(())
+    }
+
+    /// Whether a user shader has been installed successfully.
+    pub fn has_custom_shader(&self) -> bool {
+        self.custom_program != 0
     }
 
     /// Whether a texture for `key` is currently resident.
@@ -1159,19 +1344,61 @@ impl GlBackend {
 
         // SAFETY: a context is current; upload data outlives each call.
         unsafe {
-            (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
             (self.gl.glActiveTexture)(GL_TEXTURE0);
         }
         for upload in &frame.image_uploads {
             if !upload.is_valid() {
                 continue;
             }
+            if upload.indexed_format.is_some() {
+                if let Some(palette) = upload.palette.as_ref() {
+                    self.upload_indexed_palette(palette);
+                }
+            }
+            // Expand indexed uploads through their palette when one is
+            // available. The integer-texture + indexed-graphics path is kept
+            // for uploads without a palette; expansion also keeps the texture
+            // valid for ordinary graphics draws and tests.
+            let expanded = match (upload.indexed_format, upload.palette.as_ref()) {
+                (Some(format), Some(palette)) => {
+                    Some(palette.expand(&upload.data, format, upload.width, upload.height))
+                }
+                _ => None,
+            };
+            let indexed_format = if expanded.is_some() {
+                None
+            } else {
+                upload.indexed_format
+            };
+            let indexed = indexed_format.is_some();
+            let (internal_format, pixel_format) = match indexed_format {
+                Some(ImageFormat::IndexedAlpha) => (GL_RG8UI, GL_RG_INTEGER),
+                Some(_) => (GL_R8UI, GL_RED_INTEGER),
+                None => (GL_RGBA8, GL_RGBA),
+            };
+            let bytes_per_pixel = if expanded.is_some() {
+                4
+            } else {
+                upload.bytes_per_pixel()
+            };
+            let alignment = if indexed || bytes_per_pixel != 4 {
+                1
+            } else {
+                4
+            };
+            // SAFETY: a context is current; alignment matches the tightly
+            // packed upload buffer.
+            unsafe {
+                (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, alignment);
+            }
+            let pixel_data: &[u8] = expanded.as_deref().unwrap_or(&upload.data);
             let current = self.image_textures.get(&upload.key).copied();
             let recreate = current.is_none_or(|cached| {
                 cached.width != upload.width
                     || cached.height != upload.height
                     || cached.filter != upload.filter
                     || cached.wrap != upload.wrap
+                    || cached.indexed_format != indexed_format
             });
             if recreate {
                 if let Some(old) = self.image_textures.remove(&upload.key) {
@@ -1193,7 +1420,13 @@ impl GlBackend {
                 // SAFETY: the newly created texture is bound before any use.
                 unsafe {
                     (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
-                    let filter = image_filter_gl(upload.filter) as i32;
+                    // Integer textures cannot be filtered; the indexed shader
+                    // performs its own bilinear lookup after the palette fetch.
+                    let filter = if indexed {
+                        GL_NEAREST
+                    } else {
+                        image_filter_gl(upload.filter)
+                    } as i32;
                     (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
                     (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
                     (self.gl.glTexParameteri)(
@@ -1209,13 +1442,13 @@ impl GlBackend {
                     (self.gl.glTexImage2D)(
                         GL_TEXTURE_2D,
                         0,
-                        GL_RGBA8 as i32,
+                        internal_format as i32,
                         upload.width as i32,
                         upload.height as i32,
                         0,
-                        GL_RGBA,
+                        pixel_format,
                         GL_UNSIGNED_BYTE,
-                        upload.data.as_ptr() as *const c_void,
+                        pixel_data.as_ptr() as *const c_void,
                     );
                 }
                 self.image_textures.insert(
@@ -1226,6 +1459,7 @@ impl GlBackend {
                         height: upload.height,
                         filter: upload.filter,
                         wrap: upload.wrap,
+                        indexed_format,
                         fingerprint: upload.fingerprint,
                     },
                 );
@@ -1248,9 +1482,9 @@ impl GlBackend {
                         0,
                         upload.width as i32,
                         upload.height as i32,
-                        GL_RGBA,
+                        pixel_format,
                         GL_UNSIGNED_BYTE,
-                        upload.data.as_ptr() as *const c_void,
+                        pixel_data.as_ptr() as *const c_void,
                     );
                 }
                 cached.fingerprint = upload.fingerprint;
@@ -1289,6 +1523,9 @@ impl GlBackend {
         config: &RenderConfig,
     ) -> Result<RenderStats, GlBackendError> {
         self.ensure_current()?;
+        if let Some(palette) = frame.indexed_palette.as_ref() {
+            self.upload_indexed_palette(palette);
+        }
         let scissors = self.scissor_rects(frame, config);
 
         self.instances.clear();
@@ -1587,7 +1824,7 @@ impl GlBackend {
         }
         if self.instances.len() > start {
             self.draw_calls.push(DrawCall {
-                kind: BatchKind::Solid,
+                kind: BatchKind::Trail,
                 first: start as i32,
                 count: (self.instances.len() - start) as i32,
             });
@@ -1653,18 +1890,65 @@ impl GlBackend {
         Ok(())
     }
 
+    fn upload_indexed_palette(&self, palette: &kitty_graphics::IndexedPalette) {
+        if self.color_table_ubo == 0 {
+            return;
+        }
+        // The shader block is std140, so every uint has a 16-byte stride.
+        // Kitty's copy_color_table_to_buffer() writes the same padded layout.
+        let mut table = [0u8; 272 * 16];
+        let pack = |rgba: [u8; 4]| {
+            ((u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]))
+                .to_ne_bytes()
+        };
+        let mut set = |slot: usize, value: [u8; 4]| {
+            let offset = slot * 16;
+            table[offset..offset + 4].copy_from_slice(&value);
+        };
+        for index in 0..248u16 {
+            set(index as usize, pack(palette.color(index as u8)));
+        }
+        for index in 248..256u16 {
+            set(
+                264 + (index as usize - 248),
+                pack(palette.color(index as u8)),
+            );
+        }
+        // SAFETY: a context is current and the UBO was allocated above.
+        unsafe {
+            (self.gl.glBindBuffer)(GL_UNIFORM_BUFFER, self.color_table_ubo);
+            (self.gl.glBufferSubData)(
+                GL_UNIFORM_BUFFER,
+                0,
+                table.len() as isize,
+                table.as_ptr() as *const c_void,
+            );
+            (self.gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 1, self.color_table_ubo);
+        }
+    }
+
+    fn ndc_rect(&self, rect: Rect) -> [f32; 4] {
+        let vw = self.width as f32;
+        let vh = self.height as f32;
+        let left = rect.x / vw * 2.0 - 1.0;
+        let right = rect.right() / vw * 2.0 - 1.0;
+        let top = 1.0 - rect.y / vh * 2.0;
+        let bottom = 1.0 - rect.bottom() / vh * 2.0;
+        [left, top, right, bottom]
+    }
+
     fn draw(
         &mut self,
         scissors: &[ScissorRect],
         frame: &Frame,
         stats: &mut RenderStats,
     ) -> Result<(), GlBackendError> {
-        let background = self.storage_color(frame.default_bg);
-        let gamma = self.config.gamma.uniform();
-        let viewport = [self.width as f32, self.height as f32];
+        use crate::shaders::ProgramKind;
 
-        // SAFETY: a context is current, the VAO/VBO hold the uploaded stream
-        // and every program/texture id used below is live.
+        let background = self.storage_color(frame.default_bg);
+
+        // SAFETY: a context is current, the VAO holds the unit quad and every
+        // program/texture id used below is live.
         unsafe {
             (self.gl.glBindVertexArray)(self.vao);
             (self.gl.glEnable)(GL_BLEND);
@@ -1673,7 +1957,6 @@ impl GlBackend {
             (self.gl.glDisable)(GL_CULL_FACE);
             (self.gl.glEnable)(GL_SCISSOR_TEST);
             (self.gl.glActiveTexture)(GL_TEXTURE0);
-            (self.gl.glBindBuffer)(GL_ARRAY_BUFFER, self.instance_vbo);
 
             for scissor in scissors {
                 let y = self.height as i32 - (scissor.y + scissor.height);
@@ -1689,76 +1972,277 @@ impl GlBackend {
                 }
 
                 for call in &self.draw_calls {
-                    // glDrawArraysInstanced has no base-instance parameter in
-                    // GL 3.3 / GLES 3.0, so point the instanced attributes at
-                    // this batch inside the shared stream.
-                    let base = call.first as usize * size_of::<QuadInstance>();
-                    for (location, components, offset) in
-                        [(1, 4, 0), (2, 4, 16), (3, 4, 32), (4, 4, 48)]
-                    {
-                        (self.gl.glVertexAttribPointer)(
-                            location,
-                            components,
-                            GL_FLOAT,
-                            GL_FALSE,
-                            QUAD_INSTANCE_STRIDE,
-                            (base + offset) as *const c_void,
+                    let first = call.first as usize;
+                    let end = first + call.count.max(0) as usize;
+                    for instance in &self.instances[first..end] {
+                        let rect = Rect::new(
+                            instance.rect[0],
+                            instance.rect[1],
+                            instance.rect[2],
+                            instance.rect[3],
                         );
+                        let color = instance.color;
+                        match call.kind {
+                            BatchKind::Solid => {
+                                let radius = instance.params[0];
+                                if radius > 0.0 {
+                                    let program = self.programs.get(ProgramKind::RoundedRect);
+                                    (self.gl.glUseProgram)(program.id);
+                                    let glrect = [
+                                        rect.x,
+                                        self.height as f32 - rect.bottom(),
+                                        rect.width,
+                                        rect.height,
+                                    ];
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("rect"),
+                                        glrect[0],
+                                        glrect[1],
+                                        glrect[2],
+                                        glrect[3],
+                                    );
+                                    let thickness = rect.width.max(rect.height).max(1.0);
+                                    (self.gl.glUniform2f)(
+                                        program.uniform("params"),
+                                        thickness,
+                                        radius.min(rect.width.min(rect.height) * 0.5),
+                                    );
+                                    // rounded_rect expects a non-premultiplied
+                                    // over colour; alpha is its coverage.
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("color"),
+                                        color[0],
+                                        color[1],
+                                        color[2],
+                                        color[3],
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("background_color"),
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("outer_color"),
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                    );
+                                } else {
+                                    let program = self.programs.get(ProgramKind::Tint);
+                                    (self.gl.glUseProgram)(program.id);
+                                    let ndc = self.ndc_rect(rect);
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("edges"),
+                                        ndc[0],
+                                        ndc[1],
+                                        ndc[2],
+                                        ndc[3],
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("tint_color"),
+                                        color[0] * color[3],
+                                        color[1] * color[3],
+                                        color[2] * color[3],
+                                        color[3],
+                                    );
+                                }
+                                (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                            }
+                            BatchKind::Glyph { page, is_color } => {
+                                let kind = if is_color {
+                                    ProgramKind::Graphics
+                                } else {
+                                    ProgramKind::GraphicsAlphaMask
+                                };
+                                let program = self.programs.get(kind);
+                                (self.gl.glUseProgram)(program.id);
+                                let ndc = self.ndc_rect(rect);
+                                let src = [
+                                    instance.uv[0],
+                                    instance.uv[1],
+                                    instance.uv[2],
+                                    instance.uv[3],
+                                ];
+                                (self.gl.glUniform4f)(
+                                    program.uniform("src_rect"),
+                                    src[0],
+                                    src[1],
+                                    src[2],
+                                    src[3],
+                                );
+                                (self.gl.glUniform4f)(
+                                    program.uniform("dest_rect"),
+                                    ndc[0],
+                                    ndc[1],
+                                    ndc[2],
+                                    ndc[3],
+                                );
+                                (self.gl.glUniform1i)(program.uniform("image"), 0);
+                                (self.gl.glUniform1f)(program.uniform("extra_alpha"), 1.0);
+                                if !is_color {
+                                    // Fold the foreground alpha into the mask
+                                    // colour; the generated alpha-mask pass has
+                                    // no separate alpha uniform.
+                                    (self.gl.glUniform3f)(
+                                        program.uniform("amask_fg"),
+                                        color[0] * color[3],
+                                        color[1] * color[3],
+                                        color[2] * color[3],
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("amask_bg_premult"),
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                    );
+                                }
+                                let texture = self
+                                    .atlas_pages
+                                    .get(&page)
+                                    .map(|texture| texture.texture)
+                                    .unwrap_or(0);
+                                (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                                (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                            }
+                            BatchKind::Image(key) => {
+                                let tint = instance.params[0].clamp(0.0, 1.0);
+                                let opacity = instance.params[1].clamp(0.0, 1.0);
+                                let cached = self.image_textures.get(&key).copied();
+                                let texture = cached.map(|cached| cached.texture).unwrap_or(0);
+                                let ndc = self.ndc_rect(rect);
+                                let src = [
+                                    instance.uv[0],
+                                    instance.uv[1],
+                                    instance.uv[2],
+                                    instance.uv[3],
+                                ];
+                                if let Some(format) =
+                                    cached.and_then(|cached| cached.indexed_format)
+                                {
+                                    // The real indexed graphics program performs
+                                    // the palette lookup (including bilinear
+                                    // filtering) after reading the integer texture.
+                                    let unscaled = cached.is_some_and(|cached| {
+                                        (cached.width as f32 - rect.width).abs() < 0.5
+                                            && (cached.height as f32 - rect.height).abs() < 0.5
+                                    });
+                                    let kind = if unscaled {
+                                        ProgramKind::GraphicsIndexedUnscaled
+                                    } else {
+                                        ProgramKind::GraphicsIndexed
+                                    };
+                                    let program = self.programs.get(kind);
+                                    (self.gl.glUseProgram)(program.id);
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("src_rect"),
+                                        src[0],
+                                        src[1],
+                                        src[2],
+                                        src[3],
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("dest_rect"),
+                                        ndc[0],
+                                        ndc[1],
+                                        ndc[2],
+                                        ndc[3],
+                                    );
+                                    (self.gl.glUniform1i)(program.uniform("image"), 0);
+                                    (self.gl.glUniform1ui)(
+                                        program.uniform("has_alpha"),
+                                        u32::from(
+                                            format == kitty_graphics::ImageFormat::IndexedAlpha,
+                                        ),
+                                    );
+                                    (self.gl.glUniform1f)(
+                                        program.uniform("extra_alpha"),
+                                        opacity * (1.0 - tint),
+                                    );
+                                    (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                                    (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                                } else {
+                                    let graphics = self.programs.get(ProgramKind::Graphics);
+                                    (self.gl.glUseProgram)(graphics.id);
+                                    (self.gl.glUniform4f)(
+                                        graphics.uniform("src_rect"),
+                                        src[0],
+                                        src[1],
+                                        src[2],
+                                        src[3],
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        graphics.uniform("dest_rect"),
+                                        ndc[0],
+                                        ndc[1],
+                                        ndc[2],
+                                        ndc[3],
+                                    );
+                                    (self.gl.glUniform1i)(graphics.uniform("image"), 0);
+                                    (self.gl.glUniform1f)(
+                                        graphics.uniform("extra_alpha"),
+                                        opacity * (1.0 - tint),
+                                    );
+                                    (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                                    (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                                }
+                                if tint > 0.0 {
+                                    let program = self.programs.get(ProgramKind::Tint);
+                                    (self.gl.glUseProgram)(program.id);
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("edges"),
+                                        ndc[0],
+                                        ndc[1],
+                                        ndc[2],
+                                        ndc[3],
+                                    );
+                                    let alpha = opacity * tint;
+                                    (self.gl.glUniform4f)(
+                                        program.uniform("tint_color"),
+                                        color[0] * alpha,
+                                        color[1] * alpha,
+                                        color[2] * alpha,
+                                        alpha,
+                                    );
+                                    (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                                }
+                            }
+                            BatchKind::Trail => {
+                                let program = self.programs.get(ProgramKind::Trail);
+                                (self.gl.glUseProgram)(program.id);
+                                let ndc = self.ndc_rect(rect);
+                                (self.gl.glUniform4fv)(
+                                    program.uniform("x_coords"),
+                                    1,
+                                    [ndc[0], ndc[0], ndc[2], ndc[2]].as_ptr(),
+                                );
+                                (self.gl.glUniform4fv)(
+                                    program.uniform("y_coords"),
+                                    1,
+                                    [ndc[3], ndc[1], ndc[1], ndc[3]].as_ptr(),
+                                );
+                                (self.gl.glUniform2f)(program.uniform("cursor_edge_x"), 2.0, 2.0);
+                                (self.gl.glUniform2f)(program.uniform("cursor_edge_y"), 2.0, 2.0);
+                                (self.gl.glUniform3f)(
+                                    program.uniform("trail_color"),
+                                    color[0],
+                                    color[1],
+                                    color[2],
+                                );
+                                let alpha = color[3].clamp(0.0, 1.0);
+                                (self.gl.glUniform1f)(program.uniform("trail_opacity"), alpha);
+                                (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                            }
+                        }
+                        stats.draw_calls += 1;
                     }
-                    match call.kind {
-                        BatchKind::Solid => {
-                            (self.gl.glUseProgram)(self.programs.solid);
-                            (self.gl.glUniform2f)(
-                                self.programs.solid_viewport,
-                                viewport[0],
-                                viewport[1],
-                            );
-                            (self.gl.glUniform1i)(self.programs.solid_gamma, gamma);
-                        }
-                        BatchKind::Glyph { page, is_color } => {
-                            (self.gl.glUseProgram)(self.programs.glyph);
-                            (self.gl.glUniform2f)(
-                                self.programs.glyph_viewport,
-                                viewport[0],
-                                viewport[1],
-                            );
-                            (self.gl.glUniform1i)(self.programs.glyph_atlas, 0);
-                            (self.gl.glUniform1i)(
-                                self.programs.glyph_is_color,
-                                i32::from(is_color),
-                            );
-                            (self.gl.glUniform1i)(self.programs.glyph_gamma, gamma);
-                            let texture = self
-                                .atlas_pages
-                                .get(&page)
-                                .map(|texture| texture.texture)
-                                .unwrap_or(0);
-                            (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
-                        }
-                        BatchKind::Image(key) => {
-                            (self.gl.glUseProgram)(self.programs.image);
-                            (self.gl.glUniform2f)(
-                                self.programs.image_viewport,
-                                viewport[0],
-                                viewport[1],
-                            );
-                            (self.gl.glUniform1i)(self.programs.image_texture, 0);
-                            (self.gl.glUniform1i)(self.programs.image_gamma, gamma);
-                            let texture = self
-                                .image_textures
-                                .get(&key)
-                                .map(|cached| cached.texture)
-                                .unwrap_or(0);
-                            (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
-                        }
-                    }
-                    (self.gl.glDrawArraysInstanced)(GL_TRIANGLE_STRIP, 0, 4, call.count);
-                    stats.draw_calls += 1;
                 }
             }
 
             (self.gl.glDisable)(GL_SCISSOR_TEST);
-            (self.gl.glBindBuffer)(GL_ARRAY_BUFFER, 0);
             (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
             (self.gl.glBindVertexArray)(0);
             (self.gl.glUseProgram)(0);
@@ -1838,8 +2322,7 @@ impl Drop for GlBackend {
         if let Some(context) = &self.context {
             if context.make_current().is_err() {
                 // No current context: make sure Programs::drop does not call GL.
-                self.programs.glyph = 0;
-                self.programs.solid = 0;
+                self.programs.programs.clear();
                 return;
             }
         }
@@ -1864,6 +2347,14 @@ impl Drop for GlBackend {
             }
             for (_, cached) in self.image_textures.drain() {
                 (self.gl.glDeleteTextures)(1, &cached.texture);
+            }
+            if self.custom_program != 0 {
+                (self.gl.glDeleteProgram)(self.custom_program);
+                self.custom_program = 0;
+            }
+            if self.color_table_ubo != 0 {
+                (self.gl.glDeleteBuffers)(1, &self.color_table_ubo);
+                self.color_table_ubo = 0;
             }
         }
         let _ = self.gl.check("teardown");

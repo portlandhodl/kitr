@@ -60,7 +60,7 @@ fn collect(
 }
 
 #[test]
-fn indexed_image_is_expanded_into_the_upload() {
+fn indexed_image_keeps_indices_and_carries_the_live_palette() {
     let mut screen = make_screen();
     transmit(&mut screen, "a=t,f=8,i=1,s=2,v=2", vec![1, 2, 1, 2]);
     put(&mut screen, "a=p,i=1,p=1,c=2,r=2,C=1");
@@ -72,10 +72,12 @@ fn indexed_image_is_expanded_into_the_upload() {
     let (instances, uploads) = collect(&screen, &palette);
     assert_eq!(instances.len(), 1);
     assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].data.as_slice(), &[1, 2, 1, 2]);
     assert_eq!(
-        uploads[0].data.as_slice(),
-        &[255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 255, 255]
+        uploads[0].indexed_format,
+        Some(kitty_graphics::ImageFormat::Indexed)
     );
+    assert_eq!(uploads[0].palette.as_ref(), Some(&palette));
 }
 
 #[test]
@@ -103,22 +105,20 @@ fn relative_child_uses_parent_anchor_offsets_z_and_source() {
 }
 
 #[test]
-fn relative_cycles_and_missing_parents_are_not_rendered() {
+fn relative_cycles_and_missing_parents_are_rejected_on_put() {
     let mut screen = make_screen();
     transmit(&mut screen, "a=t,f=32,i=1,s=1,v=1", vec![255, 0, 0, 255]);
     transmit(&mut screen, "a=t,f=32,i=2,s=1,v=1", vec![0, 255, 0, 255]);
-    put(&mut screen, "a=p,i=1,p=1,P=2,Q=1,C=1");
-    put(&mut screen, "a=p,i=2,p=1,P=1,Q=1,C=1");
+    let mut first = parse_raw(b"a=p,i=1,p=1,P=2,Q=1,C=1").unwrap();
+    first.payload.clear();
+    assert!(screen.handle_graphics_command(first).is_err());
+    let mut second = parse_raw(b"a=p,i=2,p=1,P=99,Q=1,C=1").unwrap();
+    second.payload.clear();
+    assert!(screen.handle_graphics_command(second).is_err());
     let palette = IndexedPalette::default();
     let (instances, uploads) = collect(&screen, &palette);
     assert!(instances.is_empty());
     assert!(uploads.is_empty());
-
-    let mut screen2 = make_screen();
-    transmit(&mut screen2, "a=t,f=32,i=1,s=1,v=1", vec![255, 0, 0, 255]);
-    put(&mut screen2, "a=p,i=1,p=1,P=99,Q=1,C=1");
-    let (instances, _) = collect(&screen2, &palette);
-    assert!(instances.is_empty());
 }
 
 #[test]

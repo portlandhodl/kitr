@@ -484,6 +484,7 @@ fn image_2x2(key: ImageKey, wrap: ImageWrap) -> ImageUpload {
 
 fn image_frame_with(image: ImageInstance, upload: ImageUpload) -> Frame {
     let mut frame = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    frame.indexed_palette = upload.palette.clone();
     frame.images.push(image);
     frame.image_uploads.push(upload);
     frame
@@ -1191,4 +1192,164 @@ fn relative_placement_renders_at_parent_offset() {
     let pixels = backend.read_pixels().expect("readback");
     assert_pixel(pixel(&pixels, 32, 8, 8), [255, 0, 0, 255], 1, "parent");
     assert_pixel(pixel(&pixels, 32, 24, 24), [0, 255, 0, 255], 1, "child");
+}
+
+#[test]
+fn every_generated_program_variant_compiles() {
+    let _guard = lock();
+    let result = std::panic::catch_unwind(|| {
+        kitty_render::validate_all_shader_variants(kitty_render::GlApi::OpenGl)
+    });
+    match result {
+        Ok(Ok(count)) => assert!(count >= 40, "expected all variants, compiled {count}"),
+        Ok(Err(error)) => panic!("generated shader compilation failed: {error}"),
+        Err(_) => eprintln!("skipping GPU shader validation: headless EGL unavailable"),
+    }
+    let result = std::panic::catch_unwind(|| {
+        kitty_render::validate_builtin_programs(kitty_render::GlApi::OpenGl)
+    });
+    match result {
+        Ok(Ok(count)) => assert_eq!(count, 16, "all logical programs must compile"),
+        Ok(Err(error)) => panic!("logical program compilation failed: {error}"),
+        Err(_) => eprintln!("skipping GPU shader validation: headless EGL unavailable"),
+    }
+}
+
+#[test]
+fn backend_exposes_real_program_and_uniform_reflection() {
+    use kitty_render::ProgramKind;
+    let _guard = lock();
+    let backend = try_backend!(32, 32);
+    let compiled = backend.compiled_programs();
+    for kind in [
+        ProgramKind::Cell,
+        ProgramKind::Borders,
+        ProgramKind::Graphics,
+        ProgramKind::GraphicsAlphaMask,
+        ProgramKind::GraphicsIndexed,
+        ProgramKind::BgImage,
+        ProgramKind::Tint,
+        ProgramKind::Trail,
+        ProgramKind::Blit,
+        ProgramKind::Screenshot,
+        ProgramKind::RoundedRect,
+        ProgramKind::Padding,
+    ] {
+        assert!(compiled.contains(&kind), "{kind:?} was not compiled");
+    }
+
+    let cell = backend
+        .program_source(ProgramKind::Cell)
+        .expect("cell program");
+    assert!(cell.uniform_reflection().contains_key("sprites"));
+    assert!(cell
+        .uniform_reflection()
+        .contains_key("CellRenderData.columns"));
+    assert_eq!(cell.attribute_reflection().get("colors"), Some(&0));
+    assert_eq!(cell.attribute_reflection().get("sprite_idx"), Some(&1));
+    assert_eq!(cell.attribute_reflection().get("is_selected"), Some(&2));
+    assert!(backend
+        .program_uniform(ProgramKind::Cell, "sprites")
+        .is_some());
+    assert!(backend
+        .program_uniform(ProgramKind::Graphics, "src_rect")
+        .is_some());
+    assert!(backend
+        .program_uniform(ProgramKind::Tint, "tint_color")
+        .is_some());
+    assert!(backend
+        .program_uniform(ProgramKind::Trail, "x_coords")
+        .is_some());
+    assert!(backend
+        .program_uniform(ProgramKind::Blit, "image")
+        .is_some());
+}
+
+#[test]
+fn custom_slang_shader_compiles_and_links() {
+    let _guard = lock();
+    let compiler = match kitty_render::SlangCompiler::from_env() {
+        Ok(compiler) => compiler,
+        Err(error) => {
+            eprintln!("skipping custom shader test: {error}");
+            return;
+        }
+    };
+    let source = r#"#language slang 2026
+struct VSOut {
+    float4 position : SV_Position;
+    float2 texcoord : TEXCOORD;
+};
+
+[shader("vertex")]
+VSOut
+vertex_main(uint vertex_id: SV_VertexID, uniform float4 src_rect, uniform float4 dest_rect) {
+    const int2 pos_map[4] = { int2(2, 1), int2(2, 3), int2(0, 3), int2(0, 1) };
+    int2 pos = pos_map[vertex_id];
+    VSOut output;
+    output.texcoord = float2(src_rect[pos.x], src_rect[pos.y]);
+    output.position = float4(dest_rect[pos.x], dest_rect[pos.y], 0.0, 1.0);
+    return output;
+}
+
+uniform Sampler2D image;
+
+[shader("fragment")]
+float4
+fragment_main(float2 texcoord: TEXCOORD) : SV_Target {
+    return image.Sample(texcoord);
+}
+"#;
+    let custom = compiler
+        .compile_custom_shader("kitr_test", source, &[])
+        .expect("compile custom slang shader");
+    assert!(custom.vertex.contains("void main"));
+    assert!(custom.fragment.contains("void main"));
+    assert!(custom.fragment.contains("texture("));
+
+    let mut backend = try_backend!(32, 32);
+    backend
+        .install_custom_shader_with(&compiler, "kitr_test", source, &[])
+        .expect("link custom shader into the backend");
+    assert!(backend.has_custom_shader());
+}
+
+#[test]
+fn decoration_and_background_pixels_use_the_real_programs() {
+    use kitty_render::{DecorationInstance, DecorationKind};
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let mut frame = empty_frame(2, 2, 16.0, 16.0, Rgba8::BLACK);
+    frame.backgrounds.push(BackgroundInstance {
+        rect: Rect::new(0.0, 0.0, 32.0, 16.0),
+        cell_x: 0,
+        cell_y: 0,
+        color: Rgba8::rgb(10, 20, 30),
+        is_default_bg: false,
+        flags: InstanceFlags::default(),
+    });
+    frame.decorations.push(DecorationInstance {
+        rect: Rect::new(0.0, 16.0, 32.0, 16.0),
+        cell_x: 0,
+        cell_y: 1,
+        kind: DecorationKind::Strikethrough,
+        color: Rgba8::rgb(200, 100, 50),
+        flags: InstanceFlags::default(),
+    });
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(
+        pixel(&pixels, 32, 16, 8),
+        [10, 20, 30, 255],
+        1,
+        "background",
+    );
+    assert_pixel(
+        pixel(&pixels, 32, 16, 24),
+        [200, 100, 50, 255],
+        1,
+        "decoration",
+    );
 }

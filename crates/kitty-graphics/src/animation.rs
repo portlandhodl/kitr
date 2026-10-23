@@ -16,7 +16,10 @@
 //! with `ENOSPC`, matching kitty's cache-full response.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::command::{Action, DeleteAction, GraphicsCommand};
 use crate::image::{decode_image, GraphicsError, Image, ImageFormat, ImageLimits};
@@ -50,11 +53,34 @@ impl AnimationState {
     }
 }
 
+/// Pixel data that is either resident or spilled to the optional disk cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FrameBlob {
+    Memory(Arc<Vec<u8>>),
+    Disk { path: PathBuf, len: usize },
+}
+
+impl FrameBlob {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(data) => data.len(),
+            Self::Disk { len, .. } => *len,
+        }
+    }
+
+    fn to_arc(&self) -> Option<Arc<Vec<u8>>> {
+        match self {
+            Self::Memory(data) => Some(data.clone()),
+            Self::Disk { path, .. } => std::fs::read(path).ok().map(Arc::new),
+        }
+    }
+}
+
 /// Storage for one animation frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FrameStorage {
     /// A full RGBA8 canvas.
-    Key(Arc<Vec<u8>>),
+    Key(FrameBlob),
     /// A patch composed over `base_frame_id` (zero means a transparent or
     /// background-filled canvas).
     Delta {
@@ -70,7 +96,7 @@ struct DeltaPatch {
     y: u32,
     width: u32,
     height: u32,
-    rgba: Arc<Vec<u8>>,
+    rgba: FrameBlob,
     blend: bool,
 }
 
@@ -221,7 +247,7 @@ impl AnimatedImage {
         }
         let frame = self.frames.get(index)?;
         match &frame.storage {
-            FrameStorage::Key(data) => Some(data.clone()),
+            FrameStorage::Key(data) => data.to_arc(),
             FrameStorage::Delta {
                 base_frame_id,
                 patch,
@@ -241,11 +267,12 @@ impl AnimatedImage {
                 } else {
                     vec![0u8; self.canvas_bytes()]
                 };
+                let patch_data = patch.rgba.to_arc()?;
                 compose_patch(
                     &mut canvas,
                     self.width,
                     self.height,
-                    &patch.rgba,
+                    &patch_data,
                     patch.width,
                     patch.height,
                     patch.x,
@@ -262,7 +289,7 @@ impl AnimatedImage {
         let Some(data) = self.reconstruct_index(index, &mut Vec::new(), 0) else {
             return false;
         };
-        self.frames[index].storage = FrameStorage::Key(data);
+        self.frames[index].storage = FrameStorage::Key(FrameBlob::Memory(data));
         true
     }
 
@@ -346,6 +373,51 @@ pub struct AnimationManager {
     access_clock: u64,
     evicted_frames: u64,
     evicted_images: u64,
+    disk: Option<Arc<Mutex<AnimationDiskCache>>>,
+}
+
+#[derive(Clone, Debug)]
+struct AnimationDiskCache {
+    dir: PathBuf,
+    next: u64,
+}
+
+impl AnimationDiskCache {
+    fn new(root: &Path) -> io::Result<Self> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!(
+            "kitr-animation-cache-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir, next: 0 })
+    }
+
+    fn write(&mut self, data: &[u8]) -> io::Result<FrameBlob> {
+        self.next = self.next.wrapping_add(1);
+        let path = self.dir.join(format!("frame-{:016x}.bin", self.next));
+        std::fs::write(&path, data)?;
+        Ok(FrameBlob::Disk {
+            path,
+            len: data.len(),
+        })
+    }
+
+    fn clear(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        self.next = 0;
+    }
+}
+
+impl Drop for AnimationDiskCache {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 impl Default for AnimationManager {
@@ -369,7 +441,44 @@ impl AnimationManager {
             access_clock: 0,
             evicted_frames: 0,
             evicted_images: 0,
+            disk: None,
         }
+    }
+
+    /// Create a manager that spills frame pixels into a private directory
+    /// under `root`. The directory is removed when the manager is dropped.
+    pub fn new_with_disk_cache(root: impl AsRef<Path>) -> io::Result<Self> {
+        let mut manager = Self::new_with_limits(AnimationLimits::default());
+        manager.disk = Some(Arc::new(Mutex::new(AnimationDiskCache::new(
+            root.as_ref(),
+        )?)));
+        Ok(manager)
+    }
+
+    /// Enable disk spilling on an existing manager.
+    pub fn enable_disk_cache(&mut self, root: impl AsRef<Path>) -> io::Result<()> {
+        self.disk = Some(Arc::new(Mutex::new(AnimationDiskCache::new(
+            root.as_ref(),
+        )?)));
+        Ok(())
+    }
+
+    pub fn disk_cache_dir(&self) -> Option<PathBuf> {
+        self.disk
+            .as_ref()
+            .and_then(|disk| disk.lock().ok())
+            .map(|disk| disk.dir.clone())
+    }
+
+    fn store_blob(&mut self, data: Vec<u8>) -> FrameBlob {
+        if let Some(disk) = &self.disk {
+            if let Ok(mut disk) = disk.lock() {
+                if let Ok(blob) = disk.write(&data) {
+                    return blob;
+                }
+            }
+        }
+        FrameBlob::Memory(Arc::new(data))
     }
 
     pub fn limits(&self) -> AnimationLimits {
@@ -426,6 +535,11 @@ impl AnimationManager {
         self.images.clear();
         self.pending = None;
         self.total_bytes = 0;
+        if let Some(disk) = &self.disk {
+            if let Ok(mut disk) = disk.lock() {
+                disk.clear();
+            }
+        }
     }
 
     pub fn has_pending_frame(&self) -> bool {
@@ -577,6 +691,7 @@ impl AnimationManager {
                 "Failed to store image data in cache",
             ));
         }
+        let root_storage = self.store_blob(rgba);
         self.images.insert(
             id,
             AnimatedImage {
@@ -590,7 +705,7 @@ impl AnimationManager {
                     height: image.height,
                     gap_ms: 0,
                     transient: image.transient,
-                    storage: FrameStorage::Key(Arc::new(rgba)),
+                    storage: FrameStorage::Key(root_storage),
                 }],
                 current_frame_index: 0,
                 animation_state: AnimationState::Stopped,
@@ -922,6 +1037,7 @@ impl AnimationManager {
                 ));
             }
             let transient = command.is_transient();
+            let edited_storage = FrameStorage::Key(self.store_blob(canvas));
             let image = self.images.get_mut(&image_id).expect("resolved image");
             let index = image
                 .frame_index_for_id(edit_id)
@@ -933,7 +1049,7 @@ impl AnimationManager {
                 None
             };
             let frame = &mut image.frames[index];
-            frame.storage = FrameStorage::Key(Arc::new(canvas));
+            frame.storage = edited_storage;
             frame.transient |= transient;
             if let Some(gap) = gap {
                 let old_gap = frame.gap_ms;
@@ -972,7 +1088,8 @@ impl AnimationManager {
                         y,
                         blend,
                     );
-                    (FrameStorage::Key(Arc::new(canvas)), true)
+                    let blob = self.store_blob(canvas);
+                    (FrameStorage::Key(blob), true)
                 } else {
                     (
                         FrameStorage::Delta {
@@ -982,7 +1099,7 @@ impl AnimationManager {
                                 y,
                                 width: decoded.width,
                                 height: decoded.height,
-                                rgba: Arc::new(patch),
+                                rgba: self.store_blob(patch),
                                 blend,
                             },
                             bgcolor: if source_id.is_none() {
@@ -1228,12 +1345,13 @@ impl AnimationManager {
                 "Failed to store image data in cache",
             ));
         }
+        let composed_storage = FrameStorage::Key(self.store_blob(destination));
         let image = self.images.get_mut(&image_id).expect("resolved image");
         let index = image
             .frame_index_for_id(destination_id)
             .ok_or_else(|| animation_error("ENOENT", "Destination frame was evicted"))?;
         let frame = &mut image.frames[index];
-        frame.storage = FrameStorage::Key(Arc::new(destination));
+        frame.storage = composed_storage;
         frame.transient |= transient;
         let redraw = index == image.current_frame_index;
         self.recompute_total();
@@ -1752,6 +1870,35 @@ mod tests {
             manager.image(1).unwrap().frame_data(2).unwrap().as_slice(),
             &[2, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn disk_cache_spills_frames_and_cleans_up_on_drop() {
+        let root_dir =
+            std::env::temp_dir().join(format!("kitr-animation-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let mut manager = AnimationManager::new_with_disk_cache(&root_dir).unwrap();
+        let cache_dir = manager.disk_cache_dir().unwrap().to_path_buf();
+        manager.insert_root(&root(1, 1, 1, [0, 0, 0, 255])).unwrap();
+        manager
+            .feed(
+                &simple_frame(1, 2, [1, 2, 3, 255]),
+                &ImageLimits::default(),
+                0,
+            )
+            .unwrap();
+        assert!(cache_dir.is_dir());
+        assert!(std::fs::read_dir(&cache_dir).unwrap().next().is_some());
+        assert_eq!(
+            manager.image(1).unwrap().frame_data(2).unwrap().as_slice(),
+            &[1, 2, 3, 255]
+        );
+        drop(manager);
+        assert!(
+            !cache_dir.exists(),
+            "cache directory must be removed on exit"
+        );
+        let _ = std::fs::remove_dir_all(&root_dir);
     }
 
     #[test]

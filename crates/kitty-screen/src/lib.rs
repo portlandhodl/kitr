@@ -70,7 +70,10 @@ pub mod selection;
 pub use charset::CharsetState;
 pub use colors::{ColorChange, ColorOverrides, ColorStack, Rgb};
 pub use cursor::{Cursor, CursorShape, SgrAttrs, DECORATION_FG_CODE};
-pub use graphics::{GraphicsQuery, ImagePlacement, UnsupportedGraphics};
+pub use graphics::{
+    color_to_image_id, diacritic_to_num, GraphicsQuery, ImagePlacement, MaterializedPlacement,
+    UnsupportedGraphics,
+};
 pub use handler::{parse_into, ScreenHandler};
 pub use hyperlink::{Hyperlink, HyperlinkAt, HyperlinkPool, HyperlinkSpan};
 pub use lineops::{

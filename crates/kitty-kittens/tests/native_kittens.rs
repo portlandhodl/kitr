@@ -99,3 +99,81 @@ fn help_and_listing_mark_native_kittens() {
     }
     assert!(text.contains("builtin, native"));
 }
+
+#[test]
+fn newly_native_kittens_have_help() {
+    for (name, marker) in [
+        ("transfer", "Transfer files"),
+        ("ssh", "Connect to a remote host"),
+        ("themes", "Manage kitty color schemes"),
+        ("show-key", "Show the codes"),
+        ("query-terminal", "Queries:"),
+        ("resize-window", "Resize the current window"),
+        ("broadcast", "Broadcast typed text"),
+        ("ask", "Ask the user"),
+        ("choose-files", "Choose files"),
+        ("choose-fonts", "Choose the fonts"),
+        ("command-palette", "Browse and trigger"),
+        ("desktop-ui", "Usage: kitten desktop-ui"),
+        ("diff", "side-by-side"),
+        ("dnd", "drag and drop"),
+        ("hyperlinked-grep", "ripgrep"),
+        ("pager", "pager"),
+        ("panel", "accelerated panel"),
+        ("quick-access-terminal", "quick access terminal"),
+        ("remote-file", "remote file"),
+    ] {
+        let output = kitten(&[name, "--help"]);
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.to_lowercase().contains(&marker.to_lowercase()),
+            "{name}: missing {marker:?} in {text}"
+        );
+    }
+}
+
+#[test]
+fn clipboard_mime_help_is_native() {
+    let output = kitten(&["clipboard", "--mime", "--help"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("MIME"));
+}
+
+#[test]
+fn native_listing_includes_all_portable_kittens() {
+    let output = kitten(&["list"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for name in [
+        "transfer",
+        "ssh",
+        "themes",
+        "show-key",
+        "query-terminal",
+        "resize-window",
+        "broadcast",
+        "ask",
+        "choose-files",
+        "choose-fonts",
+        "command-palette",
+        "desktop-ui",
+        "diff",
+        "dnd",
+        "hyperlinked-grep",
+        "pager",
+        "panel",
+        "quick-access-terminal",
+        "remote-file",
+    ] {
+        assert!(
+            text.contains(&format!("{name}\t")),
+            "missing {name} in {text}"
+        );
+    }
+}

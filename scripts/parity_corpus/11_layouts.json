@@ -1,5 +1,4 @@
 {
   "size": "80x24",
-  "skip": "kitr's session parser does not implement launch --location, so split layouts cannot be driven identically; tabs are covered by 10_tabs",
-  "tags": ["layouts"]
+  "tags": ["layouts", "splits"]
 }

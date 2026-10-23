@@ -27,13 +27,17 @@ TERMINFO_BUILD ?= build/terminfo
 PARITY_THRESHOLD ?= 5.0
 PARITY_ARTIFACTS ?= artifacts/screenshot-parity
 PARITY_ARGS ?=
+DIST ?= dist
+VERSION ?= 0.1.0
+ARCH ?= $(shell uname -m)
 
 ICON_PNG := $(wildcard packaging/icons/kitr.png)
 ICON_SVG := $(wildcard packaging/icons/kitr.svg)
 
 .PHONY: all build test lint fmt clippy install uninstall terminfo \
 	install-binary install-terminfo install-shell-integration \
-	install-desktop install-man screenshot-parity license-check validate clean help
+	install-desktop install-man screenshot-parity license-check validate \
+	package package-smoke clean help
 
 all: build
 
@@ -136,6 +140,18 @@ uninstall:
 	rm -f "$(DESTDIR)$(ICONDIR)/256x256/apps/kitr.png" "$(DESTDIR)$(ICONDIR)/scalable/apps/kitr.svg"
 	@echo "removed kitr files under $(DESTDIR)$(PREFIX)"
 
+package-smoke:
+	$(PYTHON) scripts/package_smoke.py "$(DIST)/stage"
+
+package: build
+	rm -rf "$(DIST)/stage" "$(DIST)/kitr-$(VERSION)-linux-$(ARCH).tar.gz"
+	$(MAKE) install DESTDIR="$(abspath $(DIST)/stage)" PREFIX=/usr
+	"$(abspath $(DIST)/stage)/usr/libexec/kitr/kitr" --version >/dev/null
+	$(PYTHON) scripts/package_smoke.py "$(DIST)/stage"
+	mkdir -p "$(DIST)"
+	tar -C "$(DIST)/stage" -czf "$(DIST)/kitr-$(VERSION)-linux-$(ARCH).tar.gz" .
+	@echo "package: wrote $(DIST)/kitr-$(VERSION)-linux-$(ARCH).tar.gz"
+
 screenshot-parity: build
 	$(PYTHON) scripts/screenshot_parity.py \
 		--kitr target/release/kitr \
@@ -169,4 +185,5 @@ help:
 		'  screenshot-parity     best-effort C kitty vs kitr pixel comparison' \
 		'  license-check         verify SPDX headers and notices/manifests' \
 		'  validate              validate desktop and AppStream metadata' \
+		'  package               stage a /usr install, run smoke checks, write a tarball' \
 		'  clean                 cargo clean and remove generated artifacts'

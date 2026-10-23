@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
 use kitty_core::cell::{CpuCell, GpuCell};
 use kitty_fonts::FontCellMetrics;
-use kitty_graphics::{AnimationManager, AnimationTick};
+use kitty_graphics::{AnimationManager, AnimationTick, IndexedPalette};
 use kitty_screen::{CursorShape, HyperlinkSpan, Screen};
 
 use crate::atlas::{AtlasEvent, GlyphAtlas, GlyphKey, GlyphRasterizer, GlyphSlot, GlyphText};
@@ -243,6 +243,9 @@ pub struct RenderConfig {
     pub pane_borders: Vec<SolidRect>,
     /// Try to shape runs of adjacent cells into ligature/combining sprites.
     pub shaped_runs: bool,
+    /// Root directory for the disk-backed animation frame cache. `None` keeps
+    /// frames in memory. The manager owns and removes a private subdirectory.
+    pub animation_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for RenderConfig {
@@ -274,6 +277,7 @@ impl Default for RenderConfig {
             pane_backgrounds: Vec::new(),
             pane_borders: Vec::new(),
             shaped_runs: true,
+            animation_cache_dir: None,
         }
     }
 }
@@ -322,6 +326,10 @@ pub struct Frame {
     pub images: Vec<ImageInstance>,
     /// Texture data for images referenced by this frame.
     pub image_uploads: Vec<ImageUpload>,
+    /// Live palette for indexed protocol images. The GL backend uploads the
+    /// palette indices once and looks colours up in this palette in the
+    /// fragment shader, so colour changes do not re-upload image textures.
+    pub indexed_palette: Option<IndexedPalette>,
     /// Optional background image quad (also present in `image_uploads`).
     pub background_image: Option<ImageInstance>,
     /// Optional window logo quad (also present in `image_uploads`).
@@ -357,6 +365,7 @@ impl Frame {
         self.cursors.clear();
         self.images.clear();
         self.image_uploads.clear();
+        self.indexed_palette = None;
         self.background_image = None;
         self.logo = None;
         self.trail.clear();
@@ -772,9 +781,14 @@ pub struct InstanceGenerator {
 
 impl InstanceGenerator {
     pub fn new(config: RenderConfig) -> Self {
+        let animations = match &config.animation_cache_dir {
+            Some(dir) => AnimationManager::new_with_disk_cache(dir)
+                .unwrap_or_else(|_| AnimationManager::new()),
+            None => AnimationManager::new(),
+        };
         Self {
             config,
-            animations: RefCell::new(AnimationManager::new()),
+            animations: RefCell::new(animations),
         }
     }
 
@@ -1133,6 +1147,7 @@ impl InstanceGenerator {
 
         let animations = self.animations.borrow();
         let palette = crate::colors::indexed_image_palette(resolver);
+        frame.indexed_palette = Some(palette.clone());
         images::collect_protocol_images_with_palette(
             screen,
             Some(&animations),

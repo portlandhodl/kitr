@@ -149,6 +149,8 @@ pub struct LaunchSpec {
     pub cwd: Option<String>,
     /// ``--title`` override.
     pub title: Option<String>,
+    /// ``--location`` for restoring split layouts (`vsplit`, `hsplit`, ...).
+    pub location: Option<String>,
     pub env: BTreeMap<String, String>,
     pub vars: BTreeMap<String, String>,
     pub hold: bool,

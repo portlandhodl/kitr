@@ -1,0 +1,13 @@
+{
+  "fragment_inputs": {},
+  "input_locations": {},
+  "loose_uniforms": {
+    "background_color": "background_color_0",
+    "color": "color_0",
+    "outer_color": "outer_color_0",
+    "params": "params_0",
+    "rect": "rect_0"
+  },
+  "uniform_struct_names": {},
+  "uniform_structs": {}
+}

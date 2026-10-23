@@ -101,6 +101,7 @@ pub struct Notification {
     pub app_name: String,
     pub icon_names: Vec<String>,
     pub icon_path: Option<PathBuf>,
+    pub icon_cache_id: Option<String>,
     pub icon_data: Option<Vec<u8>>,
     pub urgency: Urgency,
     pub expire_after: Option<Duration>,
@@ -132,6 +133,9 @@ impl Notification {
         }
         for icon in &self.icon_names {
             items.push(format!("n={}", b64(icon)));
+        }
+        if let Some(cache_id) = &self.icon_cache_id {
+            items.push(format!("g={cache_id}"));
         }
         if let Some(sound) = &self.sound {
             if sound != "system" {
@@ -451,6 +455,9 @@ pub fn parse_notify_args(args: &[String]) -> Result<NotifyOptions, NotifyError> 
             "-p" | "--icon-path" => {
                 opts.notification.icon_path = Some(PathBuf::from(take("--icon-path")?))
             }
+            "-g" | "--icon-cache-id" => {
+                opts.notification.icon_cache_id = Some(take("--icon-cache-id")?)
+            }
             "-u" | "--urgency" => {
                 let value = take("--urgency")?;
                 opts.notification.urgency =
@@ -508,6 +515,11 @@ pub fn parse_notify_args(args: &[String]) -> Result<NotifyOptions, NotifyError> 
     }
     if positionals.len() > 1 {
         opts.notification.body = positionals[1..].join(" ");
+    }
+    if let Some(cache_id) = &opts.notification.icon_cache_id {
+        if !is_valid_identifier(cache_id) {
+            return Err(NotifyError::InvalidIdentifier(cache_id.clone()));
+        }
     }
     if let Some(identifier) = &opts.notification.identifier {
         if !is_valid_identifier(identifier) {

@@ -1,0 +1,29 @@
+Source: kitr
+Section: x11
+Priority: optional
+Maintainer: kitr contributors <maintainers@portlandhodl.example>
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.89), rustc (>= 1.89),
+ pkg-config, libfreetype-dev, libharfbuzz-dev, libfontconfig-dev,
+ libegl-dev, libgl-dev, libx11-dev, libxi-dev, libxcursor-dev,
+ libpng-dev, zlib1g-dev, libssl-dev, libwayland-dev,
+ wayland-protocols, ncurses-bin
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/portlandhodl/kitr
+Vcs-Git: https://github.com/portlandhodl/kitr.git
+Vcs-Browser: https://github.com/portlandhodl/kitr
+
+Package: kitr
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: fonts-dejavu-core, xdg-utils
+Provides: x-terminal-emulator
+Description: fast GPU-accelerated terminal emulator (kitty-compatible Rust port)
+ kitr is a Rust port of the kitty terminal emulator. It implements the
+ kitty graphics protocol, Unicode placeholder images, live indexed-colour
+ palettes, split layouts, tabs, sessions, remote control and the common
+ kittens on Linux.
+ .
+ This package is a distribution skeleton: it builds the workspace with
+ Cargo and installs the binary, launcher wrapper, xterm-kitty terminfo,
+ shell-integration scripts, desktop metadata and manual page.

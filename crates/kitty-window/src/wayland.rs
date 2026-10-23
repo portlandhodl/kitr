@@ -22,13 +22,14 @@
 //! supported, as are both `CLIPBOARD` and `PRIMARY` selections. `wl_touch`
 //! supplies touch points; tablet-tool tilt and pressure curves from
 //! `zwp_tablet_v2` are not modelled, and `wl_touch` pressure is the protocol's
-//! implied 1.0/0.0. Cursor theme/scale state is tracked and hot-reloaded but a
-//! themed cursor surface is left to the compositor cursor layer. Window
-//! position is controlled by the compositor, so `position`/`set_position`
-//! report or accept a best-effort value and cannot be used for absolute
-//! placement. Fractional scaling is honoured when both `fractional-scale-v1`
-//! and `viewporter` are advertised; otherwise the integer output scale is
-//! rounded.
+//! implied 1.0/0.0. Cursor themes are loaded through `libwayland-cursor` and
+//! painted on a client cursor surface; when the helper library or a theme is
+//! missing, no cursor surface is installed and the compositor keeps its
+//! default. Window position is controlled by the compositor, so
+//! `position`/`set_position` report or accept a best-effort value and cannot be
+//! used for absolute placement. Fractional scaling is honoured when both
+//! `fractional-scale-v1` and `viewporter` are advertised; otherwise the integer
+//! output scale is rounded.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -40,6 +41,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use wayland_backend::client::ObjectId;
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
     wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
@@ -741,6 +743,177 @@ fn coalesce_events(events: &mut Vec<WindowEvent>) {
 // }}}
 // {{{ WaylandWindow
 
+#[link(name = "dl")]
+extern "C" {
+    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlclose(handle: *mut c_void) -> c_int;
+}
+
+const RTLD_LAZY: c_int = 1;
+
+#[repr(C)]
+struct WlCursorImage {
+    width: u32,
+    height: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+    delay: u32,
+}
+
+#[repr(C)]
+struct WlCursor {
+    image_count: c_uint,
+    images: *mut *mut WlCursorImage,
+    name: *mut c_char,
+}
+
+type CursorThemeLoad = unsafe extern "C" fn(*const c_char, c_int, *mut c_void) -> *mut c_void;
+type CursorThemeDestroy = unsafe extern "C" fn(*mut c_void);
+type CursorThemeGet = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut WlCursor;
+type CursorImageBuffer = unsafe extern "C" fn(*mut WlCursorImage) -> *mut c_void;
+
+/// Dynamically loaded `libwayland-cursor` theme, so the Wayland feature keeps
+/// working on systems that do not ship the cursor helper library.
+struct WaylandCursorLib {
+    handle: *mut c_void,
+    load: CursorThemeLoad,
+    destroy: CursorThemeDestroy,
+    get: CursorThemeGet,
+    image_buffer: CursorImageBuffer,
+    theme: *mut c_void,
+    theme_name: String,
+    theme_size: u32,
+}
+
+impl WaylandCursorLib {
+    fn new() -> Option<Self> {
+        const NAMES: [&[u8]; 3] = [
+            b"libwayland-cursor.so.0\0",
+            b"libwayland-cursor.so\0",
+            b"libwayland-cursor.so.0.21.0\0",
+        ];
+        for name in NAMES {
+            let handle = unsafe { dlopen(name.as_ptr().cast(), RTLD_LAZY) };
+            if handle.is_null() {
+                continue;
+            }
+            let symbol = |name: &CStr| unsafe { dlsym(handle, name.as_ptr()) };
+            let load = symbol(c"wl_cursor_theme_load");
+            let destroy = symbol(c"wl_cursor_theme_destroy");
+            let get = symbol(c"wl_cursor_theme_get_cursor");
+            let image_buffer = symbol(c"wl_cursor_image_get_buffer");
+            if load.is_null() || destroy.is_null() || get.is_null() || image_buffer.is_null() {
+                unsafe { dlclose(handle) };
+                continue;
+            }
+            return Some(Self {
+                handle,
+                load: unsafe { std::mem::transmute::<*mut c_void, CursorThemeLoad>(load) },
+                destroy: unsafe { std::mem::transmute::<*mut c_void, CursorThemeDestroy>(destroy) },
+                get: unsafe { std::mem::transmute::<*mut c_void, CursorThemeGet>(get) },
+                image_buffer: unsafe {
+                    std::mem::transmute::<*mut c_void, CursorImageBuffer>(image_buffer)
+                },
+                theme: ptr::null_mut(),
+                theme_name: String::new(),
+                theme_size: 0,
+            });
+        }
+        None
+    }
+
+    fn ensure_theme(&mut self, name: &str, size: u32, shm: *mut c_void) -> bool {
+        if !self.theme.is_null() && self.theme_name == name && self.theme_size == size {
+            return true;
+        }
+        if !self.theme.is_null() {
+            unsafe { (self.destroy)(self.theme) };
+            self.theme = ptr::null_mut();
+        }
+        let Ok(c_name) = CString::new(name) else {
+            return false;
+        };
+        let theme =
+            unsafe { (self.load)(c_name.as_ptr(), size.min(i32::MAX as u32) as c_int, shm) };
+        if theme.is_null() {
+            return false;
+        }
+        self.theme = theme;
+        self.theme_name = name.to_owned();
+        self.theme_size = size;
+        true
+    }
+
+    fn image(
+        &mut self,
+        theme_name: &str,
+        cursor_name: &str,
+        size: u32,
+        shm: *mut c_void,
+    ) -> Option<(*mut c_void, u32, u32, u32, u32)> {
+        if !self.ensure_theme(theme_name, size, shm) {
+            return None;
+        }
+        let Ok(c_name) = CString::new(cursor_name) else {
+            return None;
+        };
+        let cursor = unsafe { (self.get)(self.theme, c_name.as_ptr()) };
+        if cursor.is_null() {
+            return None;
+        }
+        let cursor = unsafe { &*cursor };
+        if cursor.image_count == 0 || cursor.images.is_null() {
+            return None;
+        }
+        let image = unsafe { *cursor.images };
+        if image.is_null() {
+            return None;
+        }
+        let image = unsafe { &*image };
+        let buffer =
+            unsafe { (self.image_buffer)(image as *const WlCursorImage as *mut WlCursorImage) };
+        if buffer.is_null() {
+            return None;
+        }
+        Some((
+            buffer,
+            image.width,
+            image.height,
+            image.hotspot_x,
+            image.hotspot_y,
+        ))
+    }
+}
+
+impl Drop for WaylandCursorLib {
+    fn drop(&mut self) {
+        if !self.theme.is_null() {
+            unsafe { (self.destroy)(self.theme) };
+            self.theme = ptr::null_mut();
+        }
+        if !self.handle.is_null() {
+            unsafe { dlclose(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
+unsafe extern "C" fn unreachable_cursor_load(
+    _: *const c_char,
+    _: c_int,
+    _: *mut c_void,
+) -> *mut c_void {
+    ptr::null_mut()
+}
+unsafe extern "C" fn unreachable_cursor_destroy(_: *mut c_void) {}
+unsafe extern "C" fn unreachable_cursor_get(_: *mut c_void, _: *const c_char) -> *mut WlCursor {
+    ptr::null_mut()
+}
+unsafe extern "C" fn unreachable_cursor_buffer(_: *mut WlCursorImage) -> *mut c_void {
+    ptr::null_mut()
+}
+
 /// A Wayland top-level window and event loop.
 pub struct WaylandWindow {
     connection: Connection,
@@ -832,6 +1005,8 @@ pub struct WaylandWindow {
     fullscreen: bool,
     maximized: bool,
     pointer_shape: PointerShape,
+    cursor_surface: Option<wl_surface::WlSurface>,
+    cursor_lib: Option<WaylandCursorLib>,
     cursor_scale: f64,
     cursor_theme: crate::cursor::CursorTheme,
     cursor_theme_override: Option<String>,
@@ -943,6 +1118,8 @@ impl WaylandWindow {
             fullscreen: false,
             maximized: false,
             pointer_shape: PointerShape::Default,
+            cursor_surface: None,
+            cursor_lib: None,
             cursor_scale: 1.0,
             cursor_theme: crate::cursor::snapshot(None, None, 1.0, "left_ptr"),
             cursor_theme_override: None,
@@ -1235,8 +1412,78 @@ impl WaylandWindow {
     }
 
     pub fn set_pointer_shape(&mut self, shape: PointerShape) {
-        // Cursor themes require wl_cursor and are outside this backend's scope.
+        if self.pointer_shape == shape {
+            return;
+        }
         self.pointer_shape = shape;
+        self.install_cursor();
+    }
+
+    /// Paint the current themed cursor on a `wl_surface` and hand it to the
+    /// compositor through `wl_pointer.set_cursor`. The compositor owns the
+    /// actual cursor layer, but the client must provide the surface, image and
+    /// hotspot.
+    fn install_cursor(&mut self) {
+        let (Some(pointer), Some(compositor), Some(shm)) = (
+            self.pointer.clone(),
+            self.compositor.clone(),
+            self.shm.clone(),
+        ) else {
+            return;
+        };
+        if self.serial == 0 {
+            return;
+        }
+        let shm_ptr = shm.id().as_ptr().cast();
+        let cursor_name = crate::cursor::shape_name(self.pointer_shape);
+        let theme_name = self.cursor_theme.name.clone();
+        let size = crate::cursor::scaled_size(self.cursor_theme.size, self.cursor_scale);
+        let lib = self.cursor_lib.get_or_insert_with(|| {
+            WaylandCursorLib::new().unwrap_or(WaylandCursorLib {
+                handle: ptr::null_mut(),
+                load: unreachable_cursor_load,
+                destroy: unreachable_cursor_destroy,
+                get: unreachable_cursor_get,
+                image_buffer: unreachable_cursor_buffer,
+                theme: ptr::null_mut(),
+                theme_name: String::new(),
+                theme_size: 0,
+            })
+        });
+        if lib.handle.is_null() {
+            return;
+        }
+        let Some((buffer, width, height, hotspot_x, hotspot_y)) =
+            lib.image(&theme_name, cursor_name, size, shm_ptr)
+        else {
+            return;
+        };
+        let object_id =
+            match unsafe { ObjectId::from_ptr(wl_buffer::WlBuffer::interface(), buffer.cast()) } {
+                Ok(id) => id,
+                Err(_) => return,
+            };
+        let Ok(wl_buffer) = wl_buffer::WlBuffer::from_id(&self.connection, object_id) else {
+            return;
+        };
+        let surface = self
+            .cursor_surface
+            .get_or_insert_with(|| compositor.create_surface(&self.qh, ()))
+            .clone();
+        surface.attach(Some(&wl_buffer), 0, 0);
+        if surface.version() >= 4 {
+            surface.damage_buffer(0, 0, width as i32, height as i32);
+        } else {
+            surface.damage(0, 0, width as i32, height as i32);
+        }
+        surface.set_buffer_scale(1);
+        surface.commit();
+        pointer.set_cursor(
+            self.serial,
+            Some(&surface),
+            hotspot_x.min(i32::MAX as u32) as i32,
+            hotspot_y.min(i32::MAX as u32) as i32,
+        );
     }
 
     pub fn pointer_shape(&self) -> PointerShape {
@@ -1478,6 +1725,10 @@ impl WaylandWindow {
             return false;
         }
         self.cursor_theme = theme;
+        if let Some(lib) = &mut self.cursor_lib {
+            lib.theme_name.clear();
+        }
+        self.install_cursor();
         true
     }
 
@@ -1489,6 +1740,10 @@ impl WaylandWindow {
             self.cursor_scale,
             "left_ptr",
         );
+        if let Some(lib) = &mut self.cursor_lib {
+            lib.theme_name.clear();
+        }
+        self.install_cursor();
         true
     }
 
@@ -2513,6 +2768,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandWindow {
                 state.serial = serial;
                 state.pointer_x = surface_x;
                 state.pointer_y = surface_y;
+                state.install_cursor();
                 state.inbox.push_back(WindowEvent::Enter {
                     x: surface_x,
                     y: surface_y,

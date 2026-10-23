@@ -37,6 +37,7 @@ make uninstall          # remove the installed files
 make screenshot-parity  # best-effort C kitty vs kitr pixel comparison
 make license-check      # SPDX headers, notices, bundled-file manifests
 make validate           # desktop-file-validate + appstreamcli validate
+make package            # stage /usr install, smoke-check metadata, write tarball
 make clean              # cargo clean and generated artifacts
 ```
 
@@ -169,6 +170,25 @@ differences can move pixels even when terminal behaviour matches. The script
 sets `tab_bar_style=hidden`, zero padding, opaque background and no
 decorations for C kitty, but does not attempt to match fonts or scale.
 
+## Distribution artifacts
+
+`make package` builds the workspace, stages a `DESTDIR` install under
+`dist/stage` with `PREFIX=/usr`, checks the installed layout and launcher, runs
+`scripts/package_smoke.py`, and writes
+`dist/kitr-0.1.0-linux-<arch>.tar.gz`.
+
+Distribution metadata skeletons live in:
+
+- `debian/control` — Debian/Ubuntu binary and build dependencies.
+- `rpm/kitr.spec` — Fedora/RHEL/openSUSE RPM spec (`%cargo_build`,
+  `%cargo_test`, `%install` via `make install`).
+- `flatpak/io.github.portlandhodl.kitr.yml` — Flatpak manifest skeleton;
+  generate `flatpak/cargo-sources.json` from `Cargo.lock` before a real build.
+
+The smoke checks are offline and intentionally do not invoke `dpkg-deb`,
+`rpmbuild` or `flatpak-builder`; run those in a distro build environment after
+the staged install passes.
+
 ## License check
 
 `scripts/check_licenses.py` verifies that repository Rust/Python sources and
@@ -188,8 +208,9 @@ unavailable or its rendering may differ.
 
 ## Known packaging gaps
 
-- **No Wayland backend.** Only Linux/X11 is packaged. There is no Wayland
-  desktop file variant or portal integration.
+- **Wayland packaging is minimal.** The Rust backend and desktop entry support
+  Wayland, but there is no portal integration or separate Flatpak finish-arg
+  profile beyond the skeleton.
 - **No macOS/Cocoa app bundle.** Only the Linux ELF binary is covered.
 - **No kittens or remote control in kitr.** `kitten` itself is not packaged
   with kitr; the parity script uses a separately installed C kitty.
@@ -197,7 +218,9 @@ unavailable or its rendering may differ.
   into shell startup by kitr.
 - **No icon artwork.** The desktop entry references the name `kitr`; an icon
   must be supplied by the packager.
-- **No distro packages.** There is no deb/rpm/Flatpak/Snap/Arch packaging or
-  system-wide completion generation here.
+- **Distro packages are skeletons.** deb/rpm/Flatpak metadata and a tarball
+  smoke target exist, but no signed repository packages or generated Flatpak
+  Cargo sources are produced in this checkout. Snap/Arch packaging and
+  system-wide completion generation are absent.
 - **Best-effort parity only.** There is no golden-image suite, font pinning or
   perceptual comparison; thresholds are deliberately conservative defaults.

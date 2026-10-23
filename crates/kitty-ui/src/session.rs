@@ -653,6 +653,13 @@ fn parse_launch_args(
         match name {
             "--cwd" | "--directory" => ans.cwd = Some(take_value(&mut i)?),
             "--title" => ans.title = Some(take_value(&mut i)?),
+            "--location" => {
+                let value = take_value(&mut i)?;
+                if crate::layout::WindowLocation::from_kitty_name(&value).is_none() {
+                    return Err(format!("Invalid launch location: {value}"));
+                }
+                ans.location = Some(value);
+            }
             "--env" => {
                 let v = take_value(&mut i)?;
                 let (k, val) = v
@@ -1170,6 +1177,9 @@ fn window_launch_line(
     if w.launch.background {
         args.push("--type=background".into());
     }
+    if let Some(location) = &w.launch.location {
+        args.push(format!("--location={location}"));
+    }
     for opt in &w.launch.extra_options {
         args.push(opt.clone());
     }
@@ -1213,6 +1223,42 @@ mod tests {
         ];
         let joined = shlex_join(&args);
         assert_eq!(shlex_split(&joined).unwrap(), args);
+    }
+
+    #[test]
+    fn launch_location_is_parsed_and_round_tripped() {
+        let mut session = Session::new(&SessionOptions::default());
+        session.add_tab("splits");
+        session
+            .add_window(
+                "launch --location=vsplit --title right /bin/sh",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            session.tabs[0].windows[0].launch.location.as_deref(),
+            Some("vsplit")
+        );
+        let plan = session.restore_plan();
+        assert_eq!(
+            plan.os_windows[0].tabs[0].windows[0]
+                .launch
+                .location
+                .as_deref(),
+            Some("vsplit")
+        );
+        let empty = parse_raw_session("new_tab t\nlaunch --location=nope /bin/sh");
+        assert!(empty.is_err());
+    }
+
+    fn parse_raw_session(raw: &str) -> Result<Session, SessionError> {
+        parse_session(
+            raw,
+            &SessionOptions::default(),
+            Some(&BTreeMap::new()),
+            "test",
+            "/tmp/test.session",
+        )
     }
 
     #[test]

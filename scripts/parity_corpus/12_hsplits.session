@@ -1,0 +1,4 @@
+new_tab hsplits
+layout splits
+launch --title top /bin/sh -c "printf 'top pane\n'; sleep 30"
+launch --location=hsplit --title bottom /bin/sh -c "printf 'bottom pane\n'; sleep 30"

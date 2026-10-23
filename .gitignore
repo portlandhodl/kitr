@@ -2,3 +2,4 @@
 /build
 /artifacts
 __pycache__/
+/dist

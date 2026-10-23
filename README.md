@@ -31,7 +31,7 @@ it is marked **ported** in [PORTING.md](PORTING.md).
 | `kitty-fonts` | `fonts.c`, `freetype.c`, `fontconfig.c`, `font-names.c`, `shaped-run-cache.c` | FreeType/HarfBuzz/Fontconfig FFI, metrics, fallback, shaping, glyph rasterization and cache |
 | `kitty-graphics` | `graphics.c`, `png-reader.c`, `mime-cache.c`, graphics parser | PNG decode, MIME, base64, graphics command parser and image pipeline; Screen/GPU integration pending |
 | `kitty-remote` | `crypto.c`, `remote_control.py`, `client.py`, `rc/*` | X25519/ECDH, AES-256-GCM, framing, JSON, Unix-socket server + client, command dispatch, file-copy primitives |
-| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | EGL/GL backend: damage, atlas, instances, decorations, images/backgrounds/logo/trail, selection/hyperlink/tab-bar overlays, shaped ligature sprites; full Slang parity pending |
+| `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | EGL/GL backend: real Slang programs generated from `kitty/shaders`, variants/defines/reflection/custom shaders, damage, atlas, instances, decorations, images/backgrounds/logo/trail, overlays, shaped ligature sprites; fixed-cell sprite-array path pending |
 | `kitty-kittens` | `kittens.c`, Python/Go kittens | discovery, launch planning, DCS host, shell handoff; kitten programs/runtime pending |
 | `kitty-ui` | `tabs.py`, `window.py`, `layout/*`, `session.py` | tabs/windows/layout/session model, wired into the GUI |
 | `kitty-window` | GLFW window/event layer | Linux X11 + Wayland: events, XKB keys, XIM/Wayland IME, mouse, XDND drag-and-drop, INCR clipboard, EGL, HiDPI; Cocoa/touch pending |

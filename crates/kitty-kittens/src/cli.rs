@@ -28,11 +28,21 @@ Usage: kitten <command> [options]
 Commands:
   run [OPTIONS] NAME [ARGS...]  Run a kitten
   @ [ARGS...]                   Pass arguments to the remote-control client
-  icat [FILE...]                Display images (Rust-native kitten)
-  clipboard [OPTIONS]           Read/write the clipboard through OSC 52
+  icat [FILE...]                Display images
+  clipboard [OPTIONS]           Text (OSC 52) and file/MIME (OSC 5522) clipboard
   notify [OPTIONS] TITLE        Send a desktop notification (OSC 99/777)
   hints [OPTIONS]               Generate text/URL hints (no overlay UI)
-  unicode_input [OPTIONS]       Search/select Unicode characters (no UI)
+  unicode_input [OPTIONS]       Unicode search, or interactive table with --ui
+  transfer [OPTIONS]            Transfer files over the TTY (OSC 5113)
+  ssh [OPTIONS] HOST            SSH with kitty engine helpers
+  themes [NAME]                 Manage kitty color schemes
+  show-key, query-terminal      Key display / terminal capability queries
+  resize-window, broadcast      Resize pages and text broadcasting
+  ask, choose-files, choose-fonts, command-palette
+  desktop-ui, diff, dnd         Desktop settings, diff viewer, drag and drop
+  hyperlinked-grep, pager       Ripgrep hyperlinks and pager
+  panel, quick-access-terminal  Layer-shell/QAT command construction
+  remote-file                   Remote file helpers
   list                          List installed kittens
   help [NAME]                   Show help for all kittens or one kitten
   manifest [NAME]               Emit manifest JSON for all kittens or one kitten

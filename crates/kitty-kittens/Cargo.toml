@@ -11,6 +11,7 @@ kitty-core = { path = "../kitty-core" }
 kitty-config = { path = "../kitty-config" }
 kitty-remote = { path = "../kitty-remote" }
 kitty-graphics = { path = "../kitty-graphics" }
+kitty-os = { path = "../kitty-os" }
 
 [[bin]]
 name = "kitten"

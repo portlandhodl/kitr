@@ -1,0 +1,21 @@
+{
+  "fragment_inputs": {
+    "0": "color_premul_0"
+  },
+  "input_locations": {
+    "rect": 0,
+    "rect_color": 1
+  },
+  "loose_uniforms": {
+    "background_opacity": "background_opacity_0",
+    "gamma_lut": "gamma_lut_0[0]"
+  },
+  "uniform_struct_names": {
+    "Colors": "block_Colors_0"
+  },
+  "uniform_structs": {
+    "Colors": {
+      "colors": "colors_0[0]"
+    }
+  }
+}

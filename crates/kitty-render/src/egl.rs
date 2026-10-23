@@ -255,15 +255,21 @@ pub const GL_NEAREST: u32 = 0x2600;
 pub const GL_RED: u32 = 0x1903;
 pub const GL_RGBA: u32 = 0x1908;
 pub const GL_R8: u32 = 0x8229;
+pub const GL_R8UI: u32 = 0x8232;
+pub const GL_RG8UI: u32 = 0x8238;
+pub const GL_RED_INTEGER: u32 = 0x8D94;
+pub const GL_RG_INTEGER: u32 = 0x8D98;
 pub const GL_RGBA8: u32 = 0x8058;
 pub const GL_UNSIGNED_BYTE: u32 = 0x1401;
 pub const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 pub const GL_PACK_ALIGNMENT: u32 = 0x0D05;
 
 pub const GL_ARRAY_BUFFER: u32 = 0x8892;
+pub const GL_UNIFORM_BUFFER: u32 = 0x8A11;
 pub const GL_STATIC_DRAW: u32 = 0x88E4;
 pub const GL_DYNAMIC_DRAW: u32 = 0x88E8;
 pub const GL_TRIANGLE_STRIP: u32 = 0x0005;
+pub const GL_TRIANGLE_FAN: u32 = 0x0006;
 pub const GL_FLOAT: u32 = 0x1406;
 pub const GL_FALSE: u8 = 0;
 pub const GL_TRUE: u8 = 1;
@@ -417,8 +423,16 @@ gl_fns! {
     glDeleteProgram: unsafe extern "C" fn(u32) = "glDeleteProgram",
     glGetUniformLocation: unsafe extern "C" fn(u32, *const c_char) -> i32 = "glGetUniformLocation",
     glUniform1i: unsafe extern "C" fn(i32, i32) = "glUniform1i",
+    glUniform1ui: unsafe extern "C" fn(i32, u32) = "glUniform1ui",
     glUniform1f: unsafe extern "C" fn(i32, f32) = "glUniform1f",
+    glUniform1fv: unsafe extern "C" fn(i32, i32, *const f32) = "glUniform1fv",
     glUniform2f: unsafe extern "C" fn(i32, f32, f32) = "glUniform2f",
+    glUniform3f: unsafe extern "C" fn(i32, f32, f32, f32) = "glUniform3f",
+    glUniform4f: unsafe extern "C" fn(i32, f32, f32, f32, f32) = "glUniform4f",
+    glUniform4fv: unsafe extern "C" fn(i32, i32, *const f32) = "glUniform4fv",
+    glBindBufferBase: unsafe extern "C" fn(u32, u32, u32) = "glBindBufferBase",
+    glGetUniformBlockIndex: unsafe extern "C" fn(u32, *const c_char) -> u32 = "glGetUniformBlockIndex",
+    glUniformBlockBinding: unsafe extern "C" fn(u32, u32, u32) = "glUniformBlockBinding",
 }
 
 /// An entry point missing from `eglGetProcAddress`.

@@ -114,6 +114,7 @@ dependencies = [
  "kitty-config",
  "kitty-core",
  "kitty-graphics",
+ "kitty-os",
  "kitty-remote",
 ]
 

@@ -466,6 +466,7 @@ impl GuiSession {
             cursor_hollow_thickness: 1.0,
             undercurl_style: 0,
             emit_default_backgrounds: false,
+            animation_cache_dir: Some(std::env::temp_dir()),
             ..RenderConfig::default()
         };
         let renderer = RendererCore::new(render_config, AtlasConfig::default());
@@ -617,11 +618,27 @@ impl GuiSession {
                 if let Err(error) = tab.set_layout(&tab_restore.layout) {
                     eprintln!("kitr: session: {error}");
                 }
-                for window in restored_windows {
-                    tab.add_window_raw(
+                for (index, window) in restored_windows.into_iter().enumerate() {
+                    if index == 0 {
+                        tab.add_window_raw(
+                            window,
+                            AddWindowOptions {
+                                make_active: true,
+                                ..Default::default()
+                            },
+                        );
+                        continue;
+                    }
+                    let location = window
+                        .launch
+                        .location
+                        .as_deref()
+                        .and_then(WindowLocation::from_kitty_name)
+                        .unwrap_or(WindowLocation::Default);
+                    tab.add_window(
                         window,
-                        AddWindowOptions {
-                            make_active: true,
+                        &LayoutAddOptions {
+                            location,
                             ..Default::default()
                         },
                     );

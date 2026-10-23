@@ -1,0 +1,14 @@
+{
+  "fragment_inputs": {
+    "0": "texcoord_0"
+  },
+  "input_locations": {},
+  "loose_uniforms": {
+    "dest_rect": "dest_rect_0",
+    "image": "image_0",
+    "src_rect": "src_rect_0",
+    "src_size": "src_size_0"
+  },
+  "uniform_struct_names": {},
+  "uniform_structs": {}
+}

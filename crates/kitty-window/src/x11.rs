@@ -1474,6 +1474,14 @@ struct XiPressureAxis {
     max: f64,
 }
 
+/// Whether an XInput2 valuator label names a pressure axis.
+///
+/// libinput exposes this as `Abs MT Pressure`, older drivers use
+/// `Abs Pressure`, and some report just `Pressure`.
+fn is_pressure_axis_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("pressure")
+}
+
 /// Pressure axis lookup for an XInput2 touch device.
 fn xi_pressure_axis(display: *mut Display, deviceid: c_int) -> Option<XiPressureAxis> {
     let mut count = 0;
@@ -1499,7 +1507,7 @@ fn xi_pressure_axis(display: *mut Display, deviceid: c_int) -> Option<XiPressure
             let valuator =
                 unsafe { &*(class as *const XIAnyClassInfo as *const XIValuatorClassInfo) };
             let name = unsafe { atom_name(display, valuator.label) }.unwrap_or_default();
-            if name.eq_ignore_ascii_case("Abs Pressure") || name.eq_ignore_ascii_case("Pressure") {
+            if is_pressure_axis_name(&name) {
                 axis = Some(XiPressureAxis {
                     number: valuator.number,
                     min: valuator.min,
@@ -3238,10 +3246,12 @@ impl X11Window {
                 if unsafe { XGetEventData(self.display, &mut cookie) } != 0 {
                     if cookie.extension == self.xi_opcode && !cookie.data.is_null() {
                         let xi_event = unsafe { &*(cookie.data as *const XIDeviceEvent) };
-                        if let Some(touch) = xi_touch_event(
-                            xi_event,
-                            self.xi_pressure_axes.get(&xi_event.deviceid).copied(),
-                        ) {
+                        let pressure_axis = self
+                            .xi_pressure_axes
+                            .get(&xi_event.deviceid)
+                            .or_else(|| self.xi_pressure_axes.get(&xi_event.sourceid))
+                            .copied();
+                        if let Some(touch) = xi_touch_event(xi_event, pressure_axis) {
                             out.push(touch);
                         }
                     }
@@ -4987,6 +4997,14 @@ mod tests {
             }
             other => panic!("unexpected touch mapping: {other:?}"),
         }
+    }
+
+    #[test]
+    fn pressure_axis_names_cover_libinput_labels() {
+        assert!(is_pressure_axis_name("Abs MT Pressure"));
+        assert!(is_pressure_axis_name("Abs Pressure"));
+        assert!(is_pressure_axis_name("pressure"));
+        assert!(!is_pressure_axis_name("Abs MT Position X"));
     }
 
     #[test]

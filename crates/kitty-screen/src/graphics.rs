@@ -16,14 +16,135 @@
 //! payloads to [`Screen::handle_graphics_escape`]. If you drive a [`Screen`]
 //! directly, call [`Screen::handle_graphics_command`] instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
 use kitty_graphics::{
     parse_escape, Action, DeleteAction, GraphicsCommand, GraphicsError, GraphicsSink, Image,
-    LoadOutcome, Placement,
+    LoadOutcome, Placement, PlacementGraph, PlacementKey, PlacementRecord, SourceRect,
 };
 
 use crate::screen::Screen;
+
+/// One materialised virtual placement cell produced by a `U+10EEEE`
+/// placeholder.
+///
+/// The raw diacritic values are kept (zero when absent) so callers can group
+/// cells into image-space runs using the same continuation rules as kitty.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaterializedPlacement {
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub screen_x: u32,
+    pub screen_y: u32,
+    /// Screen columns covered by this cell, including wide/multicell spans.
+    pub screen_columns: u32,
+    /// Raw row diacritic (`0` when absent).
+    pub image_row: u32,
+    /// Raw column diacritic (`0` when absent).
+    pub image_column: u32,
+    /// Raw high image-id diacritic (`0` when absent).
+    pub image_id_high: u32,
+}
+
+/// Map a combining diacritic to kitty's image row/column number.
+pub fn diacritic_to_num(code: u32) -> u32 {
+    match code {
+        0x305..=0x306 => code - 0x305 + 1,
+        0x30d..=0x30f => code - 0x30d + 2,
+        0x310..=0x311 => code - 0x310 + 4,
+        0x312..=0x313 => code - 0x312 + 5,
+        0x33d..=0x340 => code - 0x33d + 6,
+        0x346..=0x347 => code - 0x346 + 9,
+        0x34a..=0x34d => code - 0x34a + 10,
+        0x350..=0x353 => code - 0x350 + 13,
+        0x357..=0x358 => code - 0x357 + 16,
+        0x35b..=0x35c => code - 0x35b + 17,
+        0x363..=0x370 => code - 0x363 + 18,
+        0x483..=0x488 => code - 0x483 + 31,
+        0x592..=0x596 => code - 0x592 + 36,
+        0x597..=0x59a => code - 0x597 + 40,
+        0x59c..=0x5a2 => code - 0x59c + 43,
+        0x5a8..=0x5aa => code - 0x5a8 + 49,
+        0x5ab..=0x5ad => code - 0x5ab + 51,
+        0x5af..=0x5b0 => code - 0x5af + 53,
+        0x5c4..=0x5c5 => code - 0x5c4 + 54,
+        0x610..=0x618 => code - 0x610 + 55,
+        0x657..=0x65c => code - 0x657 + 63,
+        0x65d..=0x65f => code - 0x65d + 68,
+        0x6d6..=0x6dd => code - 0x6d6 + 70,
+        0x6df..=0x6e3 => code - 0x6df + 77,
+        0x6e4..=0x6e5 => code - 0x6e4 + 81,
+        0x6e7..=0x6e9 => code - 0x6e7 + 82,
+        0x6eb..=0x6ed => code - 0x6eb + 84,
+        0x730..=0x731 => code - 0x730 + 86,
+        0x732..=0x734 => code - 0x732 + 87,
+        0x735..=0x737 => code - 0x735 + 89,
+        0x73a..=0x73b => code - 0x73a + 91,
+        0x73d..=0x73e => code - 0x73d + 92,
+        0x73f..=0x742 => code - 0x73f + 93,
+        0x743..=0x744 => code - 0x743 + 96,
+        0x745..=0x746 => code - 0x745 + 97,
+        0x747..=0x748 => code - 0x747 + 98,
+        0x749..=0x74b => code - 0x749 + 99,
+        0x7eb..=0x7f2 => code - 0x7eb + 101,
+        0x7f3..=0x7f4 => code - 0x7f3 + 108,
+        0x816..=0x81a => code - 0x816 + 109,
+        0x81b..=0x824 => code - 0x81b + 113,
+        0x825..=0x828 => code - 0x825 + 122,
+        0x829..=0x82e => code - 0x829 + 125,
+        0x951..=0x952 => code - 0x951 + 130,
+        0x953..=0x955 => code - 0x953 + 131,
+        0xf82..=0xf84 => code - 0xf82 + 133,
+        0xf86..=0xf88 => code - 0xf86 + 135,
+        0x135d..=0x1360 => code - 0x135d + 137,
+        0x17dd..=0x17de => code - 0x17dd + 140,
+        0x193a..=0x193b => code - 0x193a + 141,
+        0x1a17..=0x1a18 => code - 0x1a17 + 142,
+        0x1a75..=0x1a7d => code - 0x1a75 + 143,
+        0x1b6b..=0x1b6c => code - 0x1b6b + 151,
+        0x1b6d..=0x1b74 => code - 0x1b6d + 152,
+        0x1cd0..=0x1cd3 => code - 0x1cd0 + 159,
+        0x1cda..=0x1cdc => code - 0x1cda + 162,
+        0x1ce0..=0x1ce1 => code - 0x1ce0 + 164,
+        0x1dc0..=0x1dc2 => code - 0x1dc0 + 165,
+        0x1dc3..=0x1dca => code - 0x1dc3 + 167,
+        0x1dcb..=0x1dcd => code - 0x1dcb + 174,
+        0x1dd1..=0x1de7 => code - 0x1dd1 + 176,
+        0x1dfe..=0x1dff => code - 0x1dfe + 198,
+        0x20d0..=0x20d2 => code - 0x20d0 + 199,
+        0x20d4..=0x20d8 => code - 0x20d4 + 201,
+        0x20db..=0x20dd => code - 0x20db + 205,
+        0x20e1..=0x20e2 => code - 0x20e1 + 207,
+        0x20e7..=0x20e8 => code - 0x20e7 + 208,
+        0x20e9..=0x20ea => code - 0x20e9 + 209,
+        0x20f0..=0x20f1 => code - 0x20f0 + 210,
+        0x2cef..=0x2cf2 => code - 0x2cef + 211,
+        0x2de0..=0x2e00 => code - 0x2de0 + 214,
+        0xa66f..=0xa670 => code - 0xa66f + 246,
+        0xa67c..=0xa67e => code - 0xa67c + 247,
+        0xa6f0..=0xa6f2 => code - 0xa6f0 + 249,
+        0xa8e0..=0xa8f2 => code - 0xa8e0 + 251,
+        0xaab0..=0xaab1 => code - 0xaab0 + 269,
+        0xaab2..=0xaab4 => code - 0xaab2 + 270,
+        0xaab7..=0xaab9 => code - 0xaab7 + 272,
+        0xaabe..=0xaac0 => code - 0xaabe + 274,
+        0xaac1..=0xaac2 => code - 0xaac1 + 276,
+        0xfe20..=0xfe27 => code - 0xfe20 + 277,
+        0x10a0f..=0x10a10 => code - 0x10a0f + 284,
+        0x10a38..=0x10a39 => code - 0x10a38 + 285,
+        0x1d185..=0x1d18a => code - 0x1d185 + 286,
+        0x1d1aa..=0x1d1ae => code - 0x1d1aa + 291,
+        0x1d242..=0x1d245 => code - 0x1d242 + 295,
+        _ => 0,
+    }
+}
+
+/// Extract the low 24 image-id bits from a packed cell colour.
+#[inline]
+pub fn color_to_image_id(color: u32) -> u32 {
+    (color >> 8) & 0x00ff_ffff
+}
 
 /// A stored placement. The image itself lives in [`Screen::images`].
 #[derive(Clone, Debug, PartialEq)]
@@ -153,21 +274,128 @@ impl Screen {
             .unwrap_or(false)
     }
 
-    fn remove_placements(&mut self, predicate: impl Fn(&ImagePlacement) -> bool) {
-        self.placements.retain(|p| !predicate(p));
+    /// Materialise every `U+10EEEE` placeholder cell currently on screen.
+    ///
+    /// Virtual placements are stored once, but the protocol resolves them per
+    /// placeholder cell. This exposes those cells (including their raw
+    /// diacritics) so the renderer can group them into image-space runs and so
+    /// the placement graph can anchor a virtual placement at the top-left
+    /// placeholder cell.
+    pub fn materialize_virtual_placements(&self) -> Vec<MaterializedPlacement> {
+        let mut cells = Vec::new();
+        let tc = self.text_cache().borrow();
+        for y in 0..self.lines {
+            for x in 0..self.columns {
+                let cpu = self.cpu_cell(x, y);
+                let mut single = [0u32; 1];
+                let text: &[u32] = if cpu.ch_is_idx() {
+                    tc.chars_at(cpu.ch())
+                } else if cpu.ch() != 0 {
+                    single[0] = cpu.ch();
+                    &single[..1]
+                } else {
+                    &[]
+                };
+                if text.first().copied() != Some(IMAGE_PLACEHOLDER_CHAR) {
+                    continue;
+                }
+                let gpu = self.gpu_cell(x, y);
+                let lower = color_to_image_id(gpu.fg);
+                let placement_id = color_to_image_id(gpu.decoration_fg);
+                let image_row = text
+                    .get(1)
+                    .copied()
+                    .filter(|code| *code != 0)
+                    .map_or(0, diacritic_to_num);
+                let image_column = text
+                    .get(2)
+                    .copied()
+                    .filter(|code| *code != 0)
+                    .map_or(0, diacritic_to_num);
+                let image_id_high = text
+                    .get(3)
+                    .copied()
+                    .filter(|code| *code != 0)
+                    .map_or(0, diacritic_to_num);
+                let screen_columns = if cpu.is_multicell() && cpu.width() > 0 {
+                    cpu.mcd_x_limit().max(1).min(self.columns - x)
+                } else {
+                    1
+                };
+                cells.push(MaterializedPlacement {
+                    image_id: lower | (image_id_high.saturating_sub(1) << 24),
+                    placement_id,
+                    screen_x: x,
+                    screen_y: y,
+                    screen_columns,
+                    image_row,
+                    image_column,
+                    image_id_high,
+                });
+            }
+        }
+        cells
     }
 
-    fn remove_images(&mut self, predicate: impl Fn(&Image) -> bool) {
-        let removed: Vec<u32> = self
-            .images
-            .iter()
-            .filter(|(_, img)| predicate(img))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in removed {
-            self.images.remove(&id);
-            self.placements.retain(|p| p.image_id != id);
+    /// Build a validated relative-placement graph for the current screen.
+    ///
+    /// Virtual placements are anchored at the minimum placeholder cell that
+    /// refers to them, matching `resolve_cell_ref()` in `kitty/graphics.c`.
+    pub fn placement_graph(&self) -> PlacementGraph {
+        let cells = self.materialize_virtual_placements();
+        let mut graph = PlacementGraph::new();
+        for placement in &self.placements {
+            let p = &placement.placement;
+            let mut record = PlacementRecord::new(
+                PlacementKey::new(placement.image_id, placement.placement_id),
+                placement.anchor_x,
+                placement.anchor_y,
+            )
+            .with_parent(p.parent_id, p.parent_placement_id)
+            .with_offset(p.offset_from_parent_x, p.offset_from_parent_y)
+            .with_source(SourceRect::new(p.x_offset, p.y_offset, p.width, p.height))
+            .with_z_index(p.z_index)
+            .inheriting(p.parent_id != 0 && p.z_index == 0, p.parent_id != 0);
+            if p.unicode_placement {
+                record = record.as_virtual();
+            }
+            let key = record.key;
+            if graph.insert(record).is_err() {
+                continue;
+            }
+            if p.unicode_placement {
+                let anchor = cells
+                    .iter()
+                    .filter(|cell| {
+                        cell.image_id == key.image_id
+                            && (key.placement_id == 0 || cell.placement_id == key.placement_id)
+                    })
+                    .map(|cell| (cell.screen_x, cell.screen_y))
+                    .min();
+                if let Some((x, y)) = anchor {
+                    graph.set_anchor(key, x, y);
+                }
+            }
         }
+        graph
+    }
+
+    fn remove_keys_with_descendants(
+        &mut self,
+        graph: &mut PlacementGraph,
+        keys: impl IntoIterator<Item = PlacementKey>,
+    ) {
+        let mut removed = HashSet::new();
+        for key in keys {
+            for key in graph.remove_cascade(key) {
+                removed.insert(key);
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+        self.placements
+            .retain(|p| !removed.contains(&PlacementKey::new(p.image_id, p.placement_id)));
     }
 }
 
@@ -211,6 +439,44 @@ impl GraphicsSink for Screen {
             anchor_x: placement_anchor_x,
             anchor_y: placement_anchor_y,
         };
+
+        // Validate the full parent chain before mutating screen state. The
+        // graph is rebuilt from the stored placements so it also sees anchors
+        // that were materialised from Unicode placeholder cells.
+        let mut graph = self.placement_graph();
+        let record = PlacementRecord::new(
+            PlacementKey::new(entry.image_id, entry.placement_id),
+            entry.anchor_x,
+            entry.anchor_y,
+        )
+        .with_parent(
+            entry.placement.parent_id,
+            entry.placement.parent_placement_id,
+        )
+        .with_offset(
+            entry.placement.offset_from_parent_x,
+            entry.placement.offset_from_parent_y,
+        )
+        .with_source(SourceRect::new(
+            entry.placement.x_offset,
+            entry.placement.y_offset,
+            entry.placement.width,
+            entry.placement.height,
+        ))
+        .with_z_index(entry.placement.z_index)
+        .inheriting(
+            entry.placement.parent_id != 0 && entry.placement.z_index == 0,
+            entry.placement.parent_id != 0,
+        );
+        let record = if entry.placement.unicode_placement {
+            record.as_virtual()
+        } else {
+            record
+        };
+        let key = record.key;
+        graph.insert(record)?;
+        graph.validate(key)?;
+
         if let Some(existing) = self
             .placements
             .iter_mut()
@@ -236,6 +502,21 @@ impl GraphicsSink for Screen {
 
     fn on_delete(&mut self, command: &GraphicsCommand) -> Result<(), GraphicsError> {
         let action = command.delete_action.unwrap_or(DeleteAction::All);
+        let mut graph = self.placement_graph();
+        let keys = |placement: &ImagePlacement| {
+            PlacementKey::new(placement.image_id, placement.placement_id)
+        };
+        let point = (
+            i64::from(command.x_offset.saturating_sub(1)),
+            i64::from(command.y_offset.saturating_sub(1)),
+        );
+        let contains = |placement: &ImagePlacement, x: i64, y: i64| {
+            let px = i64::from(placement.anchor_x);
+            let py = i64::from(placement.anchor_y);
+            let cols = i64::from(placement.placement.num_cols.max(1));
+            let rows = i64::from(placement.placement.num_rows.max(1));
+            px <= x && x < px + cols && py <= y && y < py + rows
+        };
         match action {
             DeleteAction::All => {
                 self.images.clear();
@@ -244,38 +525,118 @@ impl GraphicsSink for Screen {
             }
             DeleteAction::AllButId => {
                 if command.id != 0 {
-                    self.placements.retain(|p| p.image_id == command.id);
+                    let victims: Vec<PlacementKey> = self
+                        .placements
+                        .iter()
+                        .filter(|p| p.image_id != command.id)
+                        .map(keys)
+                        .collect();
+                    self.remove_keys_with_descendants(&mut graph, victims);
                     self.images.retain(|id, _| *id == command.id);
                 }
             }
             DeleteAction::ById | DeleteAction::ByIdNoRefs => {
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| p.image_id == command.id)
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
                 self.images.remove(&command.id);
-                self.placements.retain(|p| p.image_id != command.id);
             }
             DeleteAction::ByNumber | DeleteAction::ByNumberNoRefs => {
-                self.remove_images(|img| img.number == command.image_number);
+                let image_ids: Vec<u32> = self
+                    .images
+                    .iter()
+                    .filter(|(_, img)| img.number == command.image_number)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| image_ids.contains(&p.image_id))
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
+                for id in image_ids {
+                    self.images.remove(&id);
+                }
             }
             DeleteAction::PlacementId => {
                 let pid = command.placement_id;
                 let iid = command.id;
-                self.remove_placements(|p| {
-                    p.placement_id == pid && (iid == 0 || p.image_id == iid)
-                });
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| p.placement_id == pid && (iid == 0 || p.image_id == iid))
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
             }
-            DeleteAction::AtCursor | DeleteAction::AtCursorPoint => {
+            DeleteAction::AtCursor => {
                 let (x, y) = (self.cursor.x, self.cursor.y);
-                self.remove_placements(|p| p.anchor_x == x && p.anchor_y == y);
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| p.anchor_x == x && p.anchor_y == y)
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
             }
-            DeleteAction::AtCell | DeleteAction::AtPoint | DeleteAction::AtPoint3d => {
-                self.remove_placements(|_| true);
+            DeleteAction::AtCursorPoint => {
+                let (x, y) = (i64::from(self.cursor.x), i64::from(self.cursor.y));
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| contains(p, x, y))
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
+            }
+            DeleteAction::AtPoint => {
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| contains(p, point.0, point.1))
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
+            }
+            DeleteAction::AtPoint3d => {
+                let z = command.z_index;
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| p.placement.z_index == z && contains(p, point.0, point.1))
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
+            }
+            DeleteAction::AtCell => {
+                let (x, y) = (self.cursor.x, self.cursor.y);
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| p.anchor_x == x && p.anchor_y == y)
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
             }
             DeleteAction::ZIndex | DeleteAction::ZIndexUpper => {
                 let z = command.z_index;
-                self.remove_placements(|p| p.placement.z_index == z);
+                let victims: Vec<PlacementKey> = self
+                    .placements
+                    .iter()
+                    .filter(|p| p.placement.z_index == z)
+                    .map(keys)
+                    .collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
             }
             _ => {
                 // Animation/cell-range variants are not executed by the loader.
-                self.remove_placements(|_| true);
+                let victims: Vec<PlacementKey> = self.placements.iter().map(keys).collect();
+                self.remove_keys_with_descendants(&mut graph, victims);
             }
         }
         Ok(())
@@ -373,7 +734,58 @@ mod tests {
 #[cfg(test)]
 mod more_tests {
     use super::*;
+    use kitty_core::cell::IMAGE_PLACEHOLDER_CHAR;
     use kitty_graphics::parse_raw;
+
+    fn put(screen: &mut Screen, command: &'static [u8]) -> Result<(), GraphicsError> {
+        let mut command = parse_raw(command).unwrap();
+        command.payload.clear();
+        screen.handle_graphics_command(command).map(|_| ())
+    }
+
+    fn transmit(screen: &mut Screen, id: u32) {
+        let mut command = parse_raw(format!("a=t,f=32,s=1,v=1,i={id}").as_bytes()).unwrap();
+        command.payload = vec![1, 2, 3, 255];
+        screen.handle_graphics_command(command).unwrap();
+    }
+
+    #[test]
+    fn relative_parent_chains_are_validated_and_deleted_as_a_cascade() {
+        let mut screen = Screen::builder(8, 4).scrollback(4).build().unwrap();
+        transmit(&mut screen, 1);
+        transmit(&mut screen, 2);
+        put(&mut screen, b"a=p,i=1,p=1,c=1,r=1,C=1").unwrap();
+        put(&mut screen, b"a=p,i=2,p=1,P=1,Q=1,c=1,r=1,C=1").unwrap();
+        assert_eq!(screen.placements().len(), 2);
+        assert!(screen
+            .placement_graph()
+            .validate(PlacementKey::new(2, 1))
+            .is_ok());
+
+        assert!(put(&mut screen, b"a=p,i=2,p=1,P=2,Q=1,c=1,r=1,C=1").is_err());
+        assert!(put(&mut screen, b"a=p,i=1,p=1,P=1,Q=1,c=1,r=1,C=1").is_err());
+        assert!(put(&mut screen, b"a=p,i=2,p=2,P=99,Q=1,c=1,r=1,C=1").is_err());
+
+        put(&mut screen, b"a=d,d=p,i=1,p=1").unwrap();
+        assert!(screen.placement(1, 1).is_none());
+        assert!(screen.placement(2, 1).is_none(), "child must be cascaded");
+    }
+
+    #[test]
+    fn virtual_placements_materialise_one_entry_per_placeholder_cell() {
+        let mut screen = Screen::builder(8, 4).scrollback(4).build().unwrap();
+        transmit(&mut screen, 7);
+        put(&mut screen, b"a=p,i=7,p=3,U=1,c=2,r=1,C=1").unwrap();
+        screen.cursor.sgr.fg = (7 << 8) | 2;
+        screen.draw_text(&[IMAGE_PLACEHOLDER_CHAR]);
+        screen.draw_text(&[IMAGE_PLACEHOLDER_CHAR]);
+        let cells = screen.materialize_virtual_placements();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].screen_x, 0);
+        assert_eq!(cells[1].screen_x, 1);
+        assert_eq!(cells[0].screen_y, 0);
+        assert!(cells.iter().all(|cell| cell.image_id == 7));
+    }
 
     #[test]
     fn unsupported_actions_are_recorded() {

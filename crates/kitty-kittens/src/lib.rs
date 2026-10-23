@@ -19,29 +19,52 @@
 //!   `--shell-integration` install snippets.
 //! * [`cli`]: the `kitten run/list/help/manifest/shell-integration` command
 //!   parser, `run --detach`/stdio options and the `kitten @` passthrough hook.
+//! * [`tui`]: dependency-free ANSI UI primitives, key parsing, list/fuzzy
+//!   helpers and the [`tui::FakeTty`] test backend.
 //! * [`icat`]: the Rust-native image kitten (`a=T,f=100`, RGB/RGBA, chunking,
 //!   placement, scaling, clear and stdin).
-//! * [`clipboard`]: OSC 52 get/set/clear with chunking and reply timeouts.
+//! * [`clipboard`] and [`clipboard_mime`]: OSC 52 text plus OSC 5522 file/MIME
+//!   reads and writes, aliases and MIME selection.
 //! * [`notify`]: chunked OSC 99 notifications, OSC 777/plain fallbacks and the
-//!   `--wait` reply state machine.
+//!   `--wait` reply state machine (the desktop notification service protocol).
 //! * [`hints`]: URL/path/line/word/regex/hyperlink matching, hint labels and
 //!   launch-plan construction (no overlay).
-//! * [`unicode_input`]: Unicode name search, favorites/history models and key
-//!   handling (no full-screen UI).
+//! * [`unicode_input`] and [`unicode_input_ui`]: the Unicode search model and
+//!   an interactive ANSI table overlay.
+//! * [`transfer`]: OSC 5113 file transfer, both directions, metadata,
+//!   symlinks/hardlinks, chunking, zlib compression and permission bypass.
+//! * [`ssh`]: ssh.conf host blocks, copy/env directives, ssh argument and
+//!   connection parsing, bootstrap environment serialization, askpass and TOTP.
+//! * [`themes`]: theme metadata/settings, local collections, search, config
+//!   updates, OSC color escapes and a family picker.
+//! * [`show_key`], [`query_terminal`] and [`resize_window`]: key display in
+//!   legacy/kitty modes, DCS capability queries, and resize settings/commands.
+//! * [`broadcast`], [`ask`], [`choose_files`], [`choose_fonts`] and
+//!   [`command_palette`]: interactive engines and ANSI UIs.
+//! * [`desktop_ui`]: appearance settings and xdg-desktop-portal installation
+//!   data (the live D-Bus service is not included).
+//! * [`diff`] and [`pager`]: anchored diff/patch parsing, side-by-side text,
+//!   search/scroll UI and a follow-capable input reader.
+//! * [`dnd`]: OSC 72 drag/drop framing, URI/data-URI parsing and local copy.
+//! * [`hyperlinked_grep`], [`panel`], [`quick_access_terminal`] and
+//!   [`remote_file`]: ripgrep hyperlinks, layer-shell configuration/command
+//!   construction, QAT command construction and remote-file helpers.
 //! * [`remote`]: the `kitten @` client built on [`kitty_remote::Client`].
 //! * [`env`]: shared `KITTY_WINDOW_ID`/`KITTY_LISTEN_ON`/`KITTY_PUBLIC_KEY`
 //!   and `KITTY_KITTEN_*` environment parsing.
 //!
-//! # Explicit non-goals
+//! # Explicit non-goals / limitations
 //!
 //! * No Python runtime is embedded. Python kittens are launched with an
 //!   external interpreter (or directly through their shebang).
+//! * The rsync delta algorithm, image/video previews, syntax highlighting and
+//!   D-Bus portal service are not ported. The transfer engine uses the simple
+//!   stream protocol; the desktop-ui settings/installer still work.
+//! * Theme ZIP cache downloads and the upstream theme repository are left to
+//!   the caller; local `.conf` theme directories are supported.
 //! * No remote-control socket server is started. `kitten @` arguments are
 //!   returned verbatim by [`cli`]; [`remote`] connects to an existing kitty
-//!   socket. The controlling-terminal fallback is not implemented.
-//! * Shell integration does not inject code into a running shell; it only
-//!   computes the handoff environment, serialized environment commands and
-//!   install snippets.
+//!   socket.
 //!
 //! # Example
 //!
@@ -57,23 +80,45 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod ask;
+pub mod broadcast;
+pub mod choose_files;
+pub mod choose_fonts;
 pub mod cli;
 pub mod clipboard;
+pub mod clipboard_mime;
+pub mod command_palette;
+pub mod desktop_ui;
+pub mod diff;
 pub mod discovery;
+pub mod dnd;
 pub mod env;
 pub mod error;
 pub mod hints;
+pub mod hyperlinked_grep;
 pub mod icat;
 pub mod launch;
 pub mod manifest;
 pub mod native;
 pub mod notify;
+pub mod pager;
+pub mod panel;
 pub mod protocol;
+pub mod query_terminal;
+pub mod quick_access_terminal;
 mod regex_lite;
 pub mod remote;
+pub mod remote_file;
+pub mod resize_window;
 pub mod shell_integration;
+pub mod show_key;
+pub mod ssh;
 pub mod terminal;
+pub mod themes;
+pub mod transfer;
+pub mod tui;
 pub mod unicode_input;
+pub mod unicode_input_ui;
 mod unicode_table;
 
 pub use cli::{
