@@ -35,6 +35,12 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.1" date="2026-10-22">
+      <description>
+        <p>Fixes Debian runtime dependencies, bundles application icons and
+        accepts squashed font family names.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-22">
       <description>
         <p>Initial packaging skeleton for the early Linux/X11 port.</p>

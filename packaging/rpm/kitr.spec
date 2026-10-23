@@ -3,7 +3,7 @@
 %global _hardened_build 1
 
 Name:           kitr
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Fast GPU-accelerated terminal emulator (kitty-compatible Rust port)
 License:        GPL-3.0-or-later
@@ -64,5 +64,8 @@ cargo test --workspace --lib
 %{_mandir}/man1/kitr.1*
 
 %changelog
+* Thu Oct 22 2026 kitr contributors <maintainers@portlandhodl.example> - 0.1.1-1
+- Fix Debian dependencies and bundle the application icon
+
 * Thu Oct 22 2026 kitr contributors <maintainers@portlandhodl.example> - 0.1.0-1
 - Initial distribution package skeleton.

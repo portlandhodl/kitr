@@ -112,6 +112,24 @@ impl FontSet {
             dpi,
         )
         .ok();
+        let symbol_map: Vec<(u32, u32, String)> = options
+            .symbol_map
+            .iter()
+            .map(|entry| (entry.start, entry.end, entry.family.clone()))
+            .collect();
+        if !symbol_map.is_empty() {
+            for stack in [
+                Some(&mut fonts.regular),
+                fonts.bold.as_mut(),
+                fonts.italic.as_mut(),
+                fonts.bold_italic.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stack.set_symbol_map(symbol_map.clone());
+            }
+        }
         Ok(fonts)
     }
 

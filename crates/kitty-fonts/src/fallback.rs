@@ -49,6 +49,14 @@ pub struct FontStack {
     style: FontStyle,
     prefer_color: bool,
     failed_codepoints: HashSet<u32>,
+    symbol_map: Vec<SymbolMapEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SymbolMapEntry {
+    start: u32,
+    end: u32,
+    family: String,
 }
 
 impl FontStack {
@@ -60,6 +68,7 @@ impl FontStack {
             style: FontStyle::Regular,
             prefer_color: false,
             failed_codepoints: HashSet::new(),
+            symbol_map: Vec::new(),
         }
     }
 
@@ -68,6 +77,17 @@ impl FontStack {
         let fc = Fontconfig::new()?;
         let matched = match_spec(&fc, spec, style, size_pts, dpi)?
             .ok_or(Error::Fontconfig("no font matched the specification"))?;
+        let explicit_bold_or_italic = !spec.is_auto();
+        if let Some(requested) = spec.primary_family() {
+            if (style == FontStyle::Regular || explicit_bold_or_italic)
+                && !family_matches(requested, &matched)
+            {
+                eprintln!(
+                    "kitr: configured font family {requested:?} did not match; using {:?}",
+                    matched.family.as_deref().unwrap_or("<unknown>")
+                );
+            }
+        }
         let face = matched.load(size_pts, dpi, dpi)?;
         Ok(Self {
             faces: vec![face],
@@ -75,6 +95,7 @@ impl FontStack {
             style,
             prefer_color: false,
             failed_codepoints: HashSet::new(),
+            symbol_map: Vec::new(),
         })
     }
 
@@ -106,6 +127,38 @@ impl FontStack {
         self
     }
 
+    /// Install kitty's `symbol_map`: codepoint ranges that must be served by a
+    /// named family instead of the normal Fontconfig fallback. Later entries
+    /// override earlier ones, matching kitty's map merge order.
+    pub fn set_symbol_map<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = (u32, u32, String)>,
+    {
+        self.symbol_map = entries
+            .into_iter()
+            .filter(|(start, end, family)| start <= end && !family.is_empty())
+            .map(|(start, end, family)| SymbolMapEntry { start, end, family })
+            .collect();
+    }
+
+    fn symbol_family_for(&self, codepoints: &[u32]) -> Option<String> {
+        let first = *codepoints.first()?;
+        self.symbol_map
+            .iter()
+            .rfind(|entry| entry.start <= first && first <= entry.end)
+            .map(|entry| entry.family.clone())
+    }
+
+    fn face_for_symbol(&mut self, family: &str, codepoints: &[u32]) -> Result<Option<usize>> {
+        let Some(fc) = self.fontconfig else {
+            return Ok(None);
+        };
+        let Some(matched) = fc.match_family(family, self.style)? else {
+            return Ok(None);
+        };
+        self.consider_fallback(&matched, codepoints)
+    }
+
     pub fn faces(&self) -> &[Face] {
         &self.faces
     }
@@ -133,6 +186,11 @@ impl FontStack {
     /// Index of the first face containing `codepoint`, loading a Fontconfig
     /// fallback if necessary.
     pub fn face_index_for_char(&mut self, codepoint: u32) -> Result<Option<usize>> {
+        if let Some(family) = self.symbol_family_for(&[codepoint]) {
+            if let Some(idx) = self.face_for_symbol(&family, &[codepoint])? {
+                return Ok(Some(idx));
+            }
+        }
         if let Some(idx) = self.faces.iter().position(|f| f.has_codepoint(codepoint)) {
             return Ok(Some(idx));
         }
@@ -154,6 +212,11 @@ impl FontStack {
 
     /// Index of a face containing every codepoint in `codepoints`.
     pub fn face_index_for_chars(&mut self, codepoints: &[u32]) -> Result<Option<usize>> {
+        if let Some(family) = self.symbol_family_for(codepoints) {
+            if let Some(idx) = self.face_for_symbol(&family, codepoints)? {
+                return Ok(Some(idx));
+            }
+        }
         if let Some(idx) = self
             .faces
             .iter()
@@ -291,11 +354,26 @@ impl FontStack {
     }
 }
 
+fn family_key(family: &str) -> String {
+    family
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn family_matches(requested: &str, matched: &MatchedFace) -> bool {
-    let requested = requested.trim().to_lowercase();
+    let requested = family_key(requested);
     let generic = matches!(
         requested.as_str(),
-        "monospace" | "sans-serif" | "serif" | "cursive" | "fantasy" | "system-ui" | "emoji"
+        "monospace"
+            | "sansserif"
+            | "serif"
+            | "cursive"
+            | "fantasy"
+            | "systemui"
+            | "emoji"
+            | "symbols"
     );
     if generic {
         return true;
@@ -304,7 +382,7 @@ fn family_matches(requested: &str, matched: &MatchedFace) -> bool {
         .family
         .as_deref()
         .map(|family| {
-            let family = family.to_lowercase();
+            let family = family_key(family);
             family == requested || family.contains(&requested) || requested.contains(&family)
         })
         .unwrap_or(false)
@@ -345,4 +423,36 @@ fn match_spec(
         }
     }
     Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn squashed_and_spaced_family_names_match() {
+        let matched = MatchedFace {
+            family: Some("JetBrainsMono Nerd Font".into()),
+            ..MatchedFace::default()
+        };
+        assert!(family_matches("JetBrainsMonoNerdFont", &matched));
+        assert!(family_matches("jetbrainsmononerdfont", &matched));
+        assert!(family_matches("JetBrainsMono Nerd Font", &matched));
+        assert!(!family_matches("Some Other Font", &matched));
+    }
+
+    #[test]
+    fn symbol_map_uses_the_last_matching_range() {
+        let mut stack = FontStack::new(Vec::new());
+        stack.set_symbol_map([
+            (0xE000, 0xE0FF, "First".to_string()),
+            (0xE0A0, 0xE0A3, "Second".to_string()),
+        ]);
+        assert_eq!(
+            stack.symbol_family_for(&[0xE0A1]).as_deref(),
+            Some("Second")
+        );
+        assert_eq!(stack.symbol_family_for(&[0xE050]).as_deref(), Some("First"));
+        assert_eq!(stack.symbol_family_for(&[0x41]), None);
+    }
 }

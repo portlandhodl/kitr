@@ -66,8 +66,8 @@ pub use color::Color;
 pub use config::{BadLine, Config, ConfigError};
 pub use options::{
     clamp_font_size, parse_dimension, CursorBlinkInterval, CursorShape, EasingFunction, Edges,
-    FontSpec, JumpType, Modifiers, Options, TabBarAlign, TabBarEdge, TabBarStyle, TabFontStyle,
-    TabPowerlineStyle, DELETE_ENV_VAR, MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE,
+    FontSpec, JumpType, Modifiers, Options, SymbolMap, TabBarAlign, TabBarEdge, TabBarStyle,
+    TabFontStyle, TabPowerlineStyle, DELETE_ENV_VAR, MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE,
 };
 pub use shlex::{Shlex, ShlexError};
 

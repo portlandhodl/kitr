@@ -10,7 +10,7 @@ C kitty 0.49.2 was built from this tree without changing its C sources:
 scripts/build_c_kitty.sh            # debug build, conda py312 + pinned slangc
 cargo build --release -p kitty      # kitr release binary
 kitty/launcher/kitty --version      # kitty 0.49.2 created by Kovid Goyal
-rust/target/release/kitr --version  # kitr 0.1.0
+rust/target/release/kitr --version  # kitr 0.1.1
 ```
 
 The build script reported success and the normal test invocation is the one
@@ -23,7 +23,7 @@ and Symbols Nerd Font Mono v3.4.0.
 
 ### Method and caveats
 
-- Reference: C kitty 0.49.2 (debug build). Candidate: kitr 0.1.0 (release build).
+- Reference: C kitty 0.49.2 (debug build). Candidate: kitr 0.1.1 (release build).
 - Both run under Xvfb at 1280x800x24, 80x24 cells, DejaVu Sans Mono 12pt at
   96dpi, block cursor with blinking disabled, zero window padding. The tab bar
   is hidden except in `10_tabs`.

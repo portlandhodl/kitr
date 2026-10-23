@@ -30,6 +30,8 @@ def check_stage(stage: Path) -> None:
         "usr/share/terminfo/x/xterm-kitty",
         "usr/share/terminfo/78/xterm-kitty",
         "usr/share/applications/kitr.desktop",
+        "usr/share/icons/hicolor/256x256/apps/kitr.png",
+        "usr/share/icons/hicolor/scalable/apps/kitr.svg",
         "usr/share/metainfo/io.github.portlandhodl.kitr.metainfo.xml",
         "usr/share/man/man1/kitr.1",
     ]

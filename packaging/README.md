@@ -130,10 +130,10 @@ experimentation, not as a claim of full shell-integration support.
 ## Desktop metadata and man page
 
 - `desktop/kitr.desktop` references `Icon=kitr`.
-- `icons/README.md` documents the expected icon paths. No artwork is bundled;
-  `make install` installs `icons/kitr.png`/`kitr.svg` only if you provide them.
+- `icons/` contains original SVG artwork and rendered hicolor PNGs;
+  `make install` installs every available size plus the scalable SVG.
 - `metainfo/io.github.portlandhodl.kitr.metainfo.xml` is an AppStream skeleton.
-  The release is a packaging placeholder for version 0.1.0.
+  The release is a packaging placeholder for version 0.1.1.
 - `man/kitr.1` documents the current CLI: `--headless`, `--gui`, `--config`,
   `--size`, `--screenshot`, `--timeout`, `-e`/`--`, plus the currently
   implemented `--dump-screen`, `--scrollback`, `--title`, `-c`, `-h`, `-V`.
@@ -175,7 +175,7 @@ decorations for C kitty, but does not attempt to match fonts or scale.
 `make package` builds the workspace, stages a `DESTDIR` install under
 `dist/stage` with `PREFIX=/usr`, checks the installed layout and launcher, runs
 `scripts/package_smoke.py`, and writes
-`dist/kitr-0.1.0-linux-<arch>.tar.gz`.
+`dist/kitr-0.1.1-linux-<arch>.tar.gz`.
 
 Distribution metadata skeletons live in:
 
@@ -225,8 +225,6 @@ build; its report and artifacts are always uploaded.
   C kitty reference.
 - **No automatic shell-integration injection.** Scripts are shipped, not wired
   into shell startup by kitr.
-- **No icon artwork.** The desktop entry references the name `kitr`; an icon
-  must be supplied by the packager.
 - **Packages are unsigned.** deb, RPM and Flatpak artifacts are built in CI,
   but there is no repository signing/key management. Snap/Arch packaging and
   system-wide completion generation are absent.

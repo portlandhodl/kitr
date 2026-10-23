@@ -1,3 +1,11 @@
+kitr (0.1.1-1) unstable; urgency=medium
+
+  * Fix runtime dependencies for current distributions.
+  * Bundle hicolor application icons.
+  * Accept squashed font family names and honour symbol_map.
+
+ -- kitr contributors <maintainers@portlandhodl.example>  Thu, 22 Oct 2026 22:10:00 +0000
+
 kitr (0.1.0-1) unstable; urgency=medium
 
   * Initial release.

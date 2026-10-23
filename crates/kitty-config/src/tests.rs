@@ -655,6 +655,20 @@ fn tab_bar_edge_choices_and_errors() {
 }
 
 #[test]
+fn symbol_map_parses_ranges_and_families() {
+    let options = cfg(&["symbol_map U+E0A0-U+E0A3,U+E0B0 JetBrainsMono Nerd Font"]).options;
+    assert_eq!(options.symbol_map.len(), 2);
+    assert_eq!(options.symbol_map[0].start, 0xE0A0);
+    assert_eq!(options.symbol_map[0].end, 0xE0A3);
+    assert_eq!(options.symbol_map[0].family, "JetBrainsMono Nerd Font");
+    assert!(options.symbol_map[0].contains(0xE0A1));
+    assert!(!options.symbol_map[0].contains(0xE0A4));
+    assert_eq!(cfg_err(&["symbol_map U+E0A0"]).len(), 1);
+    assert_eq!(cfg_err(&["symbol_map nope Font"]).len(), 1);
+    assert_eq!(cfg_err(&["symbol_map U+E0A4-U+E0A0 Font"]).len(), 1);
+}
+
+#[test]
 fn text_composition_strategy_matches_kitty() {
     let options = cfg(&[]).options;
     assert_eq!(options.text_composition_strategy, "platform");

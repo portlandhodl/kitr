@@ -692,6 +692,54 @@ pub fn to_layout_names(raw: &str) -> Result<Vec<String>, String> {
     Ok(ans)
 }
 
+/// One `symbol_map` rule: a codepoint range served by a named family.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SymbolMap {
+    pub start: u32,
+    pub end: u32,
+    pub family: String,
+}
+
+impl SymbolMap {
+    pub fn contains(&self, codepoint: u32) -> bool {
+        self.start <= codepoint && codepoint <= self.end
+    }
+}
+
+fn parse_symbol_map(value: &str) -> Result<Vec<SymbolMap>, String> {
+    let (ranges, family) = value
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| "symbol_map must have codepoints AND font name".to_string())?;
+    let family = family.trim();
+    if family.is_empty() {
+        return Err("symbol_map must have codepoints AND font name".into());
+    }
+    let mut ans = Vec::new();
+    for item in ranges.split(',') {
+        let item = item.replace('\u{2013}', "-");
+        let (start, end) = item.split_once('-').unwrap_or((&item, &item));
+        let parse = |text: &str| -> Result<u32, String> {
+            let raw = text
+                .strip_prefix("U+")
+                .or_else(|| text.strip_prefix("u+"))
+                .ok_or_else(|| format!("{text} is not a unicode codepoint of the form U+number"))?;
+            u32::from_str_radix(raw, 16)
+                .map_err(|_| format!("{text} is not a unicode codepoint of the form U+number"))
+        };
+        let start = parse(start)?;
+        let end = parse(end)?;
+        if end < start || end > 0x10FFFF || start < 1 {
+            return Err(format!("Invalid range: {start:x} - {end:x}"));
+        }
+        ans.push(SymbolMap {
+            start,
+            end,
+            family: family.to_string(),
+        });
+    }
+    Ok(ans)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub font_family: FontSpec,
@@ -699,6 +747,7 @@ pub struct Options {
     pub bold_font: FontSpec,
     pub italic_font: FontSpec,
     pub bold_italic_font: FontSpec,
+    pub symbol_map: Vec<SymbolMap>,
 
     pub foreground: Color,
     pub background: Color,
@@ -780,6 +829,7 @@ impl Default for Options {
             bold_font: FontSpec::auto(),
             italic_font: FontSpec::auto(),
             bold_italic_font: FontSpec::auto(),
+            symbol_map: Vec::new(),
             foreground: Color::new(221, 221, 221),
             background: Color::new(0, 0, 0),
             cursor: Some(Color::new(204, 204, 204)),
@@ -884,6 +934,7 @@ impl Options {
         }
         match key {
             "font_family" => self.font_family = FontSpec::from_setting(value)?,
+            "symbol_map" => self.symbol_map.extend(parse_symbol_map(value)?),
             "font_size" => self.font_size = parse_f64(value)?.max(MINIMUM_FONT_SIZE),
             "bold_font" => self.bold_font = FontSpec::from_setting(value)?,
             "italic_font" => self.italic_font = FontSpec::from_setting(value)?,

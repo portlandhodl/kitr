@@ -26,6 +26,57 @@ install -Dm644 "$root/packaging/debian/copyright" "$stage/usr/share/doc/kitr/cop
 install -Dm644 "$root/README.md" "$stage/usr/share/doc/kitr/README.md"
 install -Dm644 "$root/NOTICE" "$stage/usr/share/doc/kitr/NOTICE"
 
+# Map direct ELF dependencies to Debian package names. Transitive libraries are
+# resolved by apt; mapping only NEEDED entries avoids stale guesses such as
+# libpcre3 on distributions that removed PCRE1.
+declare -A package_for=(
+    [libc.so.6]='libc6'
+    [libm.so.6]='libc6'
+    [libgcc_s.so.1]='libgcc-s1'
+    [libz.so.1]='zlib1g'
+    [libcrypto.so.3]='libssl3t64 | libssl3'
+    [libssl.so.3]='libssl3t64 | libssl3'
+    [libEGL.so.1]='libegl1'
+    [libGL.so.1]='libgl1'
+    [libGLdispatch.so.0]='libgl1'
+    [libX11.so.6]='libx11-6'
+    [libXext.so.6]='libxext6'
+    [libXi.so.6]='libxi6'
+    [libxcb.so.1]='libxcb1'
+    [libXau.so.6]='libxau6'
+    [libXdmcp.so.6]='libxdmcp6'
+    [libfontconfig.so.1]='libfontconfig1'
+    [libfreetype.so.6]='libfreetype6'
+    [libharfbuzz.so.0]='libharfbuzz0b'
+    [libpng16.so.16]='libpng16-16'
+    [libbz2.so.1]='libbz2-1.0'
+    [liblzma.so.5]='liblzma5'
+    [libglib-2.0.so.0]='libglib2.0-0t64 | libglib2.0-0'
+    [libpcre.so.1]='libpcre3'
+    [libpcre2-8.so.0]='libpcre2-8-0'
+    [libxml2.so.2]='libxml2'
+    [libwayland-client.so.0]='libwayland-client0'
+    [libwayland-egl.so.1]='libwayland-egl1'
+    [libxkbcommon.so.0]='libxkbcommon0'
+)
+declare -A chosen=()
+while read -r lib; do
+    case "$lib" in
+        linux-vdso.so.1 | ld-linux*.so.* | /lib64/ld-linux*) continue ;;
+    esac
+    pkg=${package_for[$lib]:-}
+    if [[ -z "$pkg" ]]; then
+        printf 'warning: no Debian package mapping for %s\n' "$lib" >&2
+        continue
+    fi
+    chosen[$pkg]=1
+done < <(
+    { objdump -p "$root/target/release/kitr"
+      objdump -p "$root/target/release/kitten"; } \
+        | awk '/NEEDED/{print $2}' | sort -u
+)
+depends=$(printf '%s\n' "${!chosen[@]}" | sort | paste -sd, - | sed 's/,/, /g')
+
 installed_size=$(du -sk "$stage" | cut -f1)
 cat > "$control/control" <<EOF
 Package: kitr
@@ -35,10 +86,7 @@ Priority: optional
 Architecture: ${arch}
 Maintainer: kitr contributors <maintainers@portlandhodl.example>
 Installed-Size: ${installed_size}
-Depends: libc6, libgcc-s1, libegl1, libgl1, libx11-6, libxext6, libxi6,
- libfontconfig1, libfreetype6, libharfbuzz0b, libpng16-16, zlib1g,
- libssl3t64 | libssl3, libbz2-1.0, liblzma5, libglib2.0-0t64 | libglib2.0-0,
- libpcre3, libxml2, libxcb1, libxau6, libxdmcp6
+Depends: ${depends}
 Recommends: fonts-dejavu-core, xdg-utils
 Provides: x-terminal-emulator
 Conflicts: kitty

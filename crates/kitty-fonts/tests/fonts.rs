@@ -883,3 +883,38 @@ fn arabic_shaping_reports_rtl_and_visual_order() {
     let clusters: Vec<u32> = run.glyphs.iter().map(|g| g.cluster).collect();
     assert!(clusters.windows(2).all(|w| w[0] >= w[1]), "{clusters:?}");
 }
+
+#[test]
+fn squashed_family_name_still_matches() {
+    let spec = FontSpec::from_setting("BlexMonoNerdFont").unwrap();
+    let stack = match FontStack::from_spec(&spec, FontStyle::Regular, 12.0, 96.0) {
+        Ok(stack) => stack,
+        Err(_) => return,
+    };
+    let family: String = stack
+        .primary_face()
+        .family_name()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert_eq!(family, "BlexMonoNerdFont");
+}
+
+#[test]
+fn symbol_map_selects_the_configured_family() {
+    let spec = FontSpec::from_setting("monospace").unwrap();
+    let mut stack = FontStack::from_spec(&spec, FontStyle::Regular, 12.0, 96.0).unwrap();
+    stack.set_symbol_map([(0xE0A0, 0xE0A3, "BlexMono Nerd Font".to_string())]);
+    let Some(index) = stack.face_index_for_char(0xE0A0).unwrap() else {
+        return;
+    };
+    assert!(
+        stack.faces()[index]
+            .path()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("blex"),
+        "symbol_map chose {}",
+        stack.faces()[index].path().display()
+    );
+}

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kitty-core", "crates/kitty-vt", "crates/kitty-simd", "crates/kitty-unicode", "crates/kitty-screen", "crates/kitty-input", "crates/kitty-os", "crates/kitty-config", "crates/kitty-fonts", "crates/kitty-graphics", "crates/kitty-remote", "crates/kitty-render", "crates/kitty-kittens", "crates/kitty-window", "crates/kitty-ui", "crates/kitty"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"

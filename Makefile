@@ -28,11 +28,11 @@ PARITY_THRESHOLD ?= 5.0
 PARITY_ARTIFACTS ?= artifacts/screenshot-parity
 PARITY_ARGS ?=
 DIST ?= dist
-VERSION ?= 0.1.0
+VERSION ?= 0.1.1
 PARITY_CORPUS ?= scripts/parity_corpus
 ARCH ?= $(shell uname -m)
 
-ICON_PNG := $(wildcard packaging/icons/kitr.png)
+ICON_SIZES := 16 24 32 48 64 128 256 512
 ICON_SVG := $(wildcard packaging/icons/kitr.svg)
 
 .PHONY: all build test lint fmt clippy install uninstall terminfo \
@@ -112,12 +112,15 @@ install-desktop:
 	$(INSTALL) -d "$(DESTDIR)$(APPDIR)" "$(DESTDIR)$(METAINFODIR)"
 	$(INSTALL) -m 644 packaging/desktop/kitr.desktop "$(DESTDIR)$(APPDIR)/kitr.desktop"
 	$(INSTALL) -m 644 packaging/metainfo/io.github.portlandhodl.kitr.metainfo.xml "$(DESTDIR)$(METAINFODIR)/io.github.portlandhodl.kitr.metainfo.xml"
-ifneq ($(ICON_PNG),)
-	$(INSTALL) -d "$(DESTDIR)$(ICONDIR)/256x256/apps"
-	$(INSTALL) -m 644 "$(ICON_PNG)" "$(DESTDIR)$(ICONDIR)/256x256/apps/kitr.png"
-else
-	@echo "warning: packaging/icons/kitr.png is absent; desktop icon not installed"
-endif
+	@set -e; for size in $(ICON_SIZES); do \
+		src="packaging/icons/kitr-$$size.png"; \
+		if [ -f "$$src" ]; then \
+			$(INSTALL) -d "$(DESTDIR)$(ICONDIR)/$${size}x$${size}/apps"; \
+			$(INSTALL) -m 644 "$$src" "$(DESTDIR)$(ICONDIR)/$${size}x$${size}/apps/kitr.png"; \
+		else \
+			echo "warning: $$src is absent; size $$size icon not installed"; \
+		fi; \
+	done
 ifneq ($(ICON_SVG),)
 	$(INSTALL) -d "$(DESTDIR)$(ICONDIR)/scalable/apps"
 	$(INSTALL) -m 644 "$(ICON_SVG)" "$(DESTDIR)$(ICONDIR)/scalable/apps/kitr.svg"
@@ -141,7 +144,8 @@ uninstall:
 	rm -f "$(DESTDIR)$(APPDIR)/kitr.desktop"
 	rm -f "$(DESTDIR)$(METAINFODIR)/io.github.portlandhodl.kitr.metainfo.xml"
 	rm -f "$(DESTDIR)$(MANDIR)/man1/kitr.1"
-	rm -f "$(DESTDIR)$(ICONDIR)/256x256/apps/kitr.png" "$(DESTDIR)$(ICONDIR)/scalable/apps/kitr.svg"
+	@for size in $(ICON_SIZES); do rm -f "$(DESTDIR)$(ICONDIR)/$${size}x$${size}/apps/kitr.png"; done
+	rm -f "$(DESTDIR)$(ICONDIR)/scalable/apps/kitr.svg"
 	@echo "removed kitr files under $(DESTDIR)$(PREFIX)"
 
 package-smoke:
