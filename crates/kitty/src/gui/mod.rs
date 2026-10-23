@@ -39,14 +39,16 @@ use kitty_remote::{
 use kitty_render::{
     pane_border_rects, AtlasConfig, CellMetrics, ColorResolver, DecorationInstance, DecorationKind,
     Frame, GlBackend, GlBackendConfig, GlFns, InstanceFlags, LineRange, PaneBorderPane,
-    RenderConfig, RendererCore, Rgba8, SolidRect,
+    RenderConfig, RendererCore, Rgba8, SelectionRange, SolidRect,
 };
 use kitty_screen::{CursorShape, Modes, Screen};
 use kitty_ui::{
-    parse_sessions, AddWindowOptions, Edge, LayoutAddOptions, LayoutConfig, Region, RestorePlan,
-    SessionOptions, TabId, TabManager, Window, WindowId, WindowLocation,
+    parse_sessions, AddWindowOptions, Edge, Edges, LayoutAddOptions, LayoutConfig, Region,
+    RestorePlan, SessionOptions, TabId, TabManager, Window, WindowId, WindowLocation,
 };
-use kitty_window::{Selection as WindowSelection, WindowConfig, WindowEvent, X11Window};
+use kitty_window::{
+    EglSurface, Selection as WindowSelection, WindowBackend, WindowConfig, WindowEvent,
+};
 
 use crate::{resolve_command, Input, Options, RunOutcome};
 use remote::{encode_png, encode_ppm, encode_screenshot, RemoteBridge, RemoteJob};
@@ -55,7 +57,6 @@ const CELL_FALLBACK_WIDTH: u32 = 8;
 const CELL_FALLBACK_HEIGHT: u32 = 16;
 const IDLE_POLL: Duration = Duration::from_millis(50);
 const REMOTE_POLL: Duration = Duration::from_millis(5);
-const SCREENSHOT_SETTLE: Duration = Duration::from_millis(150);
 
 fn io_err(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
@@ -110,6 +111,12 @@ fn force_full_rows(frame: &mut kitty_render::Frame, lines: u32) {
 
 fn rgba_of(color: kitty_config::Color) -> Rgba8 {
     Rgba8::rgb(color.red, color.green, color.blue)
+}
+
+/// kitty converts margins/padding from points using the logical DPI. The
+/// logical DPI is 96 * the window scale factor on X11/EGL here.
+fn pt_to_px(value: f64, scale: f64) -> f32 {
+    (value * scale * (96.0 / 72.0)).round().max(0.0) as f32
 }
 
 fn blend_srgb(top: Rgba8, bottom: Rgba8, alpha: f64) -> Rgba8 {
@@ -326,10 +333,66 @@ fn draw_frame(
 /// The public methods operate on the active tab and active pane. Tests use
 /// them to inject synthetic events, switch tabs, capture the framebuffer and
 /// inspect the active screen.
+fn layer_shell_window_config(
+    config: &kitty_kittens::panel::LayerShellConfig,
+) -> kitty_window::LayerShellConfig {
+    use kitty_kittens::panel::{Edge, FocusPolicy, Layer};
+    let edge = match config.edge {
+        Edge::Top => kitty_window::LayerShellEdge::Top,
+        Edge::Bottom => kitty_window::LayerShellEdge::Bottom,
+        Edge::Left => kitty_window::LayerShellEdge::Left,
+        Edge::Right => kitty_window::LayerShellEdge::Right,
+        Edge::Center => kitty_window::LayerShellEdge::Center,
+        Edge::None => kitty_window::LayerShellEdge::None,
+        Edge::CenterSized => kitty_window::LayerShellEdge::CenterSized,
+        Edge::Background => kitty_window::LayerShellEdge::Top,
+    };
+    let layer = if config.edge == Edge::Background {
+        kitty_window::LayerShellLayer::Background
+    } else {
+        match config.layer {
+            Layer::Background => kitty_window::LayerShellLayer::Background,
+            Layer::Bottom => kitty_window::LayerShellLayer::Bottom,
+            Layer::Top => kitty_window::LayerShellLayer::Top,
+            Layer::Overlay => kitty_window::LayerShellLayer::Overlay,
+        }
+    };
+    let focus = match config.focus_policy {
+        FocusPolicy::NotAllowed => kitty_window::LayerShellFocus::NotAllowed,
+        FocusPolicy::Exclusive => kitty_window::LayerShellFocus::Exclusive,
+        FocusPolicy::OnDemand => kitty_window::LayerShellFocus::OnDemand,
+    };
+    let width = if config.x_size_in_pixels > 0 {
+        config.x_size_in_pixels.max(0) as u32
+    } else {
+        (config.x_size_in_cells.max(1) as u32) * CELL_FALLBACK_WIDTH
+    };
+    let height = if config.y_size_in_pixels > 0 {
+        config.y_size_in_pixels.max(0) as u32
+    } else {
+        (config.y_size_in_cells.max(1) as u32) * CELL_FALLBACK_HEIGHT
+    };
+    kitty_window::LayerShellConfig {
+        layer,
+        edge,
+        width,
+        height,
+        margin_top: config.margin_top,
+        margin_left: config.margin_left,
+        margin_bottom: config.margin_bottom,
+        margin_right: config.margin_right,
+        focus,
+        exclusive_zone: config.exclusive_zone,
+        override_exclusive_zone: config.override_exclusive_zone,
+        output_name: config.output_name.clone(),
+        namespace: "kitty-panel".to_owned(),
+    }
+}
+
 pub struct GuiSession {
     backend: Option<GlBackend>,
-    surface: kitty_window::EglWindowSurface,
-    window: X11Window,
+    surface: EglSurface,
+    window: WindowBackend,
     renderer: RendererCore,
     fonts: FontSet,
     raster_cache: RasterCache,
@@ -359,6 +422,8 @@ pub struct GuiSession {
     output_bytes: u64,
     should_close: bool,
     mouse_down: bool,
+    /// Visual cell under the pointer, used for OSC 8 hover highlighting.
+    hover_cell: Option<(u32, u32)>,
     last_title: Option<String>,
     timed_out: bool,
     exit_status: Option<ExitStatus>,
@@ -399,15 +464,19 @@ impl GuiSession {
         let provisional_width = requested.0 as u32 * CELL_FALLBACK_WIDTH;
         let provisional_height = (requested.1 as u32 + 1) * CELL_FALLBACK_HEIGHT;
 
-        let mut window = X11Window::open(
-            &WindowConfig::new(
-                title.clone(),
-                provisional_width.max(1),
-                provisional_height.max(1),
-            ),
-            display_name,
-        )
-        .map_err(|error| io_err(format!("cannot open X11 window: {error}")))?;
+        let mut window_config = WindowConfig::new(
+            title.clone(),
+            provisional_width.max(1),
+            provisional_height.max(1),
+        );
+        if let Some(layer_shell) = &options.layer_shell {
+            window_config = window_config.layer_shell(layer_shell_window_config(layer_shell));
+            if options.layer_shell_start_hidden {
+                window_config.visible = false;
+            }
+        }
+        let mut window = WindowBackend::open_on_display(&window_config, display_name)
+            .map_err(|error| io_err(format!("cannot open window: {error}")))?;
         let scale = window.scale_factor().clamp(0.5, 8.0);
 
         let fonts = FontSet::load(&cfg, scale)
@@ -416,10 +485,10 @@ impl GuiSession {
         let cell_w = metrics.cell_width.max(1.0).round() as u32;
         let cell_h = metrics.cell_height.max(1.0).round() as u32;
         let padding = (
-            (cfg.window_padding_width.left * scale).round() as f32,
-            (cfg.window_padding_width.top * scale).round() as f32,
-            (cfg.window_padding_width.right * scale).round() as f32,
-            (cfg.window_padding_width.bottom * scale).round() as f32,
+            pt_to_px(cfg.window_padding_width.left, scale),
+            pt_to_px(cfg.window_padding_width.top, scale),
+            pt_to_px(cfg.window_padding_width.right, scale),
+            pt_to_px(cfg.window_padding_width.bottom, scale),
         );
         let (columns, rows) = requested;
         let tab_bar_px = cfg.tab_bar_height(initial_tab_count, cell_h as f32);
@@ -432,7 +501,7 @@ impl GuiSession {
         window.set_size(pixel_width.max(1), pixel_height.max(1));
         window.set_size_limits(cell_w, cell_h, None, None);
 
-        let surface = kitty_window::EglWindowSurface::new(&window)
+        let surface = EglSurface::new(&window)
             .map_err(|error| io_err(format!("cannot create EGL window surface: {error}")))?;
         surface
             .make_current()
@@ -466,6 +535,13 @@ impl GuiSession {
             cursor_hollow_thickness: 1.0,
             undercurl_style: 0,
             emit_default_backgrounds: false,
+            text_contrast: 1.0 + (cfg.text_contrast as f32) * 0.01,
+            text_gamma_adjustment: if cfg.text_gamma_adjustment < 0.01 {
+                1.0
+            } else {
+                1.0 / cfg.text_gamma_adjustment as f32
+            },
+            text_old_gamma: cfg.text_old_gamma,
             animation_cache_dir: Some(std::env::temp_dir()),
             ..RenderConfig::default()
         };
@@ -508,6 +584,7 @@ impl GuiSession {
             output_bytes: 0,
             should_close: false,
             mouse_down: false,
+            hover_cell: None,
             last_title: Some(title),
             timed_out: false,
             exit_status: None,
@@ -601,6 +678,7 @@ impl GuiSession {
                     .or_else(|| window_spec.launch.title.clone())
                     .unwrap_or_default();
                 let mut window = Window::new(wid, title);
+                self.apply_window_decorations(&mut window);
                 window.serialized_id = if window_spec.serialized_id != 0 {
                     window_spec.serialized_id
                 } else {
@@ -691,6 +769,8 @@ impl GuiSession {
                     pane_rows,
                     self.scrollback,
                     config_cursor(self.config_options.cursor_shape),
+                    self.metrics.cell_width.max(1.0).round() as u32,
+                    self.metrics.cell_height.max(1.0).round() as u32,
                 )?;
                 self.panes.insert(wid, pane);
             }
@@ -720,13 +800,89 @@ impl GuiSession {
     }
 
     fn layout_config(&self) -> LayoutConfig {
+        let cw = self.metrics.cell_width.max(1.0).round() as i32;
+        let ch = self.metrics.cell_height.max(1.0).round() as i32;
+        let left = self.padding.0.round() as i32;
+        let top = (self.tab_bar_top_px() + self.padding.1).round() as i32;
+        let width = (self.pixel_size.0 as f32 - self.padding.0 - self.padding.2)
+            .max(cw as f32)
+            .round() as i32;
+        let height = (self.pixel_size.1 as f32
+            - self.tab_bar_top_px()
+            - self.tab_bar_bottom_px()
+            - self.padding.1
+            - self.padding.3)
+            .max(ch as f32)
+            .round() as i32;
+        let opts = &self.config_options;
+        let has_margin = opts.window_margin_width.left > 0.0
+            || opts.window_margin_width.top > 0.0
+            || opts.window_margin_width.right > 0.0
+            || opts.window_margin_width.bottom > 0.0;
+        let draw_minimal_borders = opts.draw_minimal_borders && !has_margin;
         LayoutConfig {
-            central: Region::new(0, 0, self.columns.max(1) as i32, self.rows.max(1) as i32),
-            cell_width: 1,
-            cell_height: 1,
-            draw_minimal_borders: false,
+            central: Region::new(left, top, width, height),
+            cell_width: cw,
+            cell_height: ch,
+            draw_minimal_borders,
             alignment_x: 0,
             alignment_y: 0,
+        }
+    }
+
+    fn apply_window_decorations(&self, window: &mut Window) {
+        let scale = self.window.scale_factor();
+        let opts = &self.config_options;
+        let margin = opts.window_margin_width;
+        let padding = opts.window_padding_width;
+        window.margin = Edges::new(
+            pt_to_px(margin.left, scale) as i32,
+            pt_to_px(margin.top, scale) as i32,
+            pt_to_px(margin.right, scale) as i32,
+            pt_to_px(margin.bottom, scale) as i32,
+        );
+        window.padding = Edges::new(
+            pt_to_px(padding.left, scale) as i32,
+            pt_to_px(padding.top, scale) as i32,
+            pt_to_px(padding.right, scale) as i32,
+            pt_to_px(padding.bottom, scale) as i32,
+        );
+        let border = (opts.window_border_width * scale).round();
+        window.border_width = if opts.window_border_width > 0.0 {
+            border.max(1.0) as i32
+        } else {
+            0
+        };
+    }
+
+    fn apply_decorations_to_all(&mut self) {
+        let mut updates = Vec::new();
+        for tab in self.tab_manager.tabs() {
+            for wid in tab.windows().all_window_ids() {
+                updates.push(*wid);
+            }
+        }
+        for wid in updates {
+            let Some(tab_idx) = self.tab_index_for_window(wid) else {
+                continue;
+            };
+            let mut decorated = self
+                .tab_manager
+                .tab(tab_idx)
+                .and_then(|tab| tab.windows().window(wid))
+                .cloned();
+            if let Some(window) = decorated.as_mut() {
+                self.apply_window_decorations(window);
+            }
+            if let Some(window) = decorated {
+                if let Some(target) = self
+                    .tab_manager
+                    .tab_mut(tab_idx)
+                    .and_then(|tab| tab.windows_mut().window_mut(wid))
+                {
+                    *target = window;
+                }
+            }
         }
     }
 
@@ -811,7 +967,8 @@ impl GuiSession {
     ) -> io::Result<WindowId> {
         let wid = self.alloc_window_id();
         let title = spec.title.clone().unwrap_or_default();
-        let window = Window::new(wid, title);
+        let mut window = Window::new(wid, title);
+        self.apply_window_decorations(&mut window);
         let tab = self
             .tab_manager
             .tab_mut(tab_idx)
@@ -836,6 +993,8 @@ impl GuiSession {
             rows,
             self.scrollback,
             config_cursor(self.config_options.cursor_shape),
+            self.metrics.cell_width.max(1.0).round() as u32,
+            self.metrics.cell_height.max(1.0).round() as u32,
         ) {
             Ok(pane) => {
                 self.panes.insert(wid, pane);
@@ -930,6 +1089,7 @@ impl GuiSession {
     }
 
     fn relayout_all(&mut self) {
+        self.apply_decorations_to_all();
         let config = self.layout_config();
         let count = self.tab_manager.tabs().len();
         for tab_idx in 0..count {
@@ -954,22 +1114,33 @@ impl GuiSession {
         }
     }
 
-    fn pane_geometry(&self, tab_idx: usize, wid: WindowId) -> Option<(u32, u32, i32, i32)> {
+    fn pane_pixel_rect(&self, tab_idx: usize, wid: WindowId) -> Option<(f32, f32, f32, f32)> {
         let window = self.tab_manager.tab(tab_idx)?.windows().window(wid)?;
         let geometry = window.geometry;
-        let left = geometry.left.max(0);
-        let top = geometry.top.max(0);
-        let columns = (geometry.right - geometry.left).max(1) as u32;
-        let rows = (geometry.bottom - geometry.top).max(1) as u32;
+        let cw = self.metrics.cell_width.max(1.0);
+        let ch = self.metrics.cell_height.max(1.0);
+        Some((
+            geometry.left as f32,
+            geometry.top as f32,
+            ((geometry.right - geometry.left) as f32).max(cw),
+            ((geometry.bottom - geometry.top) as f32).max(ch),
+        ))
+    }
+
+    fn pane_geometry(&self, tab_idx: usize, wid: WindowId) -> Option<(u32, u32, i32, i32)> {
+        let (x, y, width, height) = self.pane_pixel_rect(tab_idx, wid)?;
+        let cw = self.metrics.cell_width.max(1.0);
+        let ch = self.metrics.cell_height.max(1.0);
+        let columns = (width / cw).floor().max(1.0) as u32;
+        let rows = (height / ch).floor().max(1.0) as u32;
+        let left = (x / cw).round() as i32;
+        let top = (y / ch).round() as i32;
         Some((columns, rows, left, top))
     }
 
     fn pane_origin(&self, tab_idx: usize, wid: WindowId) -> Option<(f32, f32)> {
-        let (_, _, left, top) = self.pane_geometry(tab_idx, wid)?;
-        Some((
-            self.padding.0 + left as f32 * self.metrics.cell_width,
-            self.tab_bar_px + self.padding.1 + top as f32 * self.metrics.cell_height,
-        ))
+        let (x, y, _, _) = self.pane_pixel_rect(tab_idx, wid)?;
+        Some((x, y))
     }
 
     fn active_pane(&self) -> Option<&Pane> {
@@ -1186,6 +1357,7 @@ impl GuiSession {
         mut self,
         timeout: Option<Duration>,
         screenshot: Option<&Path>,
+        screenshot_delay: Duration,
     ) -> io::Result<RunOutcome> {
         let started = Instant::now();
         let deadline = timeout.map(|t| started + t);
@@ -1202,7 +1374,7 @@ impl GuiSession {
                 content_at = Some(Instant::now());
             }
             if let (Some(path), Some(at)) = (screenshot, content_at) {
-                if at.elapsed() >= SCREENSHOT_SETTLE {
+                if at.elapsed() >= screenshot_delay {
                     for _ in 0..3 {
                         self.render_now()?;
                     }
@@ -1378,7 +1550,10 @@ impl GuiSession {
                 modifiers,
                 ..
             } => self.handle_scroll(x, y, delta_y, modifiers),
-            WindowEvent::Leave { .. } => self.mouse_down = false,
+            WindowEvent::Leave { .. } => {
+                self.mouse_down = false;
+                self.hover_cell = None;
+            }
             WindowEvent::SelectionNotify { .. } | WindowEvent::SelectionRequest { .. } => {}
             WindowEvent::Wakeup
             | WindowEvent::Move { .. }
@@ -1396,6 +1571,42 @@ impl GuiSession {
             self.tab_manager.tabs().len(),
             self.metrics.cell_height.max(1.0),
         )
+    }
+
+    fn tab_bar_top_px(&self) -> f32 {
+        if self.tab_bar_px > 0.0 && self.config_options.tab_bar_edge.is_top() {
+            self.tab_bar_px
+        } else {
+            0.0
+        }
+    }
+
+    fn tab_bar_bottom_px(&self) -> f32 {
+        if self.tab_bar_px > 0.0 && self.config_options.tab_bar_edge.is_bottom() {
+            self.tab_bar_px
+        } else {
+            0.0
+        }
+    }
+
+    fn in_tab_bar(&self, y: f64) -> bool {
+        if self.tab_bar_px <= 0.0 {
+            return false;
+        }
+        match self.config_options.tab_bar_edge {
+            kitty_config::TabBarEdge::Top => y < self.tab_bar_px as f64,
+            kitty_config::TabBarEdge::Bottom => {
+                y >= (self.pixel_size.1 as f32 - self.tab_bar_px) as f64
+            }
+            _ => false,
+        }
+    }
+
+    fn tab_bar_origin_y(&self) -> f32 {
+        match self.config_options.tab_bar_edge {
+            kitty_config::TabBarEdge::Top => 0.0,
+            _ => (self.pixel_size.1 as f32 - self.tab_bar_px).max(0.0),
+        }
     }
 
     /// React to tab-bar visibility changes (new tab, closed tab) the same way
@@ -1715,7 +1926,7 @@ impl GuiSession {
         y: f64,
         modifiers: kitty_window::Modifiers,
     ) {
-        if y < self.tab_bar_px as f64 {
+        if self.in_tab_bar(y) {
             if pressed && button == kitty_window::MouseButton::Left {
                 if let Some(idx) = self.tab_at_x(x) {
                     self.select_tab(idx);
@@ -1789,7 +2000,7 @@ impl GuiSession {
     }
 
     fn handle_mouse_move(&mut self, x: f64, y: f64, modifiers: kitty_window::Modifiers) {
-        if y < self.tab_bar_px as f64 {
+        if self.in_tab_bar(y) {
             return;
         }
         let Some(wid) = self.tab_manager.active_window_id() else {
@@ -1832,10 +2043,11 @@ impl GuiSession {
                 .update_selection(position.cell_x, position.cell_y);
             self.need_redraw = true;
         }
+        self.hover_cell = Some((position.cell_x, position.cell_y));
     }
 
     fn handle_scroll(&mut self, x: f64, y: f64, delta_y: f64, modifiers: kitty_window::Modifiers) {
-        if y < self.tab_bar_px as f64 {
+        if self.in_tab_bar(y) {
             return;
         }
         let Some(wid) = self.tab_manager.active_window_id() else {
@@ -1894,15 +2106,13 @@ impl GuiSession {
             if !window.is_visible_in_layout {
                 continue;
             }
-            let Some((columns, rows, left, top)) = self.pane_geometry(tab_idx, *wid) else {
+            let Some((x0, y0, width, height)) = self.pane_pixel_rect(tab_idx, *wid) else {
                 continue;
             };
-            let x0 = self.padding.0 as f64 + left as f64 * self.metrics.cell_width as f64;
-            let y0 = self.tab_bar_px as f64
-                + self.padding.1 as f64
-                + top as f64 * self.metrics.cell_height as f64;
-            let x1 = x0 + columns as f64 * self.metrics.cell_width as f64;
-            let y1 = y0 + rows as f64 * self.metrics.cell_height as f64;
+            let x0 = x0 as f64;
+            let y0 = y0 as f64;
+            let x1 = x0 + width as f64;
+            let y1 = y0 + height as f64;
             if x >= x0 && x < x1 && y >= y0 && y < y1 {
                 return Some(*wid);
             }
@@ -1945,17 +2155,10 @@ impl GuiSession {
             if !window.is_visible_in_layout {
                 continue;
             }
-            let Some((columns, rows, left, top)) = self.pane_geometry(tab_idx, *wid) else {
+            let Some((x, y, width, height)) = self.pane_pixel_rect(tab_idx, *wid) else {
                 continue;
             };
-            let cw = self.metrics.cell_width.max(1.0);
-            let ch = self.metrics.cell_height.max(1.0);
-            let rect = kitty_render::Rect::new(
-                self.padding.0 + left as f32 * cw,
-                self.tab_bar_px + self.padding.1 + top as f32 * ch,
-                columns as f32 * cw,
-                rows as f32 * ch,
-            );
+            let rect = kitty_render::Rect::new(x, y, width, height);
             panes.push(PaneBorderPane {
                 rect,
                 active: Some(*wid) == active_id && !window.needs_attention,
@@ -2164,7 +2367,7 @@ impl GuiSession {
             let (mut bar_screen, ranges) = self.build_tab_bar();
             self.tab_ranges = ranges;
             self.renderer.generator.config.origin_x = 0.0;
-            self.renderer.generator.config.origin_y = 0.0;
+            self.renderer.generator.config.origin_y = self.tab_bar_origin_y();
             self.renderer.generator.config.viewport_width = self.pixel_size.0 as f32;
             self.renderer.generator.config.viewport_height = self.tab_bar_px;
             let mut bar_frame = {
@@ -2202,11 +2405,12 @@ impl GuiSession {
             if !visible {
                 continue;
             }
-            let Some((columns, rows, left, top)) = self.pane_geometry(tab_idx, wid) else {
+            let Some((columns, rows, _, _)) = self.pane_geometry(tab_idx, wid) else {
                 continue;
             };
-            let origin_x = self.padding.0 + left as f32 * cell_w;
-            let origin_y = self.tab_bar_px + self.padding.1 + top as f32 * cell_h;
+            let Some((origin_x, origin_y)) = self.pane_origin(tab_idx, wid) else {
+                continue;
+            };
             self.renderer.generator.config.origin_x = origin_x;
             self.renderer.generator.config.origin_y = origin_y;
             self.renderer.generator.config.viewport_width = columns as f32 * cell_w;
@@ -2214,6 +2418,20 @@ impl GuiSession {
             let Some(pane) = self.panes.get_mut(&wid) else {
                 continue;
             };
+            self.renderer.generator.config.selections = pane
+                .handler
+                .screen
+                .selections()
+                .items()
+                .iter()
+                .map(SelectionRange::from_selection)
+                .collect();
+            self.renderer.generator.config.hyperlink_hover = self
+                .hover_cell
+                .filter(|(hx, hy)| {
+                    *hx < pane.handler.screen.columns && *hy < pane.handler.screen.lines
+                })
+                .map(|(x, y)| kitty_render::HyperlinkHover { x, y });
             let saved_cursor = pane.handler.screen.cursor.shape;
             if Some(wid) != active {
                 pane.handler.screen.cursor.shape = CursorShape::NoCursor;
@@ -2879,7 +3097,11 @@ pub fn run_gui(options: &Options, input: Input) -> io::Result<RunOutcome> {
     let timeout = options
         .timeout
         .or_else(|| options.screenshot.as_ref().map(|_| Duration::from_secs(10)));
-    session.run(timeout, options.screenshot.as_deref())
+    session.run(
+        timeout,
+        options.screenshot.as_deref(),
+        options.screenshot_delay,
+    )
 }
 
 #[cfg(test)]

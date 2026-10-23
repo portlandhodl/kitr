@@ -9,3 +9,4 @@ description = "Font discovery, metrics and shaping ported from kitty"
 [dependencies]
 kitty-core = { path = "../kitty-core" }
 kitty-unicode = { path = "../kitty-unicode" }
+kitty-graphics = { path = "../kitty-graphics" }

@@ -10,8 +10,9 @@ description = "Linux X11/Wayland/EGL window and event backend for kitr"
 kitty-core = { path = "../kitty-core" }
 wayland-client = { version = "=0.31.12", optional = true }
 wayland-protocols = { version = "=0.32.10", features = ["client", "staging", "unstable"], optional = true }
+wayland-protocols-wlr = { version = "=0.3.10", features = ["client"], optional = true }
 wayland-backend = { version = "=0.3.12", features = ["client_system"], optional = true }
 
 [features]
 default = []
-wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-backend"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:wayland-backend"]

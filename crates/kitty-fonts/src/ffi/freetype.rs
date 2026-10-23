@@ -268,3 +268,318 @@ pub fn error_name(code: FT_Error) -> &'static str {
         _ => "unknown FreeType error",
     }
 }
+
+// {{{ Color fonts (COLR/CPAL), glyph transforms and raw SFNT tables
+
+pub type FT_F2Dot14 = c_short;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_Matrix {
+    pub xx: FT_Fixed,
+    pub xy: FT_Fixed,
+    pub yx: FT_Fixed,
+    pub yy: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_Color {
+    pub blue: u8,
+    pub green: u8,
+    pub red: u8,
+    pub alpha: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_Palette_Data {
+    pub num_palettes: FT_UShort,
+    pub palette_name_ids: *const FT_UShort,
+    pub palette_flags: *const FT_UShort,
+    pub num_palette_entries: FT_UShort,
+    pub palette_entry_name_ids: *const FT_UShort,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_LayerIterator {
+    pub num_layers: FT_UInt,
+    pub layer: FT_UInt,
+    pub p: *mut u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_OpaquePaint {
+    pub p: *mut u8,
+    pub insert_root_transform: FT_Bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_ColorIndex {
+    pub palette_index: FT_UShort,
+    pub alpha: FT_F2Dot14,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_ColorStop {
+    pub stop_offset: FT_Fixed,
+    pub color: FT_ColorIndex,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_ColorStopIterator {
+    pub num_color_stops: FT_UInt,
+    pub current_color_stop: FT_UInt,
+    pub p: *mut u8,
+    pub read_variable: FT_Bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_ColorLine {
+    pub extend: c_int,
+    pub color_stop_iterator: FT_ColorStopIterator,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_Affine23 {
+    pub xx: FT_Fixed,
+    pub xy: FT_Fixed,
+    pub dx: FT_Fixed,
+    pub yx: FT_Fixed,
+    pub yy: FT_Fixed,
+    pub dy: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintColrLayers {
+    pub layer_iterator: FT_LayerIterator,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintSolid {
+    pub color: FT_ColorIndex,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintLinearGradient {
+    pub colorline: FT_ColorLine,
+    pub p0: FT_Vector,
+    pub p1: FT_Vector,
+    pub p2: FT_Vector,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintRadialGradient {
+    pub colorline: FT_ColorLine,
+    pub c0: FT_Vector,
+    pub r0: FT_Pos,
+    pub c1: FT_Vector,
+    pub r1: FT_Pos,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintSweepGradient {
+    pub colorline: FT_ColorLine,
+    pub center: FT_Vector,
+    pub start_angle: FT_Fixed,
+    pub end_angle: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintGlyph {
+    pub paint: FT_OpaquePaint,
+    pub glyphID: FT_UInt,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintColrGlyph {
+    pub glyphID: FT_UInt,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintTransform {
+    pub paint: FT_OpaquePaint,
+    pub affine: FT_Affine23,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintTranslate {
+    pub paint: FT_OpaquePaint,
+    pub dx: FT_Fixed,
+    pub dy: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintScale {
+    pub paint: FT_OpaquePaint,
+    pub scale_x: FT_Fixed,
+    pub scale_y: FT_Fixed,
+    pub center_x: FT_Fixed,
+    pub center_y: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintRotate {
+    pub paint: FT_OpaquePaint,
+    pub angle: FT_Fixed,
+    pub center_x: FT_Fixed,
+    pub center_y: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FT_PaintSkew {
+    pub paint: FT_OpaquePaint,
+    pub x_skew_angle: FT_Fixed,
+    pub y_skew_angle: FT_Fixed,
+    pub center_x: FT_Fixed,
+    pub center_y: FT_Fixed,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union FT_COLR_PaintUnion {
+    pub colr_layers: FT_PaintColrLayers,
+    pub glyph: FT_PaintGlyph,
+    pub solid: FT_PaintSolid,
+    pub linear_gradient: FT_PaintLinearGradient,
+    pub radial_gradient: FT_PaintRadialGradient,
+    pub sweep_gradient: FT_PaintSweepGradient,
+    pub transform: FT_PaintTransform,
+    pub translate: FT_PaintTranslate,
+    pub scale: FT_PaintScale,
+    pub rotate: FT_PaintRotate,
+    pub skew: FT_PaintSkew,
+    pub composite: FT_PaintComposite,
+    pub colr_glyph: FT_PaintColrGlyph,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FT_PaintComposite {
+    pub source_paint: FT_OpaquePaint,
+    pub composite_mode: c_int,
+    pub backdrop_paint: FT_OpaquePaint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FT_COLR_Paint {
+    pub format: c_int,
+    pub u: FT_COLR_PaintUnion,
+}
+
+pub const FT_COLR_PAINTFORMAT_COLR_LAYERS: c_int = 1;
+pub const FT_COLR_PAINTFORMAT_SOLID: c_int = 2;
+pub const FT_COLR_PAINTFORMAT_LINEAR_GRADIENT: c_int = 4;
+pub const FT_COLR_PAINTFORMAT_RADIAL_GRADIENT: c_int = 6;
+pub const FT_COLR_PAINTFORMAT_SWEEP_GRADIENT: c_int = 8;
+pub const FT_COLR_PAINTFORMAT_GLYPH: c_int = 10;
+pub const FT_COLR_PAINTFORMAT_COLR_GLYPH: c_int = 11;
+pub const FT_COLR_PAINTFORMAT_TRANSFORM: c_int = 12;
+pub const FT_COLR_PAINTFORMAT_TRANSLATE: c_int = 14;
+pub const FT_COLR_PAINTFORMAT_SCALE: c_int = 16;
+pub const FT_COLR_PAINTFORMAT_ROTATE: c_int = 24;
+pub const FT_COLR_PAINTFORMAT_SKEW: c_int = 28;
+pub const FT_COLR_PAINTFORMAT_COMPOSITE: c_int = 32;
+pub const FT_COLR_PAINTFORMAT_UNSUPPORTED: c_int = 255;
+
+pub const FT_COLOR_INCLUDE_ROOT_TRANSFORM: c_int = 0;
+pub const FT_COLOR_NO_ROOT_TRANSFORM: c_int = 1;
+
+pub const FT_COLR_COMPOSITE_CLEAR: c_int = 0;
+pub const FT_COLR_COMPOSITE_SRC: c_int = 1;
+pub const FT_COLR_COMPOSITE_DEST: c_int = 2;
+pub const FT_COLR_COMPOSITE_SRC_OVER: c_int = 3;
+pub const FT_COLR_COMPOSITE_DEST_OVER: c_int = 4;
+pub const FT_COLR_COMPOSITE_SRC_IN: c_int = 5;
+pub const FT_COLR_COMPOSITE_DEST_IN: c_int = 6;
+pub const FT_COLR_COMPOSITE_SRC_OUT: c_int = 7;
+pub const FT_COLR_COMPOSITE_DEST_OUT: c_int = 8;
+pub const FT_COLR_COMPOSITE_SRC_ATOP: c_int = 9;
+pub const FT_COLR_COMPOSITE_DEST_ATOP: c_int = 10;
+pub const FT_COLR_COMPOSITE_XOR: c_int = 11;
+pub const FT_COLR_COMPOSITE_PLUS: c_int = 12;
+pub const FT_COLR_COMPOSITE_SCREEN: c_int = 13;
+pub const FT_COLR_COMPOSITE_OVERLAY: c_int = 14;
+pub const FT_COLR_COMPOSITE_DARKEN: c_int = 15;
+pub const FT_COLR_COMPOSITE_LIGHTEN: c_int = 16;
+pub const FT_COLR_COMPOSITE_COLOR_DODGE: c_int = 17;
+pub const FT_COLR_COMPOSITE_COLOR_BURN: c_int = 18;
+pub const FT_COLR_COMPOSITE_HARD_LIGHT: c_int = 19;
+pub const FT_COLR_COMPOSITE_SOFT_LIGHT: c_int = 20;
+pub const FT_COLR_COMPOSITE_DIFFERENCE: c_int = 21;
+pub const FT_COLR_COMPOSITE_EXCLUSION: c_int = 22;
+pub const FT_COLR_COMPOSITE_MULTIPLY: c_int = 23;
+
+pub const FT_PALETTE_FOR_LIGHT_BACKGROUND: FT_UShort = 1 << 0;
+pub const FT_PALETTE_FOR_DARK_BACKGROUND: FT_UShort = 1 << 1;
+pub const FT_PALETTE_FOREGROUND_INDEX: FT_UShort = 0xFFFF;
+
+#[link(name = "freetype")]
+extern "C" {
+    pub fn FT_Set_Transform(face: FT_Face, matrix: *const FT_Matrix, delta: *const FT_Vector);
+    pub fn FT_Get_Transform(face: FT_Face, matrix: *mut FT_Matrix, delta: *mut FT_Vector);
+    pub fn FT_Load_Sfnt_Table(
+        face: FT_Face,
+        tag: FT_ULong,
+        offset: FT_Long,
+        buffer: *mut u8,
+        length: *mut FT_ULong,
+    ) -> FT_Error;
+    pub fn FT_Palette_Data_Get(face: FT_Face, apalette: *mut FT_Palette_Data) -> FT_Error;
+    pub fn FT_Palette_Select(
+        face: FT_Face,
+        palette_index: FT_UShort,
+        apalette_entries: *mut *mut FT_Color,
+    ) -> FT_Error;
+    pub fn FT_Palette_Set_Foreground_Color(face: FT_Face, foreground: FT_Color) -> FT_Error;
+    pub fn FT_Get_Color_Glyph_Layer(
+        face: FT_Face,
+        base_glyph: FT_UInt,
+        aglyph_index: *mut FT_UInt,
+        acolor_index: *mut FT_UInt,
+        iterator: *mut FT_LayerIterator,
+    ) -> FT_Bool;
+    pub fn FT_Get_Color_Glyph_Paint(
+        face: FT_Face,
+        base_glyph: FT_UInt,
+        root_transform: c_int,
+        paint: *mut FT_OpaquePaint,
+    ) -> FT_Bool;
+    pub fn FT_Get_Paint(
+        face: FT_Face,
+        paint: FT_OpaquePaint,
+        apaint: *mut FT_COLR_Paint,
+    ) -> FT_Bool;
+    pub fn FT_Get_Paint_Layers(
+        face: FT_Face,
+        iterator: *mut FT_LayerIterator,
+        paint: *mut FT_OpaquePaint,
+    ) -> FT_Bool;
+    pub fn FT_Get_Colorline_Stops(
+        face: FT_Face,
+        color_stop: *mut FT_ColorStop,
+        iterator: *mut FT_ColorStopIterator,
+    ) -> FT_Bool;
+}
+
+// }}}

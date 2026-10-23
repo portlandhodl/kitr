@@ -196,10 +196,10 @@ pub use atlas::{
 };
 pub use cell::{build_cell_sprites, CellGrid, CellRecord, CellSpriteData, SpriteKey};
 pub use colors::{
-    build_gamma_lut, contrast_ratio, decode_color, dimmed_color, encode_indexed, encode_rgb,
-    encode_special, gamma_lut, gamma_lut_lookup, indexed_image_palette, kitty_default_palette,
-    linear_to_srgb, luminance, rgb_u32_to_linear, srgb_to_linear, BasicColorResolver, CellColor,
-    ColorResolver, Rgba8, KITTY_DEFAULT_ANSI_COLORS,
+    apply_text_contrast, build_gamma_lut, contrast_ratio, decode_color, dimmed_color,
+    encode_indexed, encode_rgb, encode_special, gamma_lut, gamma_lut_lookup, indexed_image_palette,
+    kitty_default_palette, linear_to_srgb, luminance, rgb_u32_to_linear, srgb_to_linear,
+    BasicColorResolver, CellColor, ColorResolver, Rgba8, KITTY_DEFAULT_ANSI_COLORS,
 };
 pub use core::RendererCore;
 pub use custom_shader::{

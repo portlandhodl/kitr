@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::color::Color;
 use crate::config::{BadLine, Config};
 use crate::options::{
-    clamp_font_size, CursorShape, EasingFunction, FontSpec, JumpType, Modifiers, TabBarStyle,
-    TabPowerlineStyle, DELETE_ENV_VAR, MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE,
+    clamp_font_size, CursorShape, EasingFunction, FontSpec, JumpType, Modifiers, TabBarEdge,
+    TabBarStyle, TabPowerlineStyle, DELETE_ENV_VAR, MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE,
 };
 use crate::shlex::Shlex;
 
@@ -600,6 +600,7 @@ fn tab_bar_visibility_and_geometry_follow_kitty() {
 fn tab_bar_defaults_match_kitty() {
     let options = cfg(&[]).options;
     assert_eq!(options.tab_bar_style, TabBarStyle::Fade);
+    assert_eq!(options.tab_bar_edge, TabBarEdge::Bottom);
     assert_eq!(options.tab_bar_min_tabs, 2);
     assert_eq!(options.tab_separator, " ┇");
     assert_eq!(options.tab_powerline_style, TabPowerlineStyle::Angled);
@@ -630,6 +631,52 @@ fn tab_bar_defaults_match_kitty() {
     assert_eq!(options.tab_separator, " | ");
     assert_eq!(options.active_tab_background, Color::new(0x11, 0x22, 0x33));
     assert_eq!(options.tab_bar_min_tabs, 3);
+}
+
+#[test]
+fn tab_bar_edge_choices_and_errors() {
+    let choices = [
+        ("top", TabBarEdge::Top),
+        ("bottom", TabBarEdge::Bottom),
+        ("left", TabBarEdge::Left),
+        ("right", TabBarEdge::Right),
+    ];
+    for (raw, expected) in choices {
+        assert_eq!(
+            cfg(&[&format!("tab_bar_edge {raw}")]).options.tab_bar_edge,
+            expected
+        );
+    }
+    let errors = cfg_err(&["tab_bar_edge middle"]);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0]
+        .error
+        .contains("not a valid choice for tab_bar_edge"));
+}
+
+#[test]
+fn text_composition_strategy_matches_kitty() {
+    let options = cfg(&[]).options;
+    assert_eq!(options.text_composition_strategy, "platform");
+    assert_eq!(options.text_gamma_adjustment, 1.0);
+    assert_eq!(options.text_contrast, 0.0);
+    assert!(!options.text_old_gamma);
+
+    let options = cfg(&["text_composition_strategy legacy"]).options;
+    assert!(options.text_old_gamma);
+
+    let options = cfg(&["text_composition_strategy 1.3 30"]).options;
+    assert_eq!(options.text_gamma_adjustment, 1.3);
+    assert_eq!(options.text_contrast, 30.0);
+
+    let options = cfg(&["text_composition_strategy 0"]).options;
+    assert_eq!(options.text_gamma_adjustment, 0.01);
+
+    let options = cfg(&["text_composition_strategy 1.3 150"]).options;
+    assert_eq!(options.text_contrast, 100.0);
+
+    assert_eq!(cfg_err(&["text_composition_strategy a"]).len(), 1);
+    assert_eq!(cfg_err(&["text_composition_strategy 1 2 3"]).len(), 1);
 }
 
 #[test]

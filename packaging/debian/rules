@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: GPL-3.0-or-later
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --workspace
+
+override_dh_auto_test:
+	cargo test --workspace --lib
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/kitr PREFIX=/usr
+
+override_dh_auto_clean:
+	cargo clean || true

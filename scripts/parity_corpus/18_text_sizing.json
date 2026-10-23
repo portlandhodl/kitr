@@ -1,0 +1,6 @@
+{
+  "size": "80x24",
+  "tags": ["text-sizing", "osc66"],
+  "settle": 1.5,
+  "threshold": 12.0
+}

@@ -75,6 +75,10 @@ pub struct ScreenOptions {
     /// Scrollback capacity in lines. The effective capacity is
     /// `max(scrollback, lines)`, matching `alloc_historybuf()` in C.
     pub scrollback: u32,
+    /// Device pixels per cell. `0` means unknown; graphics placements then
+    /// cannot derive their size from pixel dimensions.
+    pub cell_width: u32,
+    pub cell_height: u32,
 }
 
 /// Builder for [`Screen`].
@@ -207,6 +211,9 @@ pub struct Screen {
     pub(crate) graphics_queries: Vec<GraphicsQuery>,
     pub(crate) graphics_unsupported: Vec<UnsupportedGraphics>,
     pub last_graphics_error: Option<GraphicsError>,
+    /// Device pixels per cell, mirrored from the window's font metrics.
+    pub cell_width: u32,
+    pub cell_height: u32,
     pub(crate) colors: ColorOverrides,
     pub(crate) color_stack: ColorStack,
     pub(crate) output: Vec<u8>,
@@ -216,7 +223,15 @@ impl Screen {
     /// Construct a screen with the C constructor's `(lines, columns)` order and
     /// the given scrollback size.
     pub fn new(lines: u32, columns: u32, scrollback: u32) -> Result<Self, ScreenError> {
-        Self::with_options(lines, columns, ScreenOptions { scrollback })
+        Self::with_options(
+            lines,
+            columns,
+            ScreenOptions {
+                scrollback,
+                cell_width: 0,
+                cell_height: 0,
+            },
+        )
     }
 
     /// Construct a screen from [`ScreenOptions`].
@@ -266,6 +281,8 @@ impl Screen {
             graphics_queries: Vec::new(),
             graphics_unsupported: Vec::new(),
             last_graphics_error: None,
+            cell_width: options.cell_width,
+            cell_height: options.cell_height,
             colors: ColorOverrides::new(),
             color_stack: ColorStack::default(),
             output: Vec::new(),
@@ -273,6 +290,18 @@ impl Screen {
         screen.cursor.x = 0;
         screen.cursor.y = 0;
         Ok(screen)
+    }
+
+    /// Update the device pixel size of one cell. The renderer uses this for
+    /// graphics placements whose `c=`/`r=` values are omitted.
+    pub fn set_cell_size(&mut self, width: u32, height: u32) {
+        self.cell_width = width;
+        self.cell_height = height;
+    }
+
+    /// Device pixel size of one cell, if known.
+    pub fn cell_size(&self) -> (u32, u32) {
+        (self.cell_width, self.cell_height)
     }
 
     /// Create a builder for a screen.

@@ -11,12 +11,13 @@ derivative work of kitty and is licensed under **GPL-3.0-or-later**. See
 
 ## Status
 
-This is an early but usable Linux/X11 port. `kitr` opens a real EGL/OpenGL
-window, runs a shell, renders background/text/cursor/underlines, handles
-keyboard, mouse, clipboard, resize and scrollback, and can write a PPM
-screenshot. Wayland, macOS, IME, tabs/layouts, kitty graphics images, remote
-control and kittens are not integrated yet. Do not treat any subsystem as complete until
-it is marked **ported** in [PORTING.md](PORTING.md).
+`kitr` is a usable Linux port. It opens a real EGL/OpenGL window on X11 or
+Wayland, runs a shell, renders background/text/cursor/underlines and graphics
+images, handles keyboard/mouse/touch/tablet input, IME, clipboard and DnD,
+resize and scrollback, and can write a PPM screenshot. Tabs/layouts, sessions,
+remote control, common kittens, layer-shell panels/QAT and packaging are
+integrated. macOS/Cocoa remains unimplemented; do not treat any subsystem as
+complete until it is marked **ported** in [PORTING.md](PORTING.md).
 
 | Crate | Ported from | Status |
 |---|---|---|
@@ -32,10 +33,10 @@ it is marked **ported** in [PORTING.md](PORTING.md).
 | `kitty-graphics` | `graphics.c`, `png-reader.c`, `mime-cache.c`, graphics parser | PNG decode, MIME, base64, graphics command parser and image pipeline; Screen/GPU integration pending |
 | `kitty-remote` | `crypto.c`, `remote_control.py`, `client.py`, `rc/*` | X25519/ECDH, AES-256-GCM, framing, JSON, Unix-socket server + client, command dispatch, file-copy primitives |
 | `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | EGL/GL backend: real Slang programs generated from `kitty/shaders`, variants/defines/reflection/custom shaders, damage, atlas, instances, decorations, images/backgrounds/logo/trail, overlays, shaped ligature sprites; fixed-cell sprite-array path pending |
-| `kitty-kittens` | `kittens.c`, Python/Go kittens | discovery, launch planning, DCS host, shell handoff; native kitten engines for transfer (simple + rsync), SSH bootstrap/askpass, desktop portal, panel/QAT launch and remote-file actions |
+| `kitty-kittens` | `kittens.c`, Python/Go kittens | discovery, launch planning, DCS host, shell handoff; native kitten engines for transfer (simple + rsync, disk-backed deltas above 8 MiB), SSH bootstrap/askpass with ControlMaster forwarding/recovery, desktop portal with request `Close` and `current_filter`, layer-shell panel/QAT hosting and interactive remote-file save paths |
 | `kitty-ui` | `tabs.py`, `window.py`, `layout/*`, `session.py` | tabs/windows/layout/session model, wired into the GUI |
-| `kitty-window` | GLFW window/event layer | Linux X11 + Wayland: events, XKB keys, XIM/Wayland IME, mouse, XDND drag-and-drop, INCR clipboard, EGL, HiDPI; Cocoa/touch pending |
-| `kitty` (binary) | `main.py`, launcher | headless and X11 GUI terminal: tabs, splits, sessions, remote control, kitten launch |
+| `kitty-window` | GLFW window/event layer | Linux X11 + Wayland: events, XKB keys, XIM/Wayland IME, mouse, XDND drag-and-drop, INCR clipboard, EGL, HiDPI, `wl_touch`, `zwp_tablet_v2` pressure/tilt curves and `wlr-layer-shell`; Cocoa and touch pressure on core Wayland (no protocol axis) remain pending |
+| `kitty` (binary) | `main.py`, launcher | headless and X11/Wayland GUI terminal: tabs, splits, sessions, remote control, layer-shell panel/QAT, kitten launch |
 
 [PORTING.md](PORTING.md) contains the complete C/Python inventory, the crate
 dependency graph, the phase plan, per-file mapping, performance plan and risk
@@ -57,7 +58,8 @@ Headless terminal:
 cargo run --release -p kitty -- --headless --size 120x40 --dump-screen -- /bin/sh -c 'echo hello'
 ```
 
-GUI terminal (Linux/X11, needs a display; use `xvfb-run` for headless testing):
+GUI terminal (Linux X11 or Wayland, needs a display; use `xvfb-run` for
+headless X11 testing):
 
 ```sh
 cargo run --release -p kitty -- --size 100x30 -- /bin/sh
@@ -76,8 +78,15 @@ cargo run --release -p kitty-input --example bench
 ```
 
 Packaging includes a `Makefile`, a byte-identical `xterm-kitty` terminfo,
-shell-integration scripts, desktop/AppStream/man pages, a screenshot parity
-harness and CI. See [packaging/README.md](packaging/README.md).
+shell-integration scripts, desktop/AppStream/man pages, Debian/RPM/Flatpak
+builds, a screenshot parity harness and CI. See
+[packaging/README.md](packaging/README.md).
+
+```sh
+make parity-corpus            # full C-kitty vs kitr corpus
+make flatpak-sources-check    # generated Flatpak Cargo sources are current
+make deb rpm                  # distribution packages (tooling required)
+```
 
 See [BENCHMARKS.md](BENCHMARKS.md) for measured C-vs-Rust numbers and the
 methodology. The C sources are not included in this repository. Ported files carry an SPDX

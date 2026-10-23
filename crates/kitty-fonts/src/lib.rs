@@ -65,6 +65,7 @@
 //! assert!(!bitmap.data.is_empty());
 //! ```
 
+pub mod color;
 pub mod discovery;
 pub mod error;
 pub mod face;
@@ -76,6 +77,7 @@ pub mod metrics;
 pub mod raster;
 pub mod shaping;
 
+pub use color::{ColorGlyphOptions, ColorGlyphType};
 pub use discovery::{FontQuery, Fontconfig, MatchedFace};
 pub use error::{Error, Result};
 
@@ -90,5 +92,6 @@ pub use raster::{
     GlyphBitmap, PixelFormat, RasterCache, RASTER_CACHE_MAX_BYTES, RASTER_CACHE_MAX_ENTRIES,
 };
 pub use shaping::{
-    shape, ClusterLevel, Feature, ShapeOptions, ShapedGlyph, ShapedRun, ShapedRunCache,
+    shape, ClusterLevel, Feature, ShapeOptions, ShapedDirection, ShapedGlyph, ShapedRun,
+    ShapedRunCache,
 };

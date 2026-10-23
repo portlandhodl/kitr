@@ -1,0 +1,6 @@
+new_tab alpha
+launch --title alpha /bin/sh -c "printf 'fade tab alpha\n'; sleep 30"
+new_tab beta
+launch --title beta /bin/sh -c "printf 'fade tab beta\n'; sleep 30"
+new_tab gamma
+launch --title gamma /bin/sh -c "printf 'fade tab gamma\n'; sleep 30"

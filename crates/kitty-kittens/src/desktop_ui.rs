@@ -373,6 +373,26 @@ pub fn enable_portal(kitten_exe: &Path) -> Result<Vec<PathBuf>, String> {
 
 // The live portal service ///////////////////////////////////////////////////
 
+/// One filter group as carried by the FileChooser portal (`(sa(us))`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileFilter {
+    pub name: String,
+    /// `(kind, pattern)` pairs. `kind` is 0 for glob and 1 for MIME.
+    pub rules: Vec<(u32, String)>,
+}
+
+impl FileFilter {
+    pub fn from_dbus(value: &OwnedValue) -> Option<Self> {
+        let (name, rules) = <(String, Vec<(u32, String)>)>::try_from(value.clone()).ok()?;
+        Some(Self { name, rules })
+    }
+
+    pub fn to_dbus(&self) -> OwnedValue {
+        OwnedValue::try_from(Value::new((self.name.clone(), self.rules.clone())))
+            .expect("file filters are representable")
+    }
+}
+
 /// A file chooser request sent by xdg-desktop-portal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileChooserRequest {
@@ -387,6 +407,10 @@ pub struct FileChooserRequest {
     pub current_name: String,
     pub current_file: String,
     pub filters: Vec<(String, String, String)>,
+    /// Filter groups in portal order, with `current_filter` moved to the front.
+    pub filter_groups: Vec<FileFilter>,
+    /// The filter requested by the caller via `current_filter`.
+    pub current_filter: Option<FileFilter>,
 }
 
 /// The result returned by a [`ChooserLauncher`].
@@ -404,6 +428,16 @@ pub struct FileChooserResult {
 /// display server.
 pub trait ChooserLauncher: Send + Sync {
     fn choose(&self, request: &FileChooserRequest) -> Result<FileChooserResult, String>;
+
+    /// Run the chooser while allowing a portal `Close` request to cancel it.
+    /// Implementations that cannot cancel can use the default.
+    fn choose_cancelable(
+        &self,
+        request: &FileChooserRequest,
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<FileChooserResult, String> {
+        self.choose(request)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +447,14 @@ struct ProcessChooserLauncher {
 
 impl ChooserLauncher for ProcessChooserLauncher {
     fn choose(&self, request: &FileChooserRequest) -> Result<FileChooserResult, String> {
+        self.choose_cancelable(request, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    fn choose_cancelable(
+        &self,
+        request: &FileChooserRequest,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<FileChooserResult, String> {
         let temp = std::env::temp_dir().join(format!(
             "kitty-portal-{}-{}",
             std::process::id(),
@@ -441,10 +483,30 @@ impl ChooserLauncher for ProcessChooserLauncher {
                 .arg("--suggested-save-file-path")
                 .arg(&request.current_file);
         }
-        for (kind, value, name) in &request.filters {
+        for filter in &request.filter_groups {
+            let kind = if filter.rules.iter().all(|(kind, _)| *kind == 0) {
+                "glob"
+            } else if filter.rules.iter().all(|(kind, _)| *kind == 1) {
+                "mime"
+            } else {
+                "glob"
+            };
+            let value = filter
+                .rules
+                .iter()
+                .map(|(_, pattern)| pattern.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             command
                 .arg("--file-filter")
-                .arg(format!("{kind}:{value}:{name}"));
+                .arg(format!("{kind}:{value}:{}", filter.name));
+        }
+        if request.filter_groups.is_empty() {
+            for (kind, value, name) in &request.filters {
+                command
+                    .arg("--file-filter")
+                    .arg(format!("{kind}:{value}:{name}"));
+            }
         }
         let target = if request.current_folder.is_empty() {
             std::env::var_os("HOME")
@@ -454,7 +516,23 @@ impl ChooserLauncher for ProcessChooserLauncher {
             PathBuf::from(&request.current_folder)
         };
         command.arg(target);
-        let status = command.status().map_err(|err| err.to_string())?;
+        let mut child = command.spawn().map_err(|err| err.to_string())?;
+        let status = loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_dir_all(&temp);
+                return Ok(FileChooserResult {
+                    interrupted: true,
+                    current_filter: request.current_filter.as_ref().map(|f| f.name.clone()),
+                    ..FileChooserResult::default()
+                });
+            }
+            match child.try_wait().map_err(|err| err.to_string())? {
+                Some(status) => break status,
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
         let result = if status.success() {
             let text = fs::read_to_string(&output).map_err(|err| err.to_string())?;
             parse_chooser_output(&text)?
@@ -743,6 +821,77 @@ impl ChangeSettingsInterface {
 
 struct FileChooserInterface {
     chooser: std::sync::Arc<dyn ChooserLauncher>,
+    connection: SharedConnection,
+}
+
+/// The per-request `org.freedesktop.impl.portal.Request` object. Exporting it
+/// at `handle` lets the portal frontend cancel a running chooser by calling
+/// `Close`.
+struct RequestInterface {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Request")]
+impl RequestInterface {
+    fn close(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn run_chooser_request(
+    chooser: std::sync::Arc<dyn ChooserLauncher>,
+    connection: SharedConnection,
+    request: FileChooserRequest,
+) -> Result<FileChooserResult, String> {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connection = connection
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned());
+    let registered = if let Some(connection) = &connection {
+        connection
+            .inner()
+            .object_server()
+            .at(
+                request.handle.as_str(),
+                RequestInterface {
+                    cancel: cancel.clone(),
+                },
+            )
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread_cancel = cancel.clone();
+    let thread_request = request.clone();
+    std::thread::spawn(move || {
+        let result = chooser.choose_cancelable(&thread_request, &thread_cancel);
+        let _ = sender.send(result);
+    });
+    let result = loop {
+        match receiver.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                break Err("file chooser thread exited without a result".to_owned())
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                async_io::Timer::after(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    };
+    if registered {
+        if let Some(connection) = &connection {
+            let _ = connection
+                .inner()
+                .object_server()
+                .remove::<RequestInterface, _>(request.handle.as_str())
+                .await;
+        }
+    }
+    result
 }
 
 fn option_bool(options: &std::collections::HashMap<String, OwnedValue>, key: &str) -> bool {
@@ -767,26 +916,46 @@ fn option_bytes(options: &std::collections::HashMap<String, OwnedValue>, key: &s
         .unwrap_or_default()
 }
 
-fn option_filters(
+fn option_filter_groups(
     options: &std::collections::HashMap<String, OwnedValue>,
-) -> Vec<(String, String, String)> {
+) -> Vec<FileFilter> {
     let Some(value) = options.get("filters") else {
         return Vec::new();
     };
-    let Ok(filters) = Vec::<(String, Vec<(u32, String)>)>::try_from(value.clone()) else {
+    let Ok(groups) = Vec::<(String, Vec<(u32, String)>)>::try_from(value.clone()) else {
         return Vec::new();
     };
+    groups
+        .into_iter()
+        .map(|(name, rules)| FileFilter { name, rules })
+        .collect()
+}
+
+fn option_filters(groups: &[FileFilter]) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
-    for (name, expressions) in filters {
-        for (kind, pattern) in expressions {
+    for group in groups {
+        for (kind, pattern) in &group.rules {
             out.push((
-                if kind == 0 { "glob" } else { "mime" }.to_owned(),
+                if *kind == 0 { "glob" } else { "mime" }.to_owned(),
                 pattern.clone(),
-                name.clone(),
+                group.name.clone(),
             ));
         }
     }
     out
+}
+
+fn option_current_filter(
+    options: &std::collections::HashMap<String, OwnedValue>,
+    groups: &[FileFilter],
+) -> Option<FileFilter> {
+    let value = options.get("current_filter")?;
+    let filter = FileFilter::from_dbus(value)?;
+    groups
+        .iter()
+        .find(|group| **group == filter)
+        .cloned()
+        .or(Some(filter))
 }
 
 fn file_chooser_request(
@@ -816,6 +985,12 @@ fn file_chooser_request(
     } else {
         "file"
     };
+    let mut filter_groups = option_filter_groups(options);
+    let current_filter = option_current_filter(options, &filter_groups);
+    if let Some(current) = &current_filter {
+        filter_groups.retain(|group| group != current);
+        filter_groups.insert(0, current.clone());
+    }
     FileChooserRequest {
         handle: handle.to_owned(),
         app_id: app_id.to_owned(),
@@ -827,7 +1002,9 @@ fn file_chooser_request(
         current_folder: option_bytes(options, "current_folder"),
         current_name: option_bytes(options, "current_name"),
         current_file: option_bytes(options, "current_file"),
-        filters: option_filters(options),
+        filters: option_filters(&filter_groups),
+        filter_groups,
+        current_filter,
     }
 }
 
@@ -845,6 +1022,7 @@ fn uri_for_path(path: &str) -> String {
 
 fn chooser_response(
     result: &FileChooserResult,
+    request: &FileChooserRequest,
 ) -> (u32, std::collections::HashMap<String, OwnedValue>) {
     let mut results = std::collections::HashMap::new();
     if result.interrupted {
@@ -853,13 +1031,28 @@ fn chooser_response(
     let uris: Vec<String> = result.paths.iter().map(|path| uri_for_path(path)).collect();
     let uris = OwnedValue::try_from(Value::from(uris)).expect("string arrays are representable");
     results.insert("uris".to_owned(), uris);
+    if let Some(name) = &result.current_filter {
+        if let Some(filter) = request
+            .filter_groups
+            .iter()
+            .find(|filter| &filter.name == name)
+            .or_else(|| {
+                request
+                    .current_filter
+                    .as_ref()
+                    .filter(|filter| &filter.name == name)
+            })
+        {
+            results.insert("current_filter".to_owned(), filter.to_dbus());
+        }
+    }
     (0, results)
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.FileChooser")]
 impl FileChooserInterface {
     #[zbus(out_args("response", "results"))]
-    fn open_file(
+    async fn open_file(
         &self,
         handle: &str,
         app_id: &str,
@@ -868,14 +1061,20 @@ impl FileChooserInterface {
         options: std::collections::HashMap<String, OwnedValue>,
     ) -> (u32, std::collections::HashMap<String, OwnedValue>) {
         let request = file_chooser_request(handle, app_id, parent_window, title, &options, false);
-        match self.chooser.choose(&request) {
-            Ok(result) => chooser_response(&result),
+        match run_chooser_request(
+            self.chooser.clone(),
+            self.connection.clone(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(result) => chooser_response(&result, &request),
             Err(_) => (2, std::collections::HashMap::new()),
         }
     }
 
     #[zbus(out_args("response", "results"))]
-    fn save_file(
+    async fn save_file(
         &self,
         handle: &str,
         app_id: &str,
@@ -884,8 +1083,14 @@ impl FileChooserInterface {
         options: std::collections::HashMap<String, OwnedValue>,
     ) -> (u32, std::collections::HashMap<String, OwnedValue>) {
         let request = file_chooser_request(handle, app_id, parent_window, title, &options, true);
-        match self.chooser.choose(&request) {
-            Ok(result) => chooser_response(&result),
+        match run_chooser_request(
+            self.chooser.clone(),
+            self.connection.clone(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(result) => chooser_response(&result, &request),
             Err(_) => (2, std::collections::HashMap::new()),
         }
     }
@@ -975,6 +1180,7 @@ pub fn serve_portal(
             config.object_path.clone(),
             FileChooserInterface {
                 chooser: config.chooser.clone(),
+                connection: connection_slot.clone(),
             },
         )
         .map_err(|err| format!("failed to export FileChooser interface: {err}"))?
@@ -1509,5 +1715,176 @@ mod tests {
         let json = settings.as_json();
         assert!(json.contains("\"key\":\"value\""));
         assert!(json.contains(PORTAL_APPEARANCE_NAMESPACE));
+    }
+}
+
+#[cfg(test)]
+mod portal_request_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn options_with_filters() -> HashMap<String, OwnedValue> {
+        let filters = vec![
+            ("Images".to_owned(), vec![(0u32, "*.png".to_owned())]),
+            ("Text".to_owned(), vec![(0u32, "*.txt".to_owned())]),
+        ];
+        let current = ("Text".to_owned(), vec![(0u32, "*.txt".to_owned())]);
+        HashMap::from([
+            (
+                "filters".to_owned(),
+                OwnedValue::try_from(Value::new(filters)).unwrap(),
+            ),
+            (
+                "current_filter".to_owned(),
+                OwnedValue::try_from(Value::new(current)).unwrap(),
+            ),
+            (
+                "current_folder".to_owned(),
+                OwnedValue::try_from(Value::from(b"/tmp\0".to_vec())).unwrap(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn current_filter_is_first_group_and_round_trips() {
+        let options = options_with_filters();
+        let request = file_chooser_request(
+            "/org/freedesktop/portal/desktop/request/1",
+            "app",
+            "",
+            "Pick",
+            &options,
+            false,
+        );
+        assert_eq!(request.current_filter.as_ref().unwrap().name, "Text");
+        assert_eq!(request.filter_groups[0].name, "Text");
+        assert_eq!(request.filter_groups[1].name, "Images");
+        assert_eq!(request.filters.len(), 2);
+
+        let result = FileChooserResult {
+            paths: vec!["/tmp/a.txt".to_owned()],
+            interrupted: false,
+            current_filter: Some("Text".to_owned()),
+        };
+        let (status, response) = chooser_response(&result, &request);
+        assert_eq!(status, 0);
+        let value = response.get("current_filter").unwrap();
+        let filter = FileFilter::from_dbus(value).unwrap();
+        assert_eq!(filter.name, "Text");
+        assert_eq!(filter.rules, vec![(0u32, "*.txt".to_owned())]);
+    }
+
+    #[test]
+    fn request_close_sets_the_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interface = RequestInterface {
+            cancel: cancel.clone(),
+        };
+        interface.close();
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    struct BlockingChooser;
+    impl ChooserLauncher for BlockingChooser {
+        fn choose(&self, _: &FileChooserRequest) -> Result<FileChooserResult, String> {
+            Ok(FileChooserResult::default())
+        }
+
+        fn choose_cancelable(
+            &self,
+            request: &FileChooserRequest,
+            cancel: &AtomicBool,
+        ) -> Result<FileChooserResult, String> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !cancel.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(FileChooserResult {
+                paths: Vec::new(),
+                interrupted: cancel.load(Ordering::Relaxed),
+                current_filter: request.current_filter.as_ref().map(|f| f.name.clone()),
+            })
+        }
+    }
+
+    #[test]
+    fn live_portal_close_cancels_the_chooser() {
+        let bus_name = format!(
+            "org.freedesktop.impl.portal.desktop.kitty.cancel{}",
+            std::process::id()
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut config = PortalConfig::new(ColorScheme::Dark, "cyan", Contrast::Normal);
+        config.bus_name = bus_name.clone();
+        config = config.with_chooser(Arc::new(BlockingChooser));
+        let flag = shutdown.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = serve_portal(config, Some(flag));
+        });
+        let connection = loop {
+            if let Ok(connection) = zbus::blocking::Connection::session() {
+                break connection;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // Wait for the name to be owned.
+        for _ in 0..200 {
+            if connection
+                .call_method(
+                    Some(bus_name.as_str()),
+                    DESKTOP_OBJECT_PATH,
+                    Some(SETTINGS_INTERFACE),
+                    "Read",
+                    &(PORTAL_APPEARANCE_NAMESPACE, PORTAL_COLOR_SCHEME_KEY),
+                )
+                .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let handle = "/org/freedesktop/portal/desktop/request/cancel/1";
+        let caller = connection.clone();
+        let chooser_bus_name = bus_name.clone();
+        let chooser_thread = std::thread::spawn(move || {
+            let empty = HashMap::<String, OwnedValue>::new();
+            caller
+                .call_method(
+                    Some(chooser_bus_name.as_str()),
+                    DESKTOP_OBJECT_PATH,
+                    Some(FILE_CHOOSER_INTERFACE),
+                    "OpenFile",
+                    &(handle, "app", "", "Cancel me", empty),
+                )
+                .map(|reply| {
+                    reply
+                        .body()
+                        .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+                        .unwrap()
+                })
+        });
+        let mut closed = false;
+        for _ in 0..100 {
+            match connection.call_method(
+                Some(bus_name.as_str()),
+                handle,
+                Some("org.freedesktop.impl.portal.Request"),
+                "Close",
+                &(),
+            ) {
+                Ok(_) => {
+                    closed = true;
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(closed, "request Close object was never exported");
+        let (status, _) = chooser_thread.join().unwrap().unwrap();
+        assert_eq!(status, 1);
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = thread.join();
     }
 }

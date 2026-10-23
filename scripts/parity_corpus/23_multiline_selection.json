@@ -1,0 +1,6 @@
+{
+  "size": "80x24",
+  "tags": ["selection", "mouse", "multiline"],
+  "settle": 1.5,
+  "mouse": ["move 15 28", "down 1", "sleep 0.1", "move 260 58", "sleep 0.1", "up 1", "move 400 200"]
+}

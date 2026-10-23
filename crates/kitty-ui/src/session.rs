@@ -153,6 +153,9 @@ impl Session {
             self.tabs.pop();
         }
         self.tabs.push(SessionTab::new(&self.opts, name));
+        // kitty activates the most recently added tab unless a later `focus`
+        // or `focus_tab` command overrides it.
+        self.active_tab_idx = self.tabs.len() - 1;
     }
 
     pub fn set_next_title(&mut self, title: &str) {

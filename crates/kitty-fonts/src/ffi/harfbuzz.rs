@@ -75,6 +75,7 @@ extern "C" {
     );
     pub fn hb_buffer_guess_segment_properties(buffer: *mut hb_buffer_t);
     pub fn hb_buffer_set_direction(buffer: *mut hb_buffer_t, direction: c_int);
+    pub fn hb_buffer_get_direction(buffer: *mut hb_buffer_t) -> c_int;
     pub fn hb_buffer_set_cluster_level(buffer: *mut hb_buffer_t, level: c_int);
     pub fn hb_buffer_get_glyph_infos(
         buffer: *mut hb_buffer_t,

@@ -63,12 +63,18 @@ pub struct Options {
     pub title: Option<String>,
     /// Render then write a top-down PPM and exit.
     pub screenshot: Option<std::path::PathBuf>,
+    /// Delay after the first output before taking `--screenshot`.
+    pub screenshot_delay: Duration,
     /// True when `--scrollback` was given on the command line.
     pub scrollback_explicit: bool,
     /// Load tabs/windows from this kitty session file.
     pub session: Option<std::path::PathBuf>,
     /// Remote-control socket (`unix:/path`, `unix:@abstract` or a path).
     pub listen_on: Option<OsString>,
+    /// Create a layer-shell panel/QAT surface instead of a normal toplevel.
+    pub layer_shell: Option<kitty_kittens::panel::LayerShellConfig>,
+    /// Start a panel/QAT surface without mapping it (`--start-as-hidden`).
+    pub layer_shell_start_hidden: bool,
 }
 
 /// Frontend selection.
@@ -96,15 +102,19 @@ impl Default for Options {
             config: None,
             title: None,
             screenshot: None,
+            screenshot_delay: Duration::from_millis(150),
             scrollback_explicit: false,
             session: None,
             listen_on: None,
+            layer_shell: None,
+            layer_shell_start_hidden: false,
         }
     }
 }
 
 /// Result of parsing the CLI.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CliAction {
     Run(Options),
     Help,
@@ -231,6 +241,15 @@ where
                 let value = iter.next().ok_or(ArgError::MissingValue("--session"))?;
                 options.session = Some(std::path::PathBuf::from(value));
             }
+            "--screenshot-delay" => {
+                let value = iter
+                    .next()
+                    .ok_or(ArgError::MissingValue("--screenshot-delay"))?;
+                options.screenshot_delay = Duration::from_millis(parse_u32(
+                    "--screenshot-delay",
+                    &value.to_string_lossy(),
+                )? as u64);
+            }
             "--listen-on" => {
                 let value = iter.next().ok_or(ArgError::MissingValue("--listen-on"))?;
                 options.listen_on = Some(value);
@@ -278,6 +297,12 @@ where
             }
             _ if text.starts_with("--listen-on=") => {
                 options.listen_on = Some(OsString::from(&text["--listen-on=".len()..]));
+            }
+            _ if text.starts_with("--screenshot-delay=") => {
+                options.screenshot_delay = Duration::from_millis(parse_u32(
+                    "--screenshot-delay",
+                    &text["--screenshot-delay=".len()..],
+                )? as u64);
             }
             _ if text.starts_with("--scrollback=") => {
                 options.scrollback = parse_u32("--scrollback", &text["--scrollback=".len()..])?;
@@ -348,8 +373,82 @@ fn use_gui(options: &Options) -> bool {
                 && (options.screenshot.is_some()
                     || options.session.is_some()
                     || options.listen_on.is_some()
-                    || std::env::var_os("DISPLAY").is_some())
+                    || options.layer_shell.is_some()
+                    || std::env::var_os("DISPLAY").is_some()
+                    || std::env::var_os("WAYLAND_DISPLAY").is_some())
         }
+    }
+}
+
+/// Recognize the `kitty +kitten panel` / `quick-access-terminal` host form and
+/// turn it into a GUI [`Options`] carrying a real layer-shell configuration.
+fn kitten_host_options(args: &[OsString]) -> io::Result<Option<Options>> {
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    if !matches!(
+        first.to_str(),
+        Some("+kitten") | Some("kitten") | Some("--kitten")
+    ) {
+        return Ok(None);
+    }
+    let Some(name) = args.get(1).and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    let rest: Vec<String> = args[2..]
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+    let mut options = Options::default();
+    match name {
+        "panel" => {
+            let panel = kitty_kittens::panel::parse_panel_args(&rest)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if panel.help {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(kitty_kittens::panel::PANEL_USAGE.as_bytes())?;
+                stdout.flush()?;
+                return Ok(None);
+            }
+            options.layer_shell = Some(kitty_kittens::panel::layer_shell_config(&panel));
+            options.layer_shell_start_hidden = panel.start_as_hidden;
+            options.title = Some(if panel.name.is_empty() {
+                panel.class.clone()
+            } else {
+                panel.name.clone()
+            });
+            options.command = panel.items.into_iter().map(OsString::from).collect();
+            Ok(Some(options))
+        }
+        "quick-access-terminal" | "quick-access" => {
+            let qat = kitty_kittens::quick_access_terminal::parse_quick_access_args(&rest)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if qat.help {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(
+                    kitty_kittens::quick_access_terminal::QUICK_ACCESS_USAGE.as_bytes(),
+                )?;
+                stdout.flush()?;
+                return Ok(None);
+            }
+            let config = kitty_kittens::quick_access_terminal::load_config(
+                &qat,
+                &kitty_kittens::quick_access_terminal::config_paths(),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let launch = kitty_kittens::quick_access_terminal::build_quick_access_launch(
+                std::path::Path::new("kitr"),
+                &config,
+                &qat,
+                std::path::Path::new("."),
+            );
+            options.layer_shell = Some(launch.layer_shell);
+            options.layer_shell_start_hidden = config.start_as_hidden;
+            options.title = Some(config.app_id);
+            options.command = qat.items.into_iter().map(OsString::from).collect();
+            Ok(Some(options))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -363,8 +462,11 @@ where
     if args.first().is_some_and(|arg| arg == OsStr::new("@")) {
         return remote_client::run_client(&args[1..]);
     }
-    let action =
-        parse_args(args).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let kitten_host = kitten_host_options(&args)?;
+    let action = match kitten_host {
+        Some(options) => CliAction::Run(options),
+        None => parse_args(args).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+    };
     match action {
         CliAction::Help => {
             let mut stdout = io::stdout().lock();
@@ -924,6 +1026,37 @@ mod tests {
             command: command.iter().map(OsString::from).collect(),
             ..Options::default()
         }
+    }
+
+    #[test]
+    fn parses_panel_and_quick_access_host_invocations() {
+        let args = [
+            "+kitten",
+            "panel",
+            "--edge=bottom",
+            "--layer=overlay",
+            "--lines=10",
+            "--app-id=kitty-panel",
+            "--start-as-hidden",
+            "sh",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let options = kitten_host_options(&args).unwrap().unwrap();
+        let layer = options.layer_shell.as_ref().unwrap();
+        assert_eq!(layer.edge, kitty_kittens::panel::Edge::Bottom);
+        assert_eq!(layer.layer, kitty_kittens::panel::Layer::Overlay);
+        assert_eq!(layer.y_size_in_cells, 10);
+        assert!(options.layer_shell_start_hidden);
+        assert_eq!(options.command, vec![OsString::from("sh")]);
+
+        let args = ["+kitten", "quick-access-terminal", "--override=lines=12"]
+            .iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let options = kitten_host_options(&args).unwrap().unwrap();
+        assert_eq!(options.layer_shell.unwrap().y_size_in_cells, 12);
     }
 
     #[test]

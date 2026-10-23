@@ -7,6 +7,9 @@
 //! followed by 20-byte `(index, weak, strong)` block hashes, and a delta
 //! stream made of block/block-range/data/hash operations.
 
+use std::io::Write;
+use std::path::Path;
+
 use crate::xxh3;
 
 /// Block size used when the file size is unknown.
@@ -219,8 +222,30 @@ enum Pending {
     Range(u64, u64),
 }
 
+/// Files above this size use the disk-backed delta path in the transfer
+/// kitten by default. It is deliberately conservative so small files still
+/// avoid a temporary-file round trip.
+pub const DISK_DELTA_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Whether a file of `size` bytes should use the disk-backed delta path.
+pub fn should_spill_delta(size: u64) -> bool {
+    size >= DISK_DELTA_THRESHOLD
+}
+
 /// Create a delta that transforms `signature` (the target) into `source`.
 pub fn create_delta(source: &[u8], signature: &Signature) -> Result<Vec<u8>, RsyncError> {
+    let mut out = Vec::new();
+    create_delta_to_writer(source, signature, &mut out)?;
+    Ok(out)
+}
+
+/// Streaming form of [`create_delta`]. The delta is written incrementally, so
+/// callers can spill it to a file instead of keeping it in memory.
+pub fn create_delta_to_writer(
+    source: &[u8],
+    signature: &Signature,
+    out: &mut dyn Write,
+) -> Result<(), RsyncError> {
     let block_size = signature.block_size as usize;
     if block_size == 0 {
         return Err(RsyncError::BadSignature(
@@ -237,7 +262,6 @@ pub fn create_delta(source: &[u8], signature: &Signature) -> Result<Vec<u8>, Rsy
     for block in &signature.blocks {
         by_weak.entry(block.weak_hash).or_default().push(*block);
     }
-    let mut out = Vec::new();
     let mut pending: Option<Pending> = None;
     let mut data_start = 0usize;
     let mut pos = 0usize;
@@ -245,7 +269,7 @@ pub fn create_delta(source: &[u8], signature: &Signature) -> Result<Vec<u8>, Rsy
     macro_rules! flush_pending {
         () => {
             if let Some(op) = pending.take() {
-                emit_pending(&mut out, op);
+                emit_pending(out, op)?;
             }
         };
     }
@@ -253,7 +277,7 @@ pub fn create_delta(source: &[u8], signature: &Signature) -> Result<Vec<u8>, Rsy
         ($end:expr) => {
             if $end > data_start {
                 flush_pending!();
-                emit_data(&mut out, &source[data_start..$end]);
+                emit_data(out, &source[data_start..$end])?;
             }
         };
     }
@@ -267,7 +291,7 @@ pub fn create_delta(source: &[u8], signature: &Signature) -> Result<Vec<u8>, Rsy
                     pending = Some(Pending::Range(start, $index));
                 }
                 Some(op) => {
-                    emit_pending(&mut out, op);
+                    emit_pending(out, op)?;
                     pending = Some(Pending::Block($index));
                 }
                 None => pending = Some(Pending::Block($index)),
@@ -332,33 +356,69 @@ pub fn create_delta(source: &[u8], signature: &Signature) -> Result<Vec<u8>, Rsy
     }
     flush_pending!();
     let checksum = xxh3::hash128(source).to_be_bytes();
-    out.push(OP_HASH);
-    out.extend_from_slice(&(checksum.len() as u16).to_le_bytes());
-    out.extend_from_slice(&checksum);
-    Ok(out)
+    out.write_all(&[OP_HASH])
+        .map_err(|err| RsyncError::BadDelta(format!("failed to write delta: {err}")))?;
+    out.write_all(&(checksum.len() as u16).to_le_bytes())
+        .map_err(|err| RsyncError::BadDelta(format!("failed to write delta: {err}")))?;
+    out.write_all(&checksum)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to write delta: {err}")))?;
+    Ok(())
 }
 
-fn emit_data(out: &mut Vec<u8>, data: &[u8]) {
+/// Create a delta file from `source_path` without retaining the delta in
+/// memory. The source is read once; the delta is written incrementally to
+/// `delta_path` via a sibling temporary file and renamed into place.
+pub fn create_delta_file(
+    source_path: &Path,
+    signature: &Signature,
+    delta_path: &Path,
+) -> Result<u64, RsyncError> {
+    let source = std::fs::read(source_path)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to read source: {err}")))?;
+    let temp = delta_path.with_extension(format!(
+        "{}.tmp",
+        delta_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("delta")
+    ));
+    {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|err| RsyncError::BadDelta(format!("failed to create delta: {err}")))?;
+        create_delta_to_writer(&source, signature, &mut file)?;
+        file.flush()
+            .map_err(|err| RsyncError::BadDelta(format!("failed to flush delta: {err}")))?;
+    }
+    let len = std::fs::metadata(&temp)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to stat delta: {err}")))?
+        .len();
+    std::fs::rename(&temp, delta_path)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to install delta: {err}")))?;
+    Ok(len)
+}
+
+fn emit_data(out: &mut dyn Write, data: &[u8]) -> Result<(), RsyncError> {
     const MAX_CHUNK: usize = u32::MAX as usize;
     for chunk in data.chunks(MAX_CHUNK) {
-        out.push(OP_DATA);
-        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
-        out.extend_from_slice(chunk);
+        out.write_all(&[OP_DATA])
+            .and_then(|()| out.write_all(&(chunk.len() as u32).to_le_bytes()))
+            .and_then(|()| out.write_all(chunk))
+            .map_err(|err| RsyncError::BadDelta(format!("failed to write delta: {err}")))?;
     }
+    Ok(())
 }
 
-fn emit_pending(out: &mut Vec<u8>, op: Pending) {
+fn emit_pending(out: &mut dyn Write, op: Pending) -> Result<(), RsyncError> {
     match op {
-        Pending::Block(index) => {
-            out.push(OP_BLOCK);
-            out.extend_from_slice(&index.to_le_bytes());
-        }
-        Pending::Range(start, end) => {
-            out.push(OP_BLOCK_RANGE);
-            out.extend_from_slice(&start.to_le_bytes());
-            out.extend_from_slice(&((end - start) as u32).to_le_bytes());
-        }
+        Pending::Block(index) => out
+            .write_all(&[OP_BLOCK])
+            .and_then(|()| out.write_all(&index.to_le_bytes())),
+        Pending::Range(start, end) => out
+            .write_all(&[OP_BLOCK_RANGE])
+            .and_then(|()| out.write_all(&start.to_le_bytes()))
+            .and_then(|()| out.write_all(&((end - start) as u32).to_le_bytes())),
     }
+    .map_err(|err| RsyncError::BadDelta(format!("failed to write delta: {err}")))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -433,6 +493,110 @@ pub fn apply_delta_with_block_size(
     block_size: usize,
 ) -> Result<Vec<u8>, RsyncError> {
     apply_delta_impl(target, delta, block_size, true)
+}
+
+/// Apply a delta to a writer without buffering the reconstructed file.
+/// Returns the checksum carried by the delta so the caller can verify it
+/// against the finished output.
+pub fn apply_delta_to_writer(
+    target: &[u8],
+    delta: &[u8],
+    block_size: usize,
+    out: &mut dyn Write,
+) -> Result<Vec<u8>, RsyncError> {
+    if block_size == 0 {
+        return Err(RsyncError::BadSignature(
+            "signature block size must not be zero".to_owned(),
+        ));
+    }
+    let mut offset = 0usize;
+    let mut checksum: Option<Vec<u8>> = None;
+    let copy_block = |out: &mut dyn Write, index: u64| -> Result<(), RsyncError> {
+        let start = index
+            .checked_mul(block_size as u64)
+            .ok_or_else(|| RsyncError::BadDelta("block index overflow".to_owned()))?
+            as usize;
+        if start >= target.len() {
+            return Err(RsyncError::BadDelta(format!(
+                "block index {index} is outside the target file"
+            )));
+        }
+        let end = (start + block_size).min(target.len());
+        out.write_all(&target[start..end])
+            .map_err(|err| RsyncError::BadDelta(format!("failed to write output: {err}")))
+    };
+    while offset < delta.len() {
+        let (operation, consumed) = parse_operation(&delta[offset..])?;
+        offset += consumed;
+        match operation {
+            Operation::Block(index) => copy_block(out, index)?,
+            Operation::Range(start, end) => {
+                for index in start..=end {
+                    copy_block(out, index)?;
+                }
+            }
+            Operation::Data(data) => out
+                .write_all(data)
+                .map_err(|err| RsyncError::BadDelta(format!("failed to write output: {err}")))?,
+            Operation::Hash(expected) => {
+                if checksum.is_some() {
+                    return Err(RsyncError::BadDelta(
+                        "multiple checksum operations in delta".to_owned(),
+                    ));
+                }
+                checksum = Some(expected.to_vec());
+            }
+        }
+    }
+    checksum.ok_or(RsyncError::MissingChecksum)
+}
+
+/// Apply a delta by spilling the reconstructed file to `output_path`.
+/// The data is written through a sibling temporary file and renamed only after
+/// the checksum passes.
+pub fn apply_delta_file(
+    target_path: &Path,
+    delta_path: &Path,
+    block_size: usize,
+    output_path: &Path,
+) -> Result<(), RsyncError> {
+    let target = std::fs::read(target_path)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to read target: {err}")))?;
+    let delta = std::fs::read(delta_path)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to read delta: {err}")))?;
+    let temp = output_path.with_extension(format!(
+        "{}.tmp",
+        output_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("out")
+    ));
+    let expected = {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|err| RsyncError::BadDelta(format!("failed to create output: {err}")))?;
+        let expected = apply_delta_to_writer(&target, &delta, block_size, &mut file)?;
+        file.flush()
+            .map_err(|err| RsyncError::BadDelta(format!("failed to flush output: {err}")))?;
+        expected
+    };
+    let output = std::fs::read(&temp)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to verify output: {err}")))?;
+    let actual = xxh3::hash128(&output).to_be_bytes();
+    if actual.as_slice() != expected.as_slice() {
+        let _ = std::fs::remove_file(&temp);
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        return Err(RsyncError::ChecksumMismatch {
+            actual: hex(&actual),
+            expected: hex(&expected),
+        });
+    }
+    std::fs::rename(&temp, output_path)
+        .map_err(|err| RsyncError::BadDelta(format!("failed to install output: {err}")))
 }
 
 fn apply_delta_impl(
@@ -592,5 +756,68 @@ mod tests {
         assert_eq!(block_size_for(0), DEFAULT_BLOCK_SIZE);
         assert_eq!(block_size_for(1_000_000), 1000);
         assert_eq!(block_size_for(1), 1);
+    }
+}
+
+#[cfg(test)]
+mod disk_delta_tests {
+    use super::*;
+
+    #[test]
+    fn file_backed_delta_round_trips_without_keeping_the_delta_in_memory() {
+        let root = std::env::temp_dir().join(format!("kitr-rsync-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("source.bin");
+        let target_path = root.join("target.bin");
+        let delta_path = root.join("change.delta");
+        let output_path = root.join("output.bin");
+        let source = b"0123456789abcdef".repeat(700_000);
+        let mut target = source.clone();
+        target[500_000..500_100].fill(b'X');
+        std::fs::write(&source_path, &source).unwrap();
+        std::fs::write(&target_path, &target).unwrap();
+        let signature =
+            create_signature(&target, block_size_for(target.len() as u64) as u32).unwrap();
+        let parsed = parse_signature(&signature).unwrap();
+        let length = create_delta_file(&source_path, &parsed, &delta_path).unwrap();
+        assert_eq!(length, std::fs::metadata(&delta_path).unwrap().len());
+        assert!(length < source.len() as u64 / 4);
+        apply_delta_file(
+            &target_path,
+            &delta_path,
+            parsed.block_size as usize,
+            &output_path,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output_path).unwrap(), source);
+        assert!(should_spill_delta(source.len() as u64));
+        assert!(!should_spill_delta(4096));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_backed_apply_rejects_a_corrupt_delta() {
+        let root = std::env::temp_dir().join(format!("kitr-rsync-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = b"hello world".repeat(1000);
+        let target = source.clone();
+        let source_path = root.join("s");
+        let target_path = root.join("t");
+        let delta_path = root.join("d");
+        let output_path = root.join("o");
+        std::fs::write(&source_path, &source).unwrap();
+        std::fs::write(&target_path, &target).unwrap();
+        let signature = create_signature(&target, 64).unwrap();
+        let parsed = parse_signature(&signature).unwrap();
+        create_delta_file(&source_path, &parsed, &delta_path).unwrap();
+        let mut bytes = std::fs::read(&delta_path).unwrap();
+        let end = bytes.len();
+        bytes[end - 1] ^= 0xff;
+        std::fs::write(&delta_path, bytes).unwrap();
+        assert!(apply_delta_file(&target_path, &delta_path, 64, &output_path).is_err());
+        assert!(!output_path.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

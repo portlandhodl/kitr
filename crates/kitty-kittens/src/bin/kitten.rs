@@ -229,8 +229,51 @@ fn run_native_ssh(args: &[String]) -> Result<ExitCode, String> {
     if cli_config.askpass != ssh::SshHostConfig::new().askpass {
         host.askpass = cli_config.askpass.clone();
     }
+    let mut control_conn =
+        ssh::connection_data(&[vec!["ssh".to_owned()], passthrough.clone()].concat())
+            .unwrap_or_else(|| ssh::SshConnectionData {
+                binary: "ssh".to_owned(),
+                hostname: destination.clone(),
+                ..ssh::SshConnectionData::default()
+            });
+    control_conn.hostname = destination.clone();
+    let pid = std::env::var("KITTY_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_else(std::process::id);
+    control_conn.control_pid = pid;
+    if host.share_connections {
+        control_conn.ssh_kitten_cmdline = Vec::new();
+        // Keep the master's ControlPath identical to the session command.
+        control_conn.identity_file.clear();
+    }
+    if host.forward_remote_control {
+        if !host.share_connections {
+            return Err(
+                "Cannot use forward_remote_control=yes without share_connections=yes as it relies on SSH Controlmasters"
+                    .to_owned(),
+            );
+        }
+        let listen_on = std::env::var("KITTY_LISTEN_ON").map_err(|_| {
+            "forward_remote_control=yes requires KITTY_LISTEN_ON to be set by kitty".to_owned()
+        })?;
+        let mut runner = ssh::SystemSshRunner;
+        let forwarded = ssh::forward_remote_control(&control_conn, &listen_on, &mut runner)
+            .map_err(|error| error.to_string())?;
+        eprintln!(
+            "kitr: forwarding remote control on {}{}",
+            forwarded.listen_on,
+            if forwarded.recovered {
+                " (recovered stale ControlMaster)"
+            } else {
+                ""
+            }
+        );
+        host.env
+            .push(format!("KITTY_LISTEN_ON {}", forwarded.listen_on));
+    }
     let options = ssh::BootstrapOptions::default();
-    let plan = ssh::prepare_ssh_session(
+    let mut plan = ssh::prepare_ssh_session(
         &host,
         &ssh_args,
         &server_args,
@@ -239,6 +282,10 @@ fn run_native_ssh(args: &[String]) -> Result<ExitCode, String> {
         &|key| std::env::var(key).ok(),
     )
     .map_err(io_error)?;
+    if host.share_connections && !control_conn.is_ssh_kitten {
+        plan.ssh_command
+            .splice(1..1, ssh::connection_sharing_args(pid));
+    }
     let Some(program) = plan.ssh_command.first() else {
         return Err("empty ssh command".to_owned());
     };
@@ -490,6 +537,21 @@ fn exec_kitty(argv: Vec<String>) -> Result<ExitCode, String> {
     })
 }
 
+fn host_terminal_exe() -> std::path::PathBuf {
+    if let Some(exe) = std::env::var_os("KITTY_EXE").or_else(|| std::env::var_os("KITR_EXE")) {
+        return std::path::PathBuf::from(exe);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for name in ["kitr", "kitty"] {
+            let candidate = exe.with_file_name(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from("kitty")
+}
+
 fn run_native_panel(args: &[String]) -> Result<ExitCode, String> {
     use kitty_kittens::panel;
     let opts = panel::parse_panel_args(args)?;
@@ -497,10 +559,7 @@ fn run_native_panel(args: &[String]) -> Result<ExitCode, String> {
         println!("{}", panel::PANEL_USAGE);
         return Ok(ExitCode::SUCCESS);
     }
-    let exe = std::env::var_os("KITTY_EXE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("kitty"));
-    exec_kitty(panel::build_panel_command(&exe, &opts))
+    exec_kitty(panel::build_panel_command(&host_terminal_exe(), &opts))
 }
 
 fn run_native_quick_access(args: &[String]) -> Result<ExitCode, String> {
@@ -511,11 +570,8 @@ fn run_native_quick_access(args: &[String]) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     let config = quick_access_terminal::load_config(&opts, &quick_access_terminal::config_paths())?;
-    let exe = std::env::var_os("KITTY_EXE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("kitty"));
     exec_kitty(quick_access_terminal::build_quick_access_command(
-        &exe,
+        &host_terminal_exe(),
         &config,
         &opts,
         &config_dir(),

@@ -86,6 +86,35 @@ impl ClusterLevel {
     }
 }
 
+/// Paragraph direction chosen by `hb_buffer_guess_segment_properties()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ShapedDirection {
+    LeftToRight,
+    #[default]
+    RightToLeft,
+    TopToBottom,
+    BottomToTop,
+}
+
+impl ShapedDirection {
+    fn from_hb(value: i32) -> Self {
+        match value {
+            harfbuzz::HB_DIRECTION_RTL => Self::RightToLeft,
+            harfbuzz::HB_DIRECTION_TTB => Self::TopToBottom,
+            harfbuzz::HB_DIRECTION_BTT => Self::BottomToTop,
+            _ => Self::LeftToRight,
+        }
+    }
+
+    pub fn is_rtl(self) -> bool {
+        self == Self::RightToLeft
+    }
+
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, Self::LeftToRight | Self::RightToLeft)
+    }
+}
+
 /// Options for one shaping call.
 #[derive(Clone, Debug, Default)]
 pub struct ShapeOptions {
@@ -119,6 +148,7 @@ pub struct ShapedRun {
     pub glyphs: Vec<ShapedGlyph>,
     pub num_codepoints: usize,
     pub cluster_level: ClusterLevel,
+    pub direction: ShapedDirection,
 }
 
 impl ShapedRun {
@@ -205,6 +235,8 @@ pub(crate) unsafe fn shape_raw(
         harfbuzz::hb_shape(font, buffer.ptr, features.as_ptr(), features.len() as u32);
     }
 
+    let direction =
+        unsafe { ShapedDirection::from_hb(harfbuzz::hb_buffer_get_direction(buffer.ptr)) };
     let mut info_len = 0u32;
     let mut pos_len = 0u32;
     let infos = unsafe { harfbuzz::hb_buffer_get_glyph_infos(buffer.ptr, &mut info_len) };
@@ -227,6 +259,7 @@ pub(crate) unsafe fn shape_raw(
         glyphs,
         num_codepoints: text.len(),
         cluster_level: options.cluster_level,
+        direction,
     })
 }
 
@@ -347,6 +380,10 @@ impl ShapedRunCache {
     pub fn misses(&self) -> u64 {
         self.misses
     }
+}
+
+pub(crate) fn ceil_div_64_public(value: i32) -> i32 {
+    ceil_div_64(value) as i32
 }
 
 fn ceil_div_64(value: i32) -> u32 {

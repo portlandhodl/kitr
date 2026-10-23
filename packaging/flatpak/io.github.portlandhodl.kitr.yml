@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Flatpak manifest skeleton. The source list is intentionally local-only:
-# generate the two Cargo source entries with `flatpak-cargo-generator.py`
-# before publishing a reproducible build. This manifest is validated by
-# `make package`, which does not require network access.
+# Flatpak manifest. `cargo-sources.json` is generated from Cargo.lock by
+# `scripts/generate_flatpak_cargo_sources.py` and checked by `make
+# flatpak-sources-check`; it contains one archive per registry crate plus the
+# vendored-source config.
 app-id: io.github.portlandhodl.kitr
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
@@ -37,6 +37,4 @@ modules:
     sources:
       - type: dir
         path: ../..
-      - type: file
-        path: cargo-sources.json
-        dest: cargo-sources.json
+      - cargo-sources.json

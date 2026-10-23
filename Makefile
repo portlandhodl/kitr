@@ -29,6 +29,7 @@ PARITY_ARTIFACTS ?= artifacts/screenshot-parity
 PARITY_ARGS ?=
 DIST ?= dist
 VERSION ?= 0.1.0
+PARITY_CORPUS ?= scripts/parity_corpus
 ARCH ?= $(shell uname -m)
 
 ICON_PNG := $(wildcard packaging/icons/kitr.png)
@@ -37,7 +38,8 @@ ICON_SVG := $(wildcard packaging/icons/kitr.svg)
 .PHONY: all build test lint fmt clippy install uninstall terminfo \
 	install-binary install-terminfo install-shell-integration \
 	install-desktop install-man screenshot-parity license-check validate \
-	package package-smoke clean help
+	package package-smoke flatpak-sources flatpak-sources-check deb rpm \
+	parity-corpus clean help
 
 all: build
 
@@ -81,7 +83,9 @@ terminfo:
 install-binary: build
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBEXECDIR)"
 	$(INSTALL) -m 755 target/release/kitr "$(DESTDIR)$(LIBEXECDIR)/kitr"
+	$(INSTALL) -m 755 target/release/kitten "$(DESTDIR)$(LIBEXECDIR)/kitten"
 	$(INSTALL) -m 755 packaging/bin/kitr "$(DESTDIR)$(BINDIR)/kitr"
+	$(INSTALL) -m 755 target/release/kitten "$(DESTDIR)$(BINDIR)/kitten"
 
 install-terminfo: terminfo
 	$(INSTALL) -d "$(DESTDIR)$(TERMINFODIR)/x" "$(DESTDIR)$(TERMINFODIR)/78"
@@ -129,7 +133,7 @@ install: install-binary install-terminfo install-shell-integration install-deskt
 	@echo "installed kitr under $(DESTDIR)$(PREFIX)"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/kitr"
+	rm -f "$(DESTDIR)$(BINDIR)/kitr" "$(DESTDIR)$(BINDIR)/kitten"
 	rm -rf "$(DESTDIR)$(LIBEXECDIR)"
 	rm -f "$(DESTDIR)$(TERMINFODIR)/x/xterm-kitty" "$(DESTDIR)$(TERMINFODIR)/78/xterm-kitty"
 	rm -rf "$(DESTDIR)$(SHELLINTEGRATIONDIR)"
@@ -159,6 +163,36 @@ screenshot-parity: build
 		--artifacts "$(PARITY_ARTIFACTS)" \
 		$(PARITY_ARGS)
 
+parity-corpus: build
+	$(PYTHON) scripts/screenshot_parity.py \
+		--corpus "$(PARITY_CORPUS)" \
+		--kitr target/release/kitr \
+		--threshold "$(PARITY_THRESHOLD)" \
+		--artifacts "$(PARITY_ARTIFACTS)" \
+		$(PARITY_ARGS)
+
+flatpak-sources:
+	$(PYTHON) scripts/generate_flatpak_cargo_sources.py \
+		Cargo.lock -o packaging/flatpak/cargo-sources.json
+
+flatpak-sources-check:
+	$(PYTHON) scripts/generate_flatpak_cargo_sources.py \
+		Cargo.lock -o packaging/flatpak/cargo-sources.json --check
+
+deb:
+	rm -rf "$(DIST)/deb-src"
+	mkdir -p "$(DIST)/deb-src/kitr-$(VERSION)"
+	tar --exclude=.git --exclude=target --exclude=dist --exclude=artifacts \
+		--exclude=build --exclude=__pycache__ -cf - . \
+		| tar -C "$(DIST)/deb-src/kitr-$(VERSION)" -xf -
+	cp -a packaging/debian "$(DIST)/deb-src/kitr-$(VERSION)/debian"
+	cd "$(DIST)/deb-src/kitr-$(VERSION)" && dpkg-buildpackage -us -uc -b -d
+	@find "$(DIST)/deb-src" -maxdepth 1 -name '*.deb' -print
+
+rpm:
+	VERSION="$(VERSION)" scripts/build_rpm.sh
+
+
 license-check:
 	$(PYTHON) scripts/check_licenses.py
 
@@ -186,4 +220,9 @@ help:
 		'  license-check         verify SPDX headers and notices/manifests' \
 		'  validate              validate desktop and AppStream metadata' \
 		'  package               stage a /usr install, run smoke checks, write a tarball' \
+		'  parity-corpus         run the full C-kitty vs kitr screenshot corpus' \
+		'  flatpak-sources       regenerate packaging/flatpak/cargo-sources.json' \
+		'  flatpak-sources-check fail if the generated Cargo sources are stale' \
+		'  deb                   build a Debian binary package with dpkg-buildpackage' \
+		'  rpm                   build a source tarball and RPM with rpmbuild' \
 		'  clean                 cargo clean and remove generated artifacts'

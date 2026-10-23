@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use kitty_fonts::{Face, PixelFormat, ShapeOptions, ShapedGlyph};
+use kitty_fonts::{Face, PixelFormat, ShapeOptions};
 
 use crate::atlas::{GlyphBitmap, GlyphKey, GlyphRasterizer};
 use crate::shaped::{ShapedRunCluster, ShapedRunOutput, ShapedRunRequest};
@@ -58,164 +58,209 @@ impl GlyphRasterizer for FontRasterizer {
         {
             return None;
         }
-        let options = ShapeOptions {
-            force_ltr: true,
-            ..ShapeOptions::default()
-        };
-        let shaped = self.face.shape(run.text, &options).ok()?;
+        let shaped = self.face.shape(run.text, &ShapeOptions::default()).ok()?;
         if shaped.glyphs.is_empty() {
             return None;
         }
-
-        let mut cell_codepoints = vec![0usize; run.cell_count as usize];
-        for &cell in run.cell_for_codepoint {
-            let slot = cell_codepoints.get_mut(cell as usize)?;
-            *slot += 1;
+        let special = shaped.direction.is_rtl()
+            || run.text.len() != run.cell_count as usize
+            || shaped.glyphs.len() != run.cell_count as usize;
+        if !special {
+            return None;
         }
-
-        let mut groups: Vec<GlyphGroup> = Vec::new();
-        let mut last_cluster = 0usize;
-        for (index, glyph) in shaped.glyphs.iter().enumerate() {
-            let start = glyph.cluster as usize;
-            if start >= run.text.len() || start < last_cluster {
-                return None;
-            }
-            last_cluster = start;
-            let end = shaped
-                .glyphs
-                .get(index + 1)
-                .map(|next| next.cluster as usize)
-                .unwrap_or(run.text.len())
-                .max(start + 1)
-                .min(run.text.len());
-            let first_cell = *run.cell_for_codepoint.get(start)?;
-            let last_cell = *run.cell_for_codepoint.get(end - 1)?;
-            if last_cell < first_cell {
-                return None;
-            }
-            let span = last_cell - first_cell + 1;
-            match groups.last_mut() {
-                Some(group) if group.cell_start == first_cell => {
-                    group.cell_span = group.cell_span.max(span);
-                    group.glyphs.push(index);
-                }
-                _ => groups.push(GlyphGroup {
-                    cell_start: first_cell,
-                    cell_span: span,
-                    glyphs: vec![index],
-                }),
-            }
-        }
-
-        let mut pen_positions = Vec::with_capacity(shaped.glyphs.len());
-        let mut pen_x = 0i32;
-        let mut pen_y = 0i32;
-        for glyph in &shaped.glyphs {
-            pen_positions.push((pen_x, pen_y));
-            pen_x = pen_x.saturating_add(glyph.x_advance);
-            pen_y = pen_y.saturating_add(glyph.y_advance);
-        }
-
         let cell_width = run.cell_width.round().max(1.0) as i32;
         let cell_height = run.cell_height.round().max(1.0) as i32;
         let baseline = run.baseline.round() as i32;
-
-        let mut output = ShapedRunOutput::default();
-        for group in groups {
-            let special = group.cell_span > 1
-                || group.glyphs.len() > 1
-                || (group.cell_start as usize
-                    ..group.cell_start as usize + group.cell_span as usize)
-                    .any(|cell| cell_codepoints.get(cell).copied().unwrap_or(0) > 1);
-            if !special {
-                continue;
-            }
-            let canvas_width = cell_width.checked_mul(group.cell_span as i32)?;
-            if canvas_width <= 0 || cell_height <= 0 {
-                continue;
-            }
-            let mut canvas = vec![0u8; canvas_width as usize * cell_height as usize];
-            let origin_x = group.cell_start as i32 * cell_width;
-            for &glyph_index in &group.glyphs {
-                let glyph = shaped.glyphs[glyph_index];
-                let (pen_x, pen_y) = pen_positions[glyph_index];
-                if !composite_glyph(
-                    &self.face,
-                    glyph,
-                    pen_x,
-                    pen_y,
-                    origin_x,
-                    baseline,
-                    canvas_width,
-                    cell_height,
-                    &mut canvas,
-                ) {
-                    return None;
-                }
-            }
-            output.clusters.push(ShapedRunCluster {
-                cell_start: group.cell_start,
-                cell_span: group.cell_span,
-                bitmap: GlyphBitmap::gray(canvas_width as u32, cell_height as u32, canvas).ok()?,
-            });
+        let canvas_width = cell_width.checked_mul(run.cell_count as i32)?;
+        if canvas_width <= 0 || cell_height <= 0 {
+            return None;
         }
-        if output.clusters.is_empty() {
-            None
+        let mut any_color = false;
+        let mut glyphs = Vec::new();
+        let mut pen_x = 0.0f32;
+        let mut pen_y = 0.0f32;
+        for glyph in &shaped.glyphs {
+            let bitmap = self.face.rasterize_glyph(glyph.glyph_id).ok()?;
+            if bitmap.format != PixelFormat::Gray8 {
+                any_color = true;
+            }
+            glyphs.push((pen_x, pen_y, glyph.x_offset, glyph.y_offset, bitmap));
+            pen_x += (glyph.x_advance as f32 / 64.0).round();
+            pen_y += (glyph.y_advance as f32 / 64.0).round();
+        }
+        let mut gray = vec![0u8; canvas_width as usize * cell_height as usize];
+        let mut rgba = if any_color {
+            vec![0u8; canvas_width as usize * cell_height as usize * 4]
         } else {
-            Some(output)
+            Vec::new()
+        };
+        for (index, (gx, gy, x_off, y_off, bitmap)) in glyphs.into_iter().enumerate() {
+            let x = gx + x_off as f32 / 64.0;
+            let y = gy + y_off as f32 / 64.0;
+            let mut dest_x = (x + bitmap.left as f32) as i32;
+            if dest_x > 0 && index < 4 && dest_x as i64 + bitmap.width as i64 > canvas_width as i64
+            {
+                let extra = dest_x as i64 + bitmap.width as i64 - canvas_width as i64;
+                dest_x = if extra > dest_x as i64 {
+                    0
+                } else {
+                    dest_x - extra as i32
+                };
+            }
+            let yoff = (y + bitmap.top as f32) as i32;
+            let dest_y = if yoff > 0 && yoff > baseline {
+                0
+            } else {
+                baseline - yoff
+            };
+            if bitmap.format == PixelFormat::Gray8 {
+                if any_color {
+                    let mut layer = vec![0u8; bitmap.width as usize * bitmap.height as usize * 4];
+                    for row in 0..bitmap.height as usize {
+                        for col in 0..bitmap.width as usize {
+                            let a = bitmap.data[row * bitmap.pitch + col];
+                            let d = (row * bitmap.width as usize + col) * 4;
+                            layer[d..d + 4].copy_from_slice(&[255, 255, 255, a]);
+                        }
+                    }
+                    blit_rgba(
+                        &mut rgba,
+                        canvas_width as u32,
+                        cell_height as u32,
+                        bitmap.width,
+                        bitmap.height,
+                        &layer,
+                        dest_x,
+                        dest_y,
+                    );
+                } else {
+                    blit_gray(
+                        &mut gray,
+                        canvas_width as u32,
+                        cell_height as u32,
+                        &bitmap,
+                        dest_x,
+                        dest_y,
+                    );
+                }
+            } else {
+                let bgra = bitmap.format == PixelFormat::Bgra8;
+                let width = bitmap.width;
+                let height = bitmap.height;
+                let mut layer = vec![0u8; width as usize * height as usize * 4];
+                for row in 0..height as usize {
+                    for col in 0..width as usize {
+                        let src = row * bitmap.pitch + col * 4;
+                        let d = (row * width as usize + col) * 4;
+                        if bgra {
+                            layer[d] = bitmap.data[src + 2];
+                            layer[d + 1] = bitmap.data[src + 1];
+                            layer[d + 2] = bitmap.data[src];
+                        } else {
+                            layer[d..d + 3].copy_from_slice(&bitmap.data[src..src + 3]);
+                        }
+                        layer[d + 3] = bitmap.data[src + 3];
+                    }
+                }
+                blit_rgba(
+                    &mut rgba,
+                    canvas_width as u32,
+                    cell_height as u32,
+                    width,
+                    height,
+                    &layer,
+                    dest_x,
+                    dest_y,
+                );
+            }
         }
+        let bitmap = if any_color {
+            GlyphBitmap::rgba(canvas_width as u32, cell_height as u32, rgba).ok()?
+        } else {
+            GlyphBitmap::gray(canvas_width as u32, cell_height as u32, gray).ok()?
+        };
+        Some(ShapedRunOutput {
+            clusters: vec![ShapedRunCluster {
+                cell_start: 0,
+                cell_span: run.cell_count,
+                bitmap,
+            }],
+        })
     }
 }
 
-struct GlyphGroup {
-    cell_start: u32,
-    cell_span: u32,
-    glyphs: Vec<usize>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn composite_glyph(
-    face: &Face,
-    glyph: ShapedGlyph,
-    pen_x: i32,
-    pen_y: i32,
-    origin_x: i32,
-    baseline: i32,
-    canvas_width: i32,
-    canvas_height: i32,
+fn blit_gray(
     canvas: &mut [u8],
-) -> bool {
-    let Ok(bitmap) = face.rasterize_glyph(glyph.glyph_id) else {
-        return false;
-    };
-    if bitmap.format != PixelFormat::Gray8 || bitmap.width == 0 || bitmap.height == 0 {
-        return false;
-    }
-    let x_px = ((pen_x.saturating_add(glyph.x_offset)) as f32 / 64.0).round() as i32;
-    let y_px = ((pen_y.saturating_add(glyph.y_offset)) as f32 / 64.0).round() as i32;
-    let dest_x = x_px + bitmap.left - origin_x;
-    let dest_y = baseline - bitmap.top - y_px;
-    let bpp = bitmap.bytes_per_pixel();
+    width: u32,
+    height: u32,
+    bitmap: &kitty_fonts::GlyphBitmap,
+    x0: i32,
+    y0: i32,
+) {
     for row in 0..bitmap.height as i32 {
-        let y = dest_y + row;
-        if y < 0 || y >= canvas_height {
+        let y = y0 + row;
+        if y < 0 || y >= height as i32 {
             continue;
         }
-        let src_start = row as usize * bitmap.pitch;
-        if src_start + bitmap.width as usize * bpp > bitmap.data.len() {
-            return false;
-        }
         for col in 0..bitmap.width as i32 {
-            let x = dest_x + col;
-            if x < 0 || x >= canvas_width {
+            let x = x0 + col;
+            if x < 0 || x >= width as i32 {
                 continue;
             }
-            let src = bitmap.data[src_start + col as usize * bpp];
-            let dst = &mut canvas[y as usize * canvas_width as usize + x as usize];
+            let src = bitmap.data[row as usize * bitmap.pitch + col as usize];
+            let dst = &mut canvas[y as usize * width as usize + x as usize];
             *dst = (*dst).max(src);
         }
     }
-    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blit_rgba(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    bitmap_width: u32,
+    bitmap_height: u32,
+    data: &[u8],
+    x0: i32,
+    y0: i32,
+) {
+    for row in 0..bitmap_height as i32 {
+        let y = y0 + row;
+        if y < 0 || y >= height as i32 {
+            continue;
+        }
+        for col in 0..bitmap_width as i32 {
+            let x = x0 + col;
+            if x < 0 || x >= width as i32 {
+                continue;
+            }
+            let src = (row as u32 * bitmap_width + col as u32) as usize * 4;
+            let s = &data[src..src + 4];
+            if s[3] == 0 {
+                continue;
+            }
+            let dst = (y as usize * width as usize + x as usize) * 4;
+            if s[3] == 255 {
+                canvas[dst..dst + 4].copy_from_slice(s);
+                continue;
+            }
+            let sa = s[3] as u32;
+            let da = canvas[dst + 3] as u32;
+            let out_a = sa + da * (255 - sa) / 255;
+            let mix = |sc: u8, dc: u8| -> u8 {
+                if out_a == 0 {
+                    0
+                } else {
+                    ((sc as u32 * sa * 255 + dc as u32 * da * (255 - sa)) / (out_a * 255)) as u8
+                }
+            };
+            canvas[dst] = mix(s[0], canvas[dst]);
+            canvas[dst + 1] = mix(s[1], canvas[dst + 1]);
+            canvas[dst + 2] = mix(s[2], canvas[dst + 2]);
+            canvas[dst + 3] = out_a as u8;
+        }
+    }
 }
 
 fn convert_bitmap(bitmap: kitty_fonts::GlyphBitmap) -> Option<GlyphBitmap> {

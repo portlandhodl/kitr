@@ -390,6 +390,26 @@ pub enum WindowEvent {
         pressure: f64,
         phase: TouchPhase,
     },
+    /// A graphics-tablet tool event from `zwp_tablet_v2` (Wayland). X11
+    /// pointer events keep using [`WindowEvent::MouseMove`] because Xi2 does
+    /// not expose a separate tablet-tool object. `pressure`, `distance` and
+    /// `slider` are normalised; `tilt_x`/`tilt_y` and `rotation` are degrees.
+    TabletTool {
+        /// Stable id assigned by the backend for the lifetime of the tool.
+        tool: u64,
+        x: f64,
+        y: f64,
+        pressure: f64,
+        distance: f64,
+        tilt_x: f64,
+        tilt_y: f64,
+        rotation: f64,
+        slider: f64,
+        wheel: f64,
+        /// `true` for a touch-down/up, `false` for a motion update.
+        pressed: bool,
+        phase: TabletPhase,
+    },
     /// The event pump was woken through its wakeup pipe.
     Wakeup,
 }
@@ -401,6 +421,69 @@ pub enum TouchPhase {
     Updated,
     Ended,
     Cancelled,
+}
+
+/// Phase of a [`WindowEvent::TabletTool`] event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabletPhase {
+    ProximityIn,
+    ProximityOut,
+    Down,
+    Up,
+    Motion,
+    Wheel,
+}
+
+/// Maps a device's raw `0.0..=1.0` pressure to a perceptual curve.
+///
+/// Graphics tablets report pressure linearly, but a pen feels much lighter
+/// near the start of its range. The exponent is applied after clamping:
+/// values below 1.0 make light strokes easier, values above 1.0 require more
+/// force. `min`/`max` trim dead zones at either end. The identity curve is the
+/// default and is exactly invertible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PressureCurve {
+    pub min: f64,
+    pub max: f64,
+    pub exponent: f64,
+}
+
+impl PressureCurve {
+    pub const IDENTITY: Self = Self {
+        min: 0.0,
+        max: 1.0,
+        exponent: 1.0,
+    };
+
+    pub const fn new(min: f64, max: f64, exponent: f64) -> Self {
+        Self { min, max, exponent }
+    }
+
+    /// Standard soft-tip curve used by many drawing applications.
+    pub const fn soft() -> Self {
+        Self::new(0.0, 1.0, 0.65)
+    }
+
+    /// Apply the curve to a raw pressure value.
+    pub fn apply(&self, raw: f64) -> f64 {
+        let low = self.min.clamp(0.0, 1.0);
+        let high = self.max.clamp(low, 1.0);
+        let value = if high > low {
+            ((raw - low) / (high - low)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if self.exponent <= 0.0 || !self.exponent.is_finite() {
+            return 0.0;
+        }
+        value.powf(self.exponent).clamp(0.0, 1.0)
+    }
+}
+
+impl Default for PressureCurve {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
 }
 
 /// Common pointer shapes. Mapped to the X11 cursor font by the X11 backend.
@@ -444,6 +527,16 @@ pub struct WindowConfig {
     pub position: Option<(i32, i32)>,
     pub visible: bool,
     pub resizable: bool,
+    /// Optional `wlr-layer-shell` surface description. Wayland uses this to
+    /// create a panel/QAT surface instead of an `xdg_toplevel`; the X11
+    /// backend falls back to a normal override-redirect-style window.
+    pub layer_shell: Option<LayerShellConfig>,
+    /// Curve applied to raw tablet pressure before it reaches callers.
+    pub tablet_pressure_curve: PressureCurve,
+    /// Curve applied to touch pressure. Wayland's core `wl_touch` protocol has
+    /// no pressure axis, so it reports the protocol-implied 1.0/0.0; X11 and
+    /// tablet-tool contacts use the real device value through this curve.
+    pub touch_pressure_curve: PressureCurve,
 }
 
 impl Default for WindowConfig {
@@ -459,6 +552,9 @@ impl Default for WindowConfig {
             position: None,
             visible: true,
             resizable: true,
+            layer_shell: None,
+            tablet_pressure_curve: PressureCurve::IDENTITY,
+            touch_pressure_curve: PressureCurve::IDENTITY,
         }
     }
 }
@@ -487,6 +583,120 @@ impl WindowConfig {
     pub fn visible(mut self, visible: bool) -> Self {
         self.visible = visible;
         self
+    }
+
+    pub fn layer_shell(mut self, config: LayerShellConfig) -> Self {
+        self.layer_shell = Some(config);
+        self
+    }
+
+    pub fn tablet_pressure_curve(mut self, curve: PressureCurve) -> Self {
+        self.tablet_pressure_curve = curve;
+        self
+    }
+
+    pub fn touch_pressure_curve(mut self, curve: PressureCurve) -> Self {
+        self.touch_pressure_curve = curve;
+        self
+    }
+}
+
+/// Layer-shell stacking layer, mirroring `zwlr_layer_shell_v1.layer`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerShellLayer {
+    Background,
+    Bottom,
+    #[default]
+    Top,
+    Overlay,
+}
+
+/// Edge a layer-shell surface is anchored to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerShellEdge {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+    None,
+    CenterSized,
+}
+
+/// Keyboard-interactivity policy for a layer-shell surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerShellFocus {
+    #[default]
+    NotAllowed,
+    Exclusive,
+    OnDemand,
+}
+
+/// Neutral description of a `wlr-layer-shell` surface.
+///
+/// `width`/`height` are requested pixels. A zero dimension lets the compositor
+/// choose it for anchored axes, matching the protocol. `PanelLaunch` in
+/// `kitty-kittens` converts cells to pixels using the font metrics before it
+/// reaches the window backend.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayerShellConfig {
+    pub layer: LayerShellLayer,
+    pub edge: LayerShellEdge,
+    pub width: u32,
+    pub height: u32,
+    pub margin_top: i32,
+    pub margin_left: i32,
+    pub margin_bottom: i32,
+    pub margin_right: i32,
+    pub focus: LayerShellFocus,
+    pub exclusive_zone: i32,
+    pub override_exclusive_zone: bool,
+    pub output_name: String,
+    pub namespace: String,
+}
+
+impl LayerShellConfig {
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Anchor bits as defined by `zwlr_layer_surface_v1.anchor`.
+    pub fn anchor_bits(&self) -> u32 {
+        const TOP: u32 = 1;
+        const BOTTOM: u32 = 2;
+        const LEFT: u32 = 4;
+        const RIGHT: u32 = 8;
+        match self.edge {
+            LayerShellEdge::Top => TOP | LEFT | RIGHT,
+            LayerShellEdge::Bottom => BOTTOM | LEFT | RIGHT,
+            LayerShellEdge::Left => LEFT | TOP | BOTTOM,
+            LayerShellEdge::Right => RIGHT | TOP | BOTTOM,
+            LayerShellEdge::Center | LayerShellEdge::CenterSized | LayerShellEdge::None => 0,
+        }
+    }
+
+    /// Effective anchored dimensions. Horizontal panels span the output, so
+    /// their width is usually zero; vertical panels span the height.
+    pub fn requested_size(&self) -> (u32, u32) {
+        match self.edge {
+            LayerShellEdge::Top | LayerShellEdge::Bottom => (0, self.height),
+            LayerShellEdge::Left | LayerShellEdge::Right => (self.width, 0),
+            LayerShellEdge::Center => (self.width, self.height),
+            LayerShellEdge::CenterSized | LayerShellEdge::None => (self.width, self.height),
+        }
+    }
+
+    /// Keyboard-interactivity value passed to the compositor.
+    pub fn keyboard_interactivity(&self) -> u32 {
+        match self.focus {
+            LayerShellFocus::NotAllowed => 0,
+            LayerShellFocus::Exclusive => 1,
+            LayerShellFocus::OnDemand => 2,
+        }
     }
 }
 
@@ -548,4 +758,59 @@ pub mod keysym {
     pub const META_R: u32 = 0xffe8;
     pub const ISO_LEVEL3_SHIFT: u32 = 0xfe03;
     pub const SPACE: u32 = 0x0020;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressure_curve_trims_and_shapes() {
+        assert_eq!(PressureCurve::default().apply(0.25), 0.25);
+        let curved = PressureCurve::new(0.1, 0.9, 0.5);
+        assert_eq!(curved.apply(0.0), 0.0);
+        assert_eq!(curved.apply(1.0), 1.0);
+        assert!((curved.apply(0.5) - 0.5f64.sqrt()).abs() < 1e-12);
+        // Outside the trimmed range clamps to the endpoints.
+        assert_eq!(curved.apply(0.05), 0.0);
+        assert_eq!(curved.apply(0.95), 1.0);
+    }
+
+    #[test]
+    fn layer_shell_edges_anchor_and_size_like_kitty() {
+        let mut config = LayerShellConfig::new("kitty-panel");
+        config.edge = LayerShellEdge::Top;
+        config.height = 30;
+        assert_eq!(config.anchor_bits(), 1 | 4 | 8);
+        assert_eq!(config.requested_size(), (0, 30));
+
+        config.edge = LayerShellEdge::Left;
+        config.width = 40;
+        assert_eq!(config.anchor_bits(), 4 | 1 | 2);
+        assert_eq!(config.requested_size(), (40, 0));
+
+        config.edge = LayerShellEdge::Center;
+        assert_eq!(config.anchor_bits(), 0);
+        assert_eq!(config.requested_size(), (40, 30));
+
+        config.focus = LayerShellFocus::OnDemand;
+        assert_eq!(config.keyboard_interactivity(), 2);
+    }
+
+    #[test]
+    fn window_config_carries_layer_shell_and_curves() {
+        let config = WindowConfig::new("panel", 320, 240)
+            .layer_shell(LayerShellConfig::new("kitty-panel"))
+            .tablet_pressure_curve(PressureCurve::soft())
+            .touch_pressure_curve(PressureCurve::new(0.0, 1.0, 0.8));
+        assert_eq!(
+            config
+                .layer_shell
+                .as_ref()
+                .map(|config| config.namespace.as_str()),
+            Some("kitty-panel")
+        );
+        assert_eq!(config.tablet_pressure_curve, PressureCurve::soft());
+        assert_eq!(config.touch_pressure_curve.exponent, 0.8);
+    }
 }

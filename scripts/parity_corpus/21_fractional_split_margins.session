@@ -1,0 +1,4 @@
+new_tab margins
+layout splits
+launch --title left /bin/sh -c "printf 'left margin pane\n'; sleep 30"
+launch --location=vsplit --title right /bin/sh -c "printf 'right margin pane\n'; sleep 30"

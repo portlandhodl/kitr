@@ -669,7 +669,7 @@ rather than in the table. Status as of the initial Phase 0 landing:
 
 | C file | Target crate/module | Status |
 |---|---|---|
-| `animation.c` | `kitty-render/src/animation.rs` | planned |
+| `animation.c` | `kitty-graphics/src/animation.rs` + `kitty-render` | **ported** (delta frames, composition/timing, optional disk spill) |
 | `char-props.c` | `kitty-unicode/src/char_props.rs` | **ported** |
 | `charsets.c` | `kitty-vt/src/charsets.rs` | in progress (tables + UTF-8 DFA ported, Screen application pending) |
 | `child.c` | `kitty-os/src/child.rs` | **ported** |
@@ -691,16 +691,16 @@ rather than in the table. Status as of the initial Phase 0 landing:
 | `freetype.c` | `kitty-fonts/src/freetype.rs` | in progress (metrics/glyph lookup; rendering/variable axes pending) |
 | `freetype_render_ui_text.c` | `kitty-fonts/src/ui_text.rs` | planned |
 | `gl.c` | `kitty-render/src/{egl,gl_backend}.rs` | in progress (headless EGL/GL 3.3 core backend; window/presentation pending) |
-| `glfw.c` | `kitty-window/src/{lib,wayland}.rs` | in progress (Linux X11 + Wayland; Cocoa/IME/DnD pending) |
+| `glfw.c` | `kitty-window/src/{lib,wayland}.rs` | in progress (Linux X11 + Wayland including IME/DnD, touch and `zwp_tablet_v2`; Cocoa pending) |
 | `glfw-wrapper.c` | `kitty-window/src/lib.rs` | in progress (X11/EGL equivalent backend) |
 | `gl-wrapper.c` | `kitty-render/src/egl.rs` | in progress (function loading via eglGetProcAddress) |
 | `glyph-cache.c` | `kitty-render/src/atlas.rs` | in progress (CPU atlas; shaped-run sprites pending) |
-| `graphics.c` | `kitty-graphics/src/graphics.rs` + `kitty-render/src/images.rs` | in progress (parser, placements, textures, z-order; animation/composition/shm pending) |
+| `graphics.c` | `kitty-graphics/src/graphics.rs` + `kitty-render/src/images.rs` | in progress (parser, placements, textures, z-order, animation/composition and shm; remaining gaps in `PARITY.md`) |
 | `history.c` | `kitty-core/src/history.rs` | **ported** (core ring; pager/rewrap pending) |
 | `hyperlink.c` | `kitty-screen/src/hyperlink.rs` | **ported** |
 | `key_encoding.c` | `kitty-input/src/key_encoding.rs` | **ported** |
 | `keys.c` | `kitty-input/src/keys.rs` | **ported** (key map + dispatch; Screen/options integration pending) |
-| `kittens.c` | `kitty-kittens/src/lib.rs` | planned |
+| `kittens.c` | `kitty-kittens/src/lib.rs` | in progress (discovery, native kitten host, panel/QAT, portal, remote-file and SSH engines; macOS-only kittens skipped) |
 | `line-buf.c` | `kitty-core/src/linebuf.rs` | **ported** (core; rewrap/ANSI pending) |
 | `line.c` | `kitty-core/src/line.rs` | in progress (cell/line helpers; ANSI/URL pending) |
 | `logging.c` | `kitty-os/src/logging.rs` | planned |

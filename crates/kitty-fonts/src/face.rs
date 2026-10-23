@@ -7,6 +7,7 @@
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
+use crate::color::{self, ColorGlyphOptions, ColorGlyphType};
 use crate::error::{ft_check, Error, Result};
 use crate::ffi::freetype::{self, FT_Face};
 use crate::ffi::harfbuzz;
@@ -273,6 +274,65 @@ impl Face {
         self.has_color
     }
 
+    /// Colour technology used by `glyph_id`, if any.
+    pub fn color_glyph_type(&self, glyph_id: u32) -> Option<ColorGlyphType> {
+        color::glyph_color_type(self, glyph_id)
+    }
+
+    /// Rasterize a COLR/CBDT/SVG glyph into RGBA. Returns `None` when the
+    /// glyph is not a colour glyph. This is the kitty-compatible entry point
+    /// used by the renderer.
+    pub fn rasterize_color_glyph(
+        &self,
+        glyph_id: u32,
+        options: &ColorGlyphOptions,
+    ) -> Result<Option<GlyphBitmap>> {
+        color::rasterize_color_glyph(self, glyph_id, options)
+    }
+
+    pub(crate) fn ffi_face(&self) -> FT_Face {
+        self.face
+    }
+
+    /// Read a raw SFNT table through FreeType. `tag` is a four byte tag such
+    /// as `b"CBLC"`.
+    pub fn sfnt_table(&self, tag: &[u8; 4]) -> Option<Vec<u8>> {
+        let tag = u32::from_be_bytes(*tag) as freetype::FT_ULong;
+        let mut length: freetype::FT_ULong = 0;
+        let code = unsafe {
+            freetype::FT_Load_Sfnt_Table(self.face, tag, 0, std::ptr::null_mut(), &mut length)
+        };
+        if code != 0 || length == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; length as usize];
+        let code = unsafe {
+            freetype::FT_Load_Sfnt_Table(self.face, tag, 0, data.as_mut_ptr(), &mut length)
+        };
+        if code != 0 {
+            return None;
+        }
+        data.truncate(length as usize);
+        Some(data)
+    }
+
+    pub(crate) fn load_flags_value(&self) -> i32 {
+        self.load_flags
+    }
+
+    /// Pixels per font unit on each axis, derived from the active FT_Size.
+    pub(crate) fn pixels_per_font_unit(&self) -> (f64, f64) {
+        let size = unsafe { (*self.face).size };
+        if size.is_null() {
+            return (1.0, 1.0);
+        }
+        let metrics = unsafe { &(*size).metrics };
+        (
+            metrics.x_scale as f64 / 65536.0 / 64.0,
+            metrics.y_scale as f64 / 65536.0 / 64.0,
+        )
+    }
+
     pub fn is_variable(&self) -> bool {
         self.is_variable
     }
@@ -348,6 +408,13 @@ impl Face {
     /// (`FT_LOAD_DEFAULT | FT_LOAD_RENDER`). Color faces automatically also
     /// get `FT_LOAD_COLOR`.
     pub fn rasterize_glyph(&self, glyph_id: u32) -> Result<GlyphBitmap> {
+        if self.color_glyph_type(glyph_id).is_some() {
+            if let Some(bitmap) =
+                self.rasterize_color_glyph(glyph_id, &ColorGlyphOptions::default())?
+            {
+                return Ok(bitmap);
+            }
+        }
         self.rasterize_glyph_with_flags(
             glyph_id,
             freetype::FT_LOAD_DEFAULT | freetype::FT_LOAD_RENDER,
@@ -447,6 +514,16 @@ impl Face {
     /// Rasterize a codepoint on this face. Missing codepoints return
     /// [`Error::MissingGlyph`].
     pub fn rasterize_codepoint(&self, codepoint: u32) -> Result<GlyphBitmap> {
+        if codepoint <= 0x10FFFF {
+            let glyph_id = self.glyph_id(codepoint);
+            if glyph_id != 0 && self.color_glyph_type(glyph_id).is_some() {
+                if let Some(bitmap) =
+                    self.rasterize_color_glyph(glyph_id, &ColorGlyphOptions::default())?
+                {
+                    return Ok(bitmap);
+                }
+            }
+        }
         self.rasterize_codepoint_with_flags(
             codepoint,
             freetype::FT_LOAD_DEFAULT | freetype::FT_LOAD_RENDER,

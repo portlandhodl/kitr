@@ -31,6 +31,10 @@
 //!   [`WindowEvent::DragCancelled`] notifications;
 //! * XInput2 touch begin/update/end on X11 and `wl_touch` on Wayland, exposed
 //!   as [`WindowEvent::Touch`] with id, position, pressure and phase;
+//! * `zwp_tablet_v2` tool events on Wayland, exposed as
+//!   [`WindowEvent::TabletTool`] with pressure, tilt, rotation and axes;
+//! * `wlr-layer-shell` panel/QAT surfaces on Wayland via
+//!   [`WindowConfig::layer_shell`];
 //! * a `poll()`-based event pump with EINTR handling, configure/expose
 //!   coalescing and a pipe-based wakeup handle that another thread can use;
 //! * clipboard get/set with an async request state machine and blocking
@@ -58,10 +62,13 @@
 //!
 //! # Intentional gaps
 //!
-//! macOS/Cocoa is not implemented. Tablet-tool proximity, pressure curves and
-//! tilt from `zwp_tablet_v2` are not modelled; `wl_touch` uses unit pressure
-//! because the core protocol carries no pressure axis, while X11 maps the
-//! `Abs MT Pressure`/`Abs Pressure` valuator through its advertised range.
+//! macOS/Cocoa is not implemented. Wayland `zwp_tablet_v2` tool proximity,
+//! pressure (shaped by [`PressureCurve`]), tilt, rotation, slider and wheel are
+//! forwarded as [`WindowEvent::TabletTool`]; X11 touch maps the
+//! `Abs MT Pressure`/`Abs Pressure` valuator through its advertised range and
+//! the same curve. `wl_touch` still uses unit pressure because the core
+//! Wayland protocol carries no pressure axis. `wlr-layer-shell` panel/QAT
+//! surfaces are created when [`WindowConfig::layer_shell`] is set.
 //! X11 cursor themes load size-specific images through `libXcursor` when
 //! present and fall back to the cursor font otherwise; Wayland uses
 //! `libwayland-cursor` when present. Wayland window position is
@@ -117,11 +124,71 @@ pub use dnd::{DragSourceData, DragSourceState, DropTarget};
 pub use egl::EglWaylandSurface;
 pub use egl::{EglError, EglWindowSurface, GlApi, GlFns};
 pub use types::{
-    keysym, KeyAction, KeyInput, ModifierMasks, Modifiers, MouseButton, PointerShape, Selection,
-    TouchPhase, WindowConfig, WindowError, WindowEvent,
+    keysym, KeyAction, KeyInput, LayerShellConfig, LayerShellEdge, LayerShellFocus,
+    LayerShellLayer, ModifierMasks, Modifiers, MouseButton, PointerShape, PressureCurve, Selection,
+    TabletPhase, TouchPhase, WindowConfig, WindowError, WindowEvent,
 };
 pub use wakeup::WakeupHandle;
 pub use x11::{probe_display, x_error_count, X11Window};
 
 #[cfg(feature = "wayland")]
 pub use wayland::{probe_wayland, WaylandWindow};
+
+/// An EGL surface for either backend, selected to match [`WindowBackend`].
+pub enum EglSurface {
+    X11(egl::EglWindowSurface),
+    #[cfg(feature = "wayland")]
+    Wayland(egl::EglWaylandSurface),
+}
+
+impl EglSurface {
+    pub fn new(window: &WindowBackend) -> Result<Self, egl::EglError> {
+        match window {
+            WindowBackend::X11(window) => egl::EglWindowSurface::new(window).map(Self::X11),
+            #[cfg(feature = "wayland")]
+            WindowBackend::Wayland(window) => {
+                egl::EglWaylandSurface::new(window).map(Self::Wayland)
+            }
+        }
+    }
+
+    pub fn make_current(&self) -> Result<(), egl::EglError> {
+        match self {
+            Self::X11(surface) => surface.make_current(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(surface) => surface.make_current(),
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Self::X11(surface) => surface.size(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(surface) => surface.size(),
+        }
+    }
+
+    pub fn refresh_size(&mut self) -> (u32, u32) {
+        match self {
+            Self::X11(surface) => surface.refresh_size(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(surface) => surface.refresh_size(),
+        }
+    }
+
+    pub fn swap_buffers(&self) -> Result<(), egl::EglError> {
+        match self {
+            Self::X11(surface) => surface.swap_buffers(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(surface) => surface.swap_buffers(),
+        }
+    }
+
+    pub fn read_pixels(&mut self) -> Result<Vec<u8>, egl::EglError> {
+        match self {
+            Self::X11(surface) => surface.read_pixels(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(surface) => surface.read_pixels(),
+        }
+    }
+}

@@ -689,6 +689,246 @@ pub fn handle_remote_file_action(
     }
 }
 
+/// Where the interactive save UI remembers the last directory.
+pub fn last_used_store_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("kitr").join("remote-file-last-used.txt")
+}
+
+pub fn read_last_save_dir() -> PathBuf {
+    fs::read_to_string(last_used_store_path())
+        .ok()
+        .map(|text| PathBuf::from(text.trim()))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+pub fn write_last_save_dir(dir: &Path) {
+    let path = last_used_store_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, dir.to_string_lossy().as_bytes());
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Complete a partially typed path from the entries in its directory.
+/// Directories gain a trailing slash. Results preserve the input's
+/// absolute/relative form.
+pub fn complete_save_path(text: &str, cwd: &Path) -> Vec<String> {
+    let (dir_text, prefix) = match text.rfind('/') {
+        Some(index) => (&text[..=index], &text[index + 1..]),
+        None => ("", text),
+    };
+    let search_dir = if dir_text.is_empty() {
+        cwd.to_path_buf()
+    } else if Path::new(dir_text).is_absolute() {
+        PathBuf::from(dir_text)
+    } else {
+        cwd.join(dir_text)
+    };
+    let Ok(entries) = fs::read_dir(&search_dir) else {
+        return Vec::new();
+    };
+    let mut matches: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(prefix) {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            Some(format!("{dir_text}{name}{}", if is_dir { "/" } else { "" }))
+        })
+        .collect();
+    matches.sort();
+    matches
+}
+
+fn common_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for value in &values[1..] {
+        let mut length = 0;
+        for (left, right) in prefix.chars().zip(value.chars()) {
+            if left != right {
+                break;
+            }
+            length += left.len_utf8();
+        }
+        prefix.truncate(length);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+/// Read one path with inline editing and Tab completion. Returns `None` when
+/// the user presses Escape or Ctrl+C.
+pub fn prompt_save_path(
+    tty: &mut dyn crate::tui::Tty,
+    prompt: &str,
+    initial: &str,
+    cwd: &Path,
+) -> std::io::Result<Option<String>> {
+    use crate::tui::{read_key, Key, KeyParser};
+    use std::time::Duration;
+    let mut text = initial.to_owned();
+    let mut parser = KeyParser::new();
+    loop {
+        let mut line = format!("\r\x1b[K{prompt}{text}");
+        tty.write_all(line.as_bytes())?;
+        tty.flush()?;
+        let Some(key) = read_key(tty, &mut parser, Duration::from_millis(500))? else {
+            continue;
+        };
+        match key {
+            Key::Enter => {
+                tty.write_all(b"\r\n")?;
+                tty.flush()?;
+                return Ok(Some(text));
+            }
+            Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => {
+                tty.write_all(b"\r\n")?;
+                tty.flush()?;
+                return Ok(None);
+            }
+            Key::Backspace => {
+                text.pop();
+            }
+            Key::Ctrl('u') => text.clear(),
+            Key::Tab => {
+                let matches = complete_save_path(&text, cwd);
+                if matches.len() == 1 {
+                    text = matches[0].clone();
+                } else if matches.len() > 1 {
+                    text = common_prefix(&matches);
+                    line = format!("\r\x1b[K{prompt}{text}\r\n");
+                    tty.write_all(line.as_bytes())?;
+                    tty.write_all(matches.join("  ").as_bytes())?;
+                    tty.write_all(b"\r\n")?;
+                }
+            }
+            Key::Char(ch) => text.push(ch),
+            _ => {}
+        }
+    }
+}
+
+/// Prompt for the save destination, including the last-used directory and
+/// overwrite/rename handling. Returns `None` when the user aborts.
+pub fn interactive_save_path(
+    tty: &mut dyn crate::tui::Tty,
+    remote_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+    let last_dir = read_last_save_dir();
+    let name = Path::new(remote_path)
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("remote-file"));
+    let default = last_dir.join(&name);
+    eprintln!(
+        "Where do you want to save the file? Leaving it blank saves it as: {}",
+        default.display()
+    );
+    eprintln!("Relative paths are resolved from: {}", cwd.display());
+    let mut initial = String::new();
+    loop {
+        let Some(text) =
+            prompt_save_path(tty, "> ", &initial, &cwd).map_err(|err| err.to_string())?
+        else {
+            return Ok(None);
+        };
+        let mut dest = if text.trim().is_empty() {
+            default.clone()
+        } else {
+            expand_home(text.trim())
+        };
+        if !dest.is_absolute() {
+            dest = cwd.join(dest);
+        }
+        if dest.is_dir() {
+            dest = dest.join(&name);
+        }
+        if !dest.exists() {
+            if let Some(parent) = dest.parent() {
+                write_last_save_dir(parent);
+            }
+            return Ok(Some(dest));
+        }
+        // Existing file: O)verwrite, A)bort, R)ename, N)ew name.
+        eprint!(
+            "{} already exists. (O)verwrite (A)bort Auto (R)ename (N)ew name: ",
+            dest.display()
+        );
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|err| err.to_string())?;
+        match line.chars().next().unwrap_or('a').to_ascii_lowercase() {
+            'o' => {
+                if let Some(parent) = dest.parent() {
+                    write_last_save_dir(parent);
+                }
+                return Ok(Some(dest));
+            }
+            'r' => {
+                let renamed = auto_rename_dest(&dest, |path| path.exists());
+                if let Some(parent) = renamed.parent() {
+                    write_last_save_dir(parent);
+                }
+                return Ok(Some(renamed));
+            }
+            'n' => {
+                initial.clear();
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Interactive variant of [`handle_remote_file_action`]. The Save action uses
+/// a path prompt instead of silently writing under the temporary directory.
+pub fn handle_remote_file_action_interactive(
+    action: FileAction,
+    opts: &RemoteFileOptions,
+    runner: &mut dyn CommandRunner,
+    editor: &[String],
+    tty: &mut dyn crate::tui::Tty,
+) -> Result<Option<String>, String> {
+    if action != FileAction::Save {
+        return handle_remote_file_action(action, opts, runner, editor);
+    }
+    let Some(dest) = interactive_save_path(tty, &opts.path)? else {
+        return Ok(None);
+    };
+    let conn = parse_connection_data(&opts.ssh_connection_data)?;
+    let mut master = download_remote_file(conn, &opts.path, dest.clone(), runner)?;
+    let path = master.dest.clone();
+    master.close(runner);
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 fn ask_action_from_stdin(opts: &RemoteFileOptions) -> Result<FileAction, String> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
@@ -737,6 +977,17 @@ pub fn run_remote_file_cli(
     )
     .map_err(|err| err.to_string())?;
     let mut runner = SystemRunner;
+    if action == FileAction::Save && crate::tui::StdTty::is_terminal() {
+        if let Ok(mut tty) = crate::tui::StdTty::open() {
+            return handle_remote_file_action_interactive(
+                action,
+                &opts,
+                &mut runner,
+                &get_editor(),
+                &mut tty,
+            );
+        }
+    }
     handle_remote_file_action(action, &opts, &mut runner, &get_editor())
 }
 
@@ -935,5 +1186,63 @@ mod tests {
         assert_eq!(opts.mode, RemoteFileMode::Edit);
         assert_eq!(opts.path, "/remote/a");
         assert_eq!(opts.hostname, "h");
+    }
+}
+
+#[cfg(test)]
+mod interactive_path_tests {
+    use super::*;
+    use crate::tui::FakeTty;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kitr-remote-path-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tab_completion_lists_and_extends_paths() {
+        let dir = temp_dir("complete");
+        fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        fs::write(dir.join("alpine.txt"), b"b").unwrap();
+        fs::create_dir_all(dir.join("beta")).unwrap();
+        let matches = complete_save_path("al", &dir);
+        assert_eq!(matches, vec!["alpha.txt", "alpine.txt"]);
+        assert_eq!(common_prefix(&matches), "alp");
+        let matches = complete_save_path("be", &dir);
+        assert_eq!(matches, vec!["beta/"]);
+        let prefix = dir.join("al");
+        let matches = complete_save_path(prefix.to_string_lossy().as_ref(), &dir);
+        assert_eq!(matches.len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prompt_accepts_tab_completion_and_enter() {
+        let dir = temp_dir("prompt");
+        fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        let mut tty = FakeTty::new(80, 24, b"al\t\r".to_vec());
+        let result = prompt_save_path(&mut tty, "> ", "", &dir).unwrap();
+        assert_eq!(result.as_deref(), Some("alpha.txt"));
+        let mut tty = FakeTty::new(80, 24, b"abc\x1b".to_vec());
+        assert_eq!(prompt_save_path(&mut tty, "> ", "", &dir).unwrap(), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interactive_save_path_returns_a_new_destination() {
+        let dir = temp_dir("save");
+        let mut tty = FakeTty::new(
+            80,
+            24,
+            format!("{}\r", dir.join("chosen.txt").display()).into_bytes(),
+        );
+        let path = interactive_save_path(&mut tty, "/remote/a.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, dir.join("chosen.txt"));
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -34,6 +34,7 @@ fn backend(width: u32, height: u32) -> Option<GlBackend> {
         gamma: GammaMode::None,
         atlas_filter: FilterMode::Nearest,
         cursor_radius: 0.0,
+        ..GlBackendConfig::default()
     };
     match GlBackend::new(config) {
         Ok(backend) => Some(backend),

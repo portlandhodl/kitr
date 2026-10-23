@@ -27,7 +27,7 @@ ALLOWED_LICENSES = {
     "GPL-3.0-or-later",
 }
 SPDX_RE = re.compile(r"SPDX-License-Identifier:\s*([A-Za-z0-9.+-]+)")
-SKIP_DIRS = {".git", "target", "build", "artifacts", "node_modules", "__pycache__"}
+SKIP_DIRS = {".git", "target", "build", "artifacts", "dist", "node_modules", "__pycache__"}
 EXCLUDED_PREFIXES = (
     "packaging/shell-integration/",
     "packaging/terminfo/",
@@ -151,7 +151,10 @@ def check_executables(root: Path, errors: list[str]) -> None:
     required = [
         root / "scripts/screenshot_parity.py",
         root / "scripts/check_licenses.py",
+        root / "scripts/generate_flatpak_cargo_sources.py",
+        root / "scripts/build_rpm.sh",
         root / "packaging/bin/kitr",
+        root / "packaging/debian/rules",
     ]
     for path in required:
         if not path.is_file():

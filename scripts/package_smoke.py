@@ -24,7 +24,9 @@ def require(path: Path, needle: str | None = None) -> str:
 def check_stage(stage: Path) -> None:
     expected = [
         "usr/bin/kitr",
+        "usr/bin/kitten",
         "usr/libexec/kitr/kitr",
+        "usr/libexec/kitr/kitten",
         "usr/share/terminfo/x/xterm-kitty",
         "usr/share/terminfo/78/xterm-kitty",
         "usr/share/applications/kitr.desktop",
@@ -63,8 +65,11 @@ def main() -> int:
     for field in ("app-id:", "runtime:", "command:", "modules:"):
         if field not in manifest:
             raise SystemExit(f"package-smoke: Flatpak manifest is missing {field!r}")
+    sources = require(ROOT / "packaging/flatpak/cargo-sources.json")
+    if "cargo/vendor" not in sources or "vendored-sources" not in sources:
+        raise SystemExit("package-smoke: generated Flatpak Cargo sources are incomplete")
 
-    print("package-smoke: staged install, deb control, RPM spec and Flatpak manifest OK")
+    print("package-smoke: staged install, deb control, RPM spec, Flatpak manifest and Cargo sources OK")
     return 0
 
 

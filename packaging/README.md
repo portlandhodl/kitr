@@ -179,15 +179,18 @@ decorations for C kitty, but does not attempt to match fonts or scale.
 
 Distribution metadata skeletons live in:
 
-- `debian/control` — Debian/Ubuntu binary and build dependencies.
-- `rpm/kitr.spec` — Fedora/RHEL/openSUSE RPM spec (`%cargo_build`,
-  `%cargo_test`, `%install` via `make install`).
-- `flatpak/io.github.portlandhodl.kitr.yml` — Flatpak manifest skeleton;
-  generate `flatpak/cargo-sources.json` from `Cargo.lock` before a real build.
+- `debian/` — Debian/Ubuntu `debian/rules`, `control`, `changelog` and
+  `copyright`; `make deb` stages a source tree and runs `dpkg-buildpackage -b`.
+- `rpm/kitr.spec` — Fedora/RHEL/openSUSE RPM spec; `make rpm` builds a source
+  tarball and runs `rpmbuild -bb`.
+- `flatpak/io.github.portlandhodl.kitr.yml` — reproducible Flatpak manifest.
+  `packaging/flatpak/cargo-sources.json` is generated from `Cargo.lock` by
+  `scripts/generate_flatpak_cargo_sources.py` (one archive per registry crate
+  plus the vendored-source config); `make flatpak-sources-check` detects stale
+  output.
 
-The smoke checks are offline and intentionally do not invoke `dpkg-deb`,
-`rpmbuild` or `flatpak-builder`; run those in a distro build environment after
-the staged install passes.
+The staged-install smoke checks remain offline. CI installs the distro build
+dependencies and runs `make deb`, `make rpm` and `flatpak-builder` for real.
 
 ## License check
 
@@ -199,28 +202,33 @@ packaging scripts are executable.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on Ubuntu with rustfmt, CPU and all-features
-clippy, workspace tests, all-features GUI tests under `xvfb-run`, a release
-build, terminfo compilation, license/metadata checks, and an optional
-screenshot-parity smoke step. Cargo registry/git and `target/` are cached. The
-parity step is `continue-on-error` because a C kitty installation may be
-unavailable or its rendering may differ.
+`.github/workflows/ci.yml` runs rustfmt, CPU and all-features clippy, workspace
+tests, all-features GUI tests under `xvfb-run`, a release build, terminfo
+compilation, license/metadata checks, generated Flatpak source verification,
+Debian and RPM package builds, a Flatpak bundle build, and the full
+screenshot-parity corpus against a distro C kitty. Cargo registry/git and
+`target/` are cached. The parity job is `continue-on-error` because a distro C
+kitty version or its font/rendering environment can differ from the reference
+build; its report and artifacts are always uploaded.
 
 ## Known packaging gaps
 
-- **Wayland packaging is minimal.** The Rust backend and desktop entry support
-  Wayland, but there is no portal integration or separate Flatpak finish-arg
-  profile beyond the skeleton.
+- **Wayland packaging is portal-light.** The Rust backend, layer-shell panel/QAT
+  hosting and desktop portal kitten work, but the Flatpak has no separate
+  finish-arg profile for portal-file access beyond the manifest defaults.
 - **No macOS/Cocoa app bundle.** Only the Linux ELF binary is covered.
-- **No kittens or remote control in kitr.** `kitten` itself is not packaged
-  with kitr; the parity script uses a separately installed C kitty.
+- **Kitten coverage is Linux/portable only.** The `kitten` binary is packaged
+  alongside kitr with the native kitten set; Python-only and macOS-specific
+  kittens are not shipped. The parity script still uses a separately installed
+  C kitty reference.
 - **No automatic shell-integration injection.** Scripts are shipped, not wired
   into shell startup by kitr.
 - **No icon artwork.** The desktop entry references the name `kitr`; an icon
   must be supplied by the packager.
-- **Distro packages are skeletons.** deb/rpm/Flatpak metadata and a tarball
-  smoke target exist, but no signed repository packages or generated Flatpak
-  Cargo sources are produced in this checkout. Snap/Arch packaging and
+- **Packages are unsigned.** deb, RPM and Flatpak artifacts are built in CI,
+  but there is no repository signing/key management. Snap/Arch packaging and
   system-wide completion generation are absent.
+- **Flatpak build needs a runtime.** CI installs the 24.08 Platform/SDK and the
+  Rust SDK extension; offline builds require that runtime to be present.
 - **Best-effort parity only.** There is no golden-image suite, font pinning or
   perceptual comparison; thresholds are deliberately conservative defaults.

@@ -243,6 +243,13 @@ pub struct RenderConfig {
     pub pane_borders: Vec<SolidRect>,
     /// Try to shape runs of adjacent cells into ligature/combining sprites.
     pub shaped_runs: bool,
+    /// kitty's `text_contrast` uniform, where the configured percentage is
+    /// converted to a multiplier as `1 + contrast / 100`.
+    pub text_contrast: f32,
+    /// kitty's `text_gamma_adjustment` uniform (the reciprocal of the option).
+    pub text_gamma_adjustment: f32,
+    /// Select the legacy gamma-incorrect composition curve.
+    pub text_old_gamma: bool,
     /// Root directory for the disk-backed animation frame cache. `None` keeps
     /// frames in memory. The manager owns and removes a private subdirectory.
     pub animation_cache_dir: Option<std::path::PathBuf>,
@@ -277,6 +284,9 @@ impl Default for RenderConfig {
             pane_backgrounds: Vec::new(),
             pane_borders: Vec::new(),
             shaped_runs: true,
+            text_contrast: 1.0,
+            text_gamma_adjustment: 1.0,
+            text_old_gamma: false,
             animation_cache_dir: None,
         }
     }

@@ -1,0 +1,22 @@
+{
+  "size": "80x24",
+  "tab_bar_style": "powerline",
+  "tags": [
+    "tabs",
+    "tab-bar",
+    "both-sides"
+  ],
+  "settle": 2.0,
+  "kitty_args": [
+    "-o",
+    "tab_bar_min_tabs=1"
+  ],
+  "kitr_config": [
+    "tab_bar_min_tabs 1"
+  ],
+  "threshold": 12.0,
+  "kitty_setup": [
+    "action new_tab",
+    "action close_tab"
+  ]
+}

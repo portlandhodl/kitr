@@ -44,20 +44,31 @@ and Symbols Nerd Font Mono v3.4.0.
 | --- | ---: | ---: | --- |
 | 00_blank | 0.000% | 0.005% | +0.005 (alignment picks `(0,-2)` instead of `(0,0)`; raw is 0.000%) |
 | 01_ascii | 1.193% | 1.349% | +0.156 (rebuilt reference/font environment) |
-| 02_utf8 | 1.328% | 1.417% | +0.089 (rebuilt reference/font environment) |
+| 02_utf8 | 1.328% | 1.274% | -0.054 (colour/RTL shaping path) |
 | 03_wide | 0.814% | 0.869% | +0.055 (rebuilt reference/font environment) |
-| 04_combining | 1.086% | 1.198% | +0.112 (rebuilt reference/font environment) |
-| 05_sgr | 3.538% | 2.857% | -0.681 (palette fix; still the largest text case) |
+| 04_combining | 1.086% | 1.200% | +0.114 (rebuilt reference/font environment) |
+| 05_sgr | 3.538% | 2.852% | -0.686 (palette fix; still the largest text case) |
 | 06_cursor | 0.953% | 1.080% | +0.127 (rebuilt reference/font environment) |
 | 07_erase | 2.149% | 1.234% | -0.915 (no phantom tab strip) |
 | 08_scroll | 2.644% | 2.910% | +0.266 (rebuilt reference/font environment) |
 | 09_alt_screen | 0.745% | 0.828% | +0.083 (rebuilt reference/font environment) |
-| 10_tabs | 3.704% | 0.271% | -3.433 (aligned below the tab bar; see the tab-bar caveat below) |
-| 11_layouts | skipped | 0.239% | new vertical split case (`layout splits`, `--location=vsplit`) |
-| 12_hsplits | skipped | 1.156% | new horizontal split case (`layout splits`, `--location=hsplit`) |
+| 10_tabs | 3.704% | 1.219% | -2.485 (aligned below the tab bar; see the tab-bar caveat below) |
+| 11_layouts | skipped | 0.495% | new vertical split case (`layout splits`, `--location=vsplit`) |
+| 12_hsplits | skipped | 0.849% | new horizontal split case (`layout splits`, `--location=hsplit`) |
+| 13_hyperlinks | skipped | 0.994% | new hyperlink case |
+| 14_selection | skipped | 1.191% | new selection case |
+| 15_mouse_cursor | skipped | 0.751% | new painted cursor case |
+| 16_graphics_image | skipped | 0.956% | new graphics-protocol image case |
+| 17_graphics_animation | skipped | 6.363% | new animation case |
+| 18_text_sizing | skipped | 0.709% | new text-sizing case |
+| 19_tab_bar_both_sides | skipped | 2.522% | new bottom tab bar case |
+| 20_tab_bar_fade_both_sides | skipped | 2.343% | new bottom fade tab bar case |
+| 21_fractional_split_margins | skipped | 3.000% | new fractional margin case |
+| 22_full_split_borders | skipped | 4.345% | new full-border case |
+| 23_multiline_selection | skipped | 7.189% | new multi-line selection case |
 
 Raw tolerant percentages improved for every non-split text case because kitr no
-longer reserves a 19px strip when the bar is hidden. `10_tabs` raw is 1.828%
+longer reserves a 19px strip when the bar is hidden. `10_tabs` raw is 1.195%
 because kitr draws the bar while the C session screenshot below does not include
 one.
 
@@ -97,7 +108,7 @@ remaining difference is glyph rasterisation, not colour gamma.
 
 ### 3. UTF-8 fallback and shaping
 
-`02_utf8` is 1.417% tolerant after alignment. Latin, Greek and Cyrillic match
+`02_utf8` is 1.274% tolerant after alignment. Latin, Greek and Cyrillic match
 well. The Arabic and Hebrew RTL lines and the emoji line are the largest
 per-line contributors, consistent with fallback-font and shaping differences.
 Emoji are monochrome in both screenshots with this font configuration; colour
@@ -109,7 +120,7 @@ The default `color0`..`color15` entries come from kitty's option defaults
 (`#cc0403` red, `#19cb00` green, `#f2201f` bright red, `#23fd00` bright green,
 etc.); the 6x6x6 cube and grayscale ramp still match `init_FG_BG_table()` in
 `colors.c`. A unit test cross-checks all 16 values plus representative cube and
-ramp entries. `05_sgr` is 2.857% aligned tolerant.
+ramp entries. `05_sgr` is 2.852% aligned tolerant.
 
 ### 4a. Indexed-colour images and animation storage
 
@@ -119,10 +130,10 @@ palette, so changing terminal colours does not re-upload the image and the
 change is visible on the next draw. Animation frames remain delta-compressed and
 can be spilled to a private disk cache under the renderer's temp directory;
 deleted, edited, evicted and replaced frame files are unlinked immediately, and
-the cache subdirectory is removed on drop/clear. Neither path is exercised by
-the screenshot corpus (no graphics protocol case or animated image is included),
-but both have CPU/GPU unit tests, including a live-palette redraw and a
-per-frame disk-cleanup test. Placements without a `p` id now keep distinct graph
+the cache subdirectory is removed on drop/clear. `16_graphics_image` and
+`17_graphics_animation` exercise the graphics and animation paths in the
+corpus, and both still have CPU/GPU unit tests, including a live-palette redraw
+and a per-frame disk-cleanup test. Placements without a `p` id now keep distinct graph
 instances (the protocol allows several per image), and cascade deletion follows
 the first-placement rule for `Q=0`. The screen sink still does not advance the
 cursor after a put without `C=1`, since that needs cell pixel metrics, so that
@@ -160,10 +171,10 @@ transparent chrome overlay so per-pane scissor clears cannot erase them, using
 `window_border_width` scaled to device pixels. Unit tests cover horizontal and
 vertical splits, single-pane suppression and full borders. The cell-grid layout
 does not reserve fractional border pixels or `window_margin_width`, so split
-geometry remains approximate. `11_layouts` and `12_hsplits` now exercise a
-vertical and a horizontal split and pass at 0.239% and 1.156% aligned tolerant
-respectively; the `12_hsplits` offset `(2,-31)` reflects the extra C kitty
-chrome/border rows rather than different pane text.
+geometry remains approximate. `11_layouts`, `12_hsplits`,
+`21_fractional_split_margins` and `22_full_split_borders` exercise both split
+directions, margins and full borders; their aligned-tolerant results are in the
+table above.
 
 ### 7. Tabs and layouts
 
@@ -177,11 +188,18 @@ parameter (biases, arbitrary nesting) is not visually tested.
 
 ### 8. Other untested surfaces
 
-Window decorations/titlebar, graphics protocol images, hyperlinks, undercurl and
-coloured underlines, ligatures beyond the ASCII corpus, IME/compose input and
-selection rendering are outside this screenshot corpus. Wayland cursor-surface
-painting and X11 touch pressure mapping are unit tested in `kitty-window` but
-need a real compositor/tablet to exercise end to end.
+Window decorations/titlebar, undercurl and coloured underlines, ligatures beyond
+the ASCII corpus, IME/compose input and live pointer/cursor animation are outside
+this screenshot corpus. `13_hyperlinks`, `14_selection`,
+`15_mouse_cursor`, `16_graphics_image`, `17_graphics_animation` and
+`23_multiline_selection` now cover hyperlinks, selection, cursor painting,
+images, animation and multi-line selection. Wayland cursor-surface painting,
+`zwp_tablet_v2` pressure/tilt forwarding and `wlr-layer-shell` panel/QAT
+surfaces are unit tested or compile-checked in `kitty-window` and the GUI, but
+still need a real compositor/tablet for end-to-end validation. Core `wl_touch`
+has no pressure axis, so Wayland finger-touch pressure remains the
+protocol-implied 1.0/0.0; X11 and tablet-tool contacts use the device value
+through the configurable pressure curve.
 
 ### 9. Erase, scroll and alternate screen
 
@@ -196,7 +214,14 @@ edges account for the remaining pixels.
   pixels are not validated by `10_tabs`.
 - Split geometry does not reserve fractional border/margin pixels; the corpus
   validates text/placement but not exact border widths.
-- Wayland `wl_touch` has no pressure axis; only X11 can forward real pressure.
-  `zwp_tablet_v2` pressure curves/tilt remain unimplemented.
-- The Flatpak manifest is a skeleton and needs generated Cargo sources before a
-  reproducible Flatpak build; deb/RPM specs are not built in CI here.
+- Wayland `wl_touch` has no pressure axis; only X11 touch and
+  `zwp_tablet_v2` tools can forward real pressure. Tablet pressure is shaped by
+  `PressureCurve`; tilt/rotation/slider/wheel are forwarded, but no compositor
+  or physical tablet is part of this corpus.
+- The Flatpak manifest uses generated `packaging/flatpak/cargo-sources.json`;
+  CI runs `flatpak-builder`, `dpkg-buildpackage` and `rpmbuild`, and runs this
+  full corpus against a distro C kitty. Package jobs still produce unsigned
+  artifacts only (no repository signing).
+- Layer-shell panels/QAT are created by the GUI, but the single-instance
+  toggle/`--toggle-visibility` control socket and hide-on-focus-loss policy are
+  not exercised end to end without a panel-aware compositor session.

@@ -187,11 +187,15 @@ pub use remote::{
     REMOTE_USAGE,
 };
 pub use remote_file::{
-    get_editor, handle_remote_file_action, CommandOutput, CommandRunner, CommandSpec, SystemRunner,
+    complete_save_path, get_editor, handle_remote_file_action,
+    handle_remote_file_action_interactive, interactive_save_path, last_used_store_path,
+    prompt_save_path, read_last_save_dir, write_last_save_dir, CommandOutput, CommandRunner,
+    CommandSpec, SystemRunner,
 };
 pub use rsync::{
-    apply_delta, apply_delta_with_block_size, create_delta, create_signature, parse_signature,
-    BlockHash, Signature,
+    apply_delta, apply_delta_file, apply_delta_to_writer, apply_delta_with_block_size,
+    create_delta, create_delta_file, create_delta_to_writer, create_signature, parse_signature,
+    should_spill_delta, BlockHash, Signature, DISK_DELTA_THRESHOLD,
 };
 pub use shell_integration::{
     as_fish_str_literal, as_str_literal, discover_shell_integration_dir,
@@ -201,9 +205,13 @@ pub use shell_integration::{
 pub use shm::SharedMemory;
 pub use ssh::{
     askpass_response, build_bootstrap_plan, build_bootstrap_plan_with_options,
-    create_bootstrap_data_shm, encode_ssh_data_request, make_bootstrap_tar, perform_askpass,
-    prepare_ssh_session, run_askpass_cli, AskpassHost, AskpassRequest, BootstrapOptions,
-    BootstrapPlan, BootstrapResources, SshSessionPlan, TtyAskpassHost,
+    connection_sharing_args, control_master_check_command, control_master_exit_command,
+    control_master_responds, control_master_start_command, create_bootstrap_data_shm,
+    encode_ssh_data_request, forward_remote_control, make_bootstrap_tar, parse_forward_target,
+    perform_askpass, port_forward_command, prepare_ssh_session, run_askpass_cli, AskpassHost,
+    AskpassRequest, BootstrapOptions, BootstrapPlan, BootstrapResources, ForwardTarget,
+    ForwardedControl, SshCommandOutput, SshCommandRunner, SshSessionPlan, SystemSshRunner,
+    TtyAskpassHost, STALE_MASTER_TIMEOUT,
 };
 pub use terminal::{
     InteractiveTransport, ScriptedTransport, StdioTransport, DEFAULT_REPLY_TIMEOUT,

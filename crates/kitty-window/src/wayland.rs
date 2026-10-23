@@ -20,9 +20,13 @@
 //! events behind the `wayland` feature. `wl_data_device` drag targets
 //! (enter/motion/leave/drop) and `wl_data_source.start_drag` sources are
 //! supported, as are both `CLIPBOARD` and `PRIMARY` selections. `wl_touch`
-//! supplies touch points; tablet-tool tilt and pressure curves from
-//! `zwp_tablet_v2` are not modelled, and `wl_touch` pressure is the protocol's
-//! implied 1.0/0.0. Cursor themes are loaded through `libwayland-cursor` and
+//! supplies touch points, and `zwp_tablet_v2` supplies tool proximity, motion,
+//! pressure, distance, tilt, rotation, slider, wheel and button events, exposed
+//! through [`WindowEvent::TabletTool`](crate::WindowEvent::TabletTool). Core
+//! `wl_touch` has no pressure axis, so its pressure remains the protocol's
+//! implied 1.0/0.0. `zwlr_layer_shell_v1` creates panel/QAT surfaces when
+//! [`LayerShellConfig`](crate::LayerShellConfig) is present in the window
+//! configuration. Cursor themes are loaded through `libwayland-cursor` and
 //! painted on a client cursor surface; when the helper library or a theme is
 //! missing, no cursor surface is installed and the compositor keeps its
 //! default. Window position is controlled by the compositor, so
@@ -57,19 +61,24 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    zwp_tablet_manager_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2, zwp_tablet_v2,
+};
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::clipboard::{
     ClipboardError, ClipboardReply, ClipboardState, ClipboardTarget, ClipboardToken,
 };
 use crate::dnd::{parse_uri_list, DragSession, DragSourceData, DragSourceState};
 use crate::types::{
-    keysym, KeyAction, KeyInput, Modifiers, MouseButton, PointerShape, Selection, TouchPhase,
-    WindowConfig, WindowError, WindowEvent,
+    keysym, KeyAction, KeyInput, LayerShellConfig, LayerShellFocus, LayerShellLayer, Modifiers,
+    MouseButton, PointerShape, PressureCurve, Selection, TabletPhase, TouchPhase, WindowConfig,
+    WindowError, WindowEvent,
 };
 use crate::wakeup::{WakeupHandle, WakeupPipe};
 
@@ -914,6 +923,37 @@ unsafe extern "C" fn unreachable_cursor_buffer(_: *mut WlCursorImage) -> *mut c_
     ptr::null_mut()
 }
 
+#[derive(Clone, Debug)]
+struct TabletToolState {
+    x: f64,
+    y: f64,
+    pressure: f64,
+    distance: f64,
+    tilt_x: f64,
+    tilt_y: f64,
+    rotation: f64,
+    slider: f64,
+    pressed: bool,
+    in_proximity: bool,
+}
+
+impl Default for TabletToolState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            pressure: 0.0,
+            distance: 0.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation: 0.0,
+            slider: 0.0,
+            pressed: false,
+            in_proximity: false,
+        }
+    }
+}
+
 /// A Wayland top-level window and event loop.
 pub struct WaylandWindow {
     connection: Connection,
@@ -945,6 +985,17 @@ pub struct WaylandWindow {
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
     active_touches: HashMap<i32, (f64, f64)>,
+    tablet_manager: Option<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
+    tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+    tablet_tools: HashMap<u32, zwp_tablet_tool_v2::ZwpTabletToolV2>,
+    tablet_tool_state: HashMap<u32, TabletToolState>,
+    tablet_pressure_curve: PressureCurve,
+    touch_pressure_curve: PressureCurve,
+    layer_shell_global: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    layer_shell: Option<LayerShellConfig>,
+    layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    layer_configured: bool,
+    output_names: HashMap<u32, String>,
     keyboard_focused: bool,
     pointer_x: f64,
     pointer_y: f64,
@@ -1013,6 +1064,10 @@ pub struct WaylandWindow {
     cursor_size_override: Option<u32>,
 }
 
+fn anchor_from_bits(bits: u32) -> zwlr_layer_surface_v1::Anchor {
+    zwlr_layer_surface_v1::Anchor::from_bits_truncate(bits)
+}
+
 impl WaylandWindow {
     /// Connect to `$WAYLAND_DISPLAY` and create a top-level window.
     pub fn new(config: &WindowConfig) -> Result<Self, WindowError> {
@@ -1056,6 +1111,17 @@ impl WaylandWindow {
             pointer: None,
             touch: None,
             active_touches: HashMap::new(),
+            tablet_manager: None,
+            tablet_seat: None,
+            tablet_tools: HashMap::new(),
+            tablet_tool_state: HashMap::new(),
+            tablet_pressure_curve: config.tablet_pressure_curve,
+            touch_pressure_curve: config.touch_pressure_curve,
+            layer_shell_global: None,
+            layer_shell: config.layer_shell.clone(),
+            layer_surface: None,
+            layer_configured: false,
+            output_names: HashMap::new(),
             keyboard_focused: false,
             pointer_x: 0.0,
             pointer_y: 0.0,
@@ -1130,8 +1196,31 @@ impl WaylandWindow {
             .roundtrip(&mut window)
             .map_err(|error| werr(format!("Wayland registry roundtrip failed: {error}")))?;
         window.queue = Some(queue);
+        window.setup_tablet();
         window.setup_shell()?;
         Ok(window)
+    }
+
+    fn output_for_name(&self, name: &str) -> Option<wl_output::WlOutput> {
+        if name.is_empty() {
+            return None;
+        }
+        self.output_names.iter().find_map(|(id, output_name)| {
+            if output_name == name {
+                self.outputs
+                    .iter()
+                    .find(|output| output.id().protocol_id() == *id)
+                    .cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn setup_tablet(&mut self) {
+        if let (Some(manager), Some(seat)) = (self.tablet_manager.clone(), self.seat.clone()) {
+            self.tablet_seat = Some(manager.get_tablet_seat(&seat, &self.qh, ()));
+        }
     }
 
     fn setup_shell(&mut self) -> Result<(), WindowError> {
@@ -1139,12 +1228,56 @@ impl WaylandWindow {
             .compositor
             .clone()
             .ok_or_else(|| werr("compositor does not advertise wl_compositor"))?;
+        let surface = compositor.create_surface(&self.qh, ());
+
+        if let Some(config) = self.layer_shell.clone() {
+            let shell = self.layer_shell_global.clone().ok_or_else(|| {
+                werr("compositor does not advertise zwlr_layer_shell_v1; cannot create a panel surface")
+            })?;
+            let layer = match config.layer {
+                LayerShellLayer::Background => zwlr_layer_shell_v1::Layer::Background,
+                LayerShellLayer::Bottom => zwlr_layer_shell_v1::Layer::Bottom,
+                LayerShellLayer::Top => zwlr_layer_shell_v1::Layer::Top,
+                LayerShellLayer::Overlay => zwlr_layer_shell_v1::Layer::Overlay,
+            };
+            let output = self.output_for_name(&config.output_name);
+            let namespace = if config.namespace.is_empty() {
+                "kitr-panel".to_owned()
+            } else {
+                config.namespace.clone()
+            };
+            let layer_surface =
+                shell.get_layer_surface(&surface, output.as_ref(), layer, namespace, &self.qh, ());
+            let (width, height) = config.requested_size();
+            layer_surface.set_size(width, height);
+            layer_surface.set_anchor(anchor_from_bits(config.anchor_bits()));
+            if config.override_exclusive_zone {
+                layer_surface.set_exclusive_zone(-1);
+            } else if config.exclusive_zone >= 0 {
+                layer_surface.set_exclusive_zone(config.exclusive_zone);
+            }
+            layer_surface.set_margin(
+                config.margin_top,
+                config.margin_right,
+                config.margin_bottom,
+                config.margin_left,
+            );
+            layer_surface.set_keyboard_interactivity(match config.focus {
+                LayerShellFocus::NotAllowed => zwlr_layer_surface_v1::KeyboardInteractivity::None,
+                LayerShellFocus::Exclusive => {
+                    zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive
+                }
+                LayerShellFocus::OnDemand => zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand,
+            });
+            self.layer_surface = Some(layer_surface);
+            self.finish_surface_setup(surface);
+            return Ok(());
+        }
+
         let wm_base = self
             .wm_base
             .clone()
             .ok_or_else(|| werr("compositor does not advertise xdg_wm_base"))?;
-
-        let surface = compositor.create_surface(&self.qh, ());
         let xdg_surface = wm_base.get_xdg_surface(&surface, &self.qh, ());
         let toplevel = xdg_surface.get_toplevel(&self.qh, ());
 
@@ -1163,6 +1296,13 @@ impl WaylandWindow {
             toplevel.set_max_size(self.width as i32, self.height as i32);
         }
 
+        self.xdg_surface = Some(xdg_surface);
+        self.toplevel = Some(toplevel);
+        self.finish_surface_setup(surface);
+        Ok(())
+    }
+
+    fn finish_surface_setup(&mut self, surface: wl_surface::WlSurface) {
         if let Some(manager) = self.fractional_manager.clone() {
             if let Some(viewporter) = self.viewporter.clone() {
                 self.viewport = Some(viewporter.get_viewport(&surface, &self.qh, ()));
@@ -1183,10 +1323,7 @@ impl WaylandWindow {
         }
 
         self.surface = Some(surface.clone());
-        self.xdg_surface = Some(xdg_surface);
-        self.toplevel = Some(toplevel);
         surface.commit();
-        Ok(())
     }
 
     fn apply_integer_scale(&mut self) {
@@ -1249,7 +1386,7 @@ impl WaylandWindow {
             .surface
             .clone()
             .ok_or_else(|| werr("Wayland surface has not been created"))?;
-        if !self.configure.configured {
+        if !self.configure.configured && !self.layer_configured {
             return Err(werr("the compositor has not configured the surface yet"));
         }
         let scale = self.effective_scale().max(0.1);
@@ -1344,6 +1481,12 @@ impl WaylandWindow {
         }
         self.width = width;
         self.height = height;
+        if let (Some(layer_surface), Some(config)) = (&self.layer_surface, &self.layer_shell) {
+            let (anchored_width, anchored_height) = config.requested_size();
+            let request_width = if anchored_width == 0 { 0 } else { width };
+            let request_height = if anchored_height == 0 { 0 } else { height };
+            layer_surface.set_size(request_width, request_height);
+        }
         self.inbox.push_back(WindowEvent::Resize { width, height });
         if self.visible_requested {
             let _ = self.present_clear([0.0, 0.0, 0.0, 1.0]);
@@ -1400,7 +1543,7 @@ impl WaylandWindow {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible_requested && self.configure.configured
+        self.visible_requested && (self.configure.configured || self.layer_configured)
     }
 
     pub fn focus(&mut self) {
@@ -2447,7 +2590,8 @@ impl WaylandWindow {
             | WindowEvent::DragStarted { .. }
             | WindowEvent::DragFinished { .. }
             | WindowEvent::DragCancelled
-            | WindowEvent::Touch { .. } => {
+            | WindowEvent::Touch { .. }
+            | WindowEvent::TabletTool { .. } => {
                 self.inbox.push_back(event.clone());
                 Ok(())
             }
@@ -2535,6 +2679,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandWindow {
                     state.text_input_manager =
                         Some(registry.bind(name, version.clamp(1, 1), qh, ()));
                 }
+                "zwp_tablet_manager_v2" if state.tablet_manager.is_none() => {
+                    state.tablet_manager = Some(registry.bind(name, version.clamp(1, 2), qh, ()));
+                }
+                "zwlr_layer_shell_v1" if state.layer_shell_global.is_none() => {
+                    state.layer_shell_global =
+                        Some(registry.bind(name, version.clamp(1, 4), qh, ()));
+                }
                 _ => {}
             }
         }
@@ -2572,11 +2723,17 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandWindow {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Scale { factor } = event {
-            let key = output.id().protocol_id();
-            state.output_scales.insert(key, factor.max(1));
-            state.refresh_integer_scale();
-            state.apply_integer_scale();
+        match event {
+            wl_output::Event::Scale { factor } => {
+                let key = output.id().protocol_id();
+                state.output_scales.insert(key, factor.max(1));
+                state.refresh_integer_scale();
+                state.apply_integer_scale();
+            }
+            wl_output::Event::Name { name } => {
+                state.output_names.insert(output.id().protocol_id(), name);
+            }
+            _ => {}
         }
     }
 }
@@ -3140,6 +3297,203 @@ impl Dispatch<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()> fo
     }
 }
 
+fn push_tablet_event(state: &mut WaylandWindow, tool: u32, phase: TabletPhase, pressed: bool) {
+    let Some(snapshot) = state.tablet_tool_state.get(&tool).cloned() else {
+        return;
+    };
+    state.inbox.push_back(WindowEvent::TabletTool {
+        tool: u64::from(tool),
+        x: snapshot.x,
+        y: snapshot.y,
+        pressure: state.tablet_pressure_curve.apply(snapshot.pressure),
+        distance: snapshot.distance,
+        tilt_x: snapshot.tilt_x,
+        tilt_y: snapshot.tilt_y,
+        rotation: snapshot.rotation,
+        slider: snapshot.slider,
+        wheel: 0.0,
+        pressed,
+        phase,
+    });
+}
+
+impl Dispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for WaylandWindow {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_manager_v2::ZwpTabletManagerV2,
+        _: <zwp_tablet_manager_v2::ZwpTabletManagerV2 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+        event: zwp_tablet_seat_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_tablet_seat_v2::Event::ToolAdded { id: tool } => {
+                let id = tool.id().protocol_id();
+                state.tablet_tools.insert(id, tool);
+                state
+                    .tablet_tool_state
+                    .insert(id, TabletToolState::default());
+            }
+            zwp_tablet_seat_v2::Event::TabletAdded { .. }
+            | zwp_tablet_seat_v2::Event::PadAdded { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        tool: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let id = tool.id().protocol_id();
+        let snapshot = state.tablet_tool_state.entry(id).or_default();
+        match event {
+            zwp_tablet_tool_v2::Event::ProximityIn { .. } => {
+                snapshot.in_proximity = true;
+            }
+            zwp_tablet_tool_v2::Event::ProximityOut => {
+                snapshot.in_proximity = false;
+                snapshot.pressed = false;
+                snapshot.pressure = 0.0;
+            }
+            zwp_tablet_tool_v2::Event::Down { .. } => {
+                snapshot.pressed = true;
+            }
+            zwp_tablet_tool_v2::Event::Up => {
+                snapshot.pressed = false;
+                snapshot.pressure = 0.0;
+            }
+            zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                snapshot.x = x;
+                snapshot.y = y;
+            }
+            zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                snapshot.pressure = f64::from(pressure) / 65535.0;
+            }
+            zwp_tablet_tool_v2::Event::Distance { distance } => {
+                snapshot.distance = f64::from(distance) / 65535.0;
+            }
+            zwp_tablet_tool_v2::Event::Tilt { tilt_x, tilt_y } => {
+                snapshot.tilt_x = tilt_x;
+                snapshot.tilt_y = tilt_y;
+            }
+            zwp_tablet_tool_v2::Event::Rotation { degrees } => {
+                snapshot.rotation = degrees;
+            }
+            zwp_tablet_tool_v2::Event::Slider { position } => {
+                snapshot.slider = f64::from(position) / 65535.0;
+            }
+            zwp_tablet_tool_v2::Event::Wheel { degrees, .. } => {
+                let pressed = snapshot.pressed;
+                let x = snapshot.x;
+                let y = snapshot.y;
+                let pressure = state.tablet_pressure_curve.apply(snapshot.pressure);
+                let distance = snapshot.distance;
+                let tilt_x = snapshot.tilt_x;
+                let tilt_y = snapshot.tilt_y;
+                let rotation = snapshot.rotation;
+                let slider = snapshot.slider;
+                state.inbox.push_back(WindowEvent::TabletTool {
+                    tool: u64::from(id),
+                    x,
+                    y,
+                    pressure,
+                    distance,
+                    tilt_x,
+                    tilt_y,
+                    rotation,
+                    slider,
+                    wheel: degrees,
+                    pressed,
+                    phase: TabletPhase::Wheel,
+                });
+                return;
+            }
+            zwp_tablet_tool_v2::Event::Frame { .. } => {
+                let phase = if !snapshot.in_proximity {
+                    TabletPhase::ProximityOut
+                } else {
+                    TabletPhase::Motion
+                };
+                let pressed = snapshot.pressed;
+                push_tablet_event(state, id, phase, pressed);
+                return;
+            }
+            zwp_tablet_tool_v2::Event::Button {
+                state: button_state,
+                ..
+            } => match button_state {
+                WEnum::Value(zwp_tablet_tool_v2::ButtonState::Pressed) => {
+                    snapshot.pressed = true;
+                }
+                WEnum::Value(zwp_tablet_tool_v2::ButtonState::Released) => {
+                    snapshot.pressed = false;
+                }
+                _ => {}
+            },
+            zwp_tablet_tool_v2::Event::Type { .. }
+            | zwp_tablet_tool_v2::Event::HardwareSerial { .. }
+            | zwp_tablet_tool_v2::Event::HardwareIdWacom { .. }
+            | zwp_tablet_tool_v2::Event::Capability { .. }
+            | zwp_tablet_tool_v2::Event::Done
+            | zwp_tablet_tool_v2::Event::Removed => {
+                if matches!(event, zwp_tablet_tool_v2::Event::Removed) {
+                    state.tablet_tool_state.remove(&id);
+                    state.tablet_tools.remove(&id);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let phase = if matches!(event, zwp_tablet_tool_v2::Event::ProximityIn { .. }) {
+            TabletPhase::ProximityIn
+        } else if matches!(event, zwp_tablet_tool_v2::Event::ProximityOut) {
+            TabletPhase::ProximityOut
+        } else if matches!(event, zwp_tablet_tool_v2::Event::Down { .. }) {
+            TabletPhase::Down
+        } else if matches!(event, zwp_tablet_tool_v2::Event::Up) {
+            TabletPhase::Up
+        } else {
+            TabletPhase::Motion
+        };
+        let pressed = state
+            .tablet_tool_state
+            .get(&id)
+            .map(|snapshot| snapshot.pressed)
+            .unwrap_or(false);
+        push_tablet_event(state, id, phase, pressed);
+    }
+}
+
+impl Dispatch<zwp_tablet_v2::ZwpTabletV2, ()> for WaylandWindow {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_v2::ZwpTabletV2,
+        _: zwp_tablet_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<wl_touch::WlTouch, ()> for WaylandWindow {
     fn event(
         state: &mut Self,
@@ -3159,7 +3513,7 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandWindow {
                     id: id.max(0) as u64,
                     x,
                     y,
-                    pressure: 1.0,
+                    pressure: state.touch_pressure_curve.apply(1.0),
                     phase: TouchPhase::Began,
                 });
             }
@@ -3170,7 +3524,7 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandWindow {
                         id: id.max(0) as u64,
                         x,
                         y,
-                        pressure: 1.0,
+                        pressure: state.touch_pressure_curve.apply(1.0),
                         phase: TouchPhase::Updated,
                     });
                 }
@@ -3184,7 +3538,7 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandWindow {
                     id: id.max(0) as u64,
                     x,
                     y,
-                    pressure: 0.0,
+                    pressure: state.touch_pressure_curve.apply(0.0),
                     phase: TouchPhase::Ended,
                 });
             }
@@ -3195,13 +3549,66 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandWindow {
                         id: id.max(0) as u64,
                         x,
                         y,
-                        pressure: 0.0,
+                        pressure: state.touch_pressure_curve.apply(0.0),
                         phase: TouchPhase::Cancelled,
                     });
                 }
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandWindow {
+    fn event(
+        state: &mut Self,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer_surface.ack_configure(serial);
+                state.layer_configured = true;
+                if width > 0 {
+                    state.width = width;
+                }
+                if height > 0 {
+                    state.height = height;
+                }
+                state.configure.configured = true;
+                state.inbox.push_back(WindowEvent::Resize {
+                    width: state.width,
+                    height: state.height,
+                });
+                if state.visible_requested {
+                    let _ = state.present_clear([0.0, 0.0, 0.0, 1.0]);
+                }
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                state.should_close = true;
+                state.inbox.push_back(WindowEvent::CloseRequested);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandWindow {
+    fn event(
+        _: &mut Self,
+        _: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        _: zwlr_layer_shell_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 

@@ -445,6 +445,7 @@ name = "kitty-fonts"
 version = "0.1.0"
 dependencies = [
  "kitty-core",
+ "kitty-graphics",
  "kitty-unicode",
 ]
 
@@ -466,6 +467,7 @@ dependencies = [
 name = "kitty-kittens"
 version = "0.1.0"
 dependencies = [
+ "async-io",
  "flate2",
  "kitty-config",
  "kitty-core",
@@ -543,6 +545,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]
@@ -1003,6 +1006,19 @@ dependencies = [
  "bitflags",
  "wayland-backend",
  "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-wlr"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9597cdf02cf0c34cd5823786dce6b5ae8598f05c2daf5621b6e178d4f7345f3"
+dependencies = [
+ "bitflags",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "wayland-scanner",
 ]
 

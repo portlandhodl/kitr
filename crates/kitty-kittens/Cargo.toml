@@ -15,6 +15,7 @@ kitty-os = { path = "../kitty-os" }
 flate2 = "1"
 libc = "0.2"
 zbus = "5"
+async-io = "2"
 
 [[bin]]
 name = "kitten"

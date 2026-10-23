@@ -410,6 +410,70 @@ impl Screen {
     }
 }
 
+impl Screen {
+    /// Mirror kitty's `update_dest_rect()`: resolve `c=`/`r=` from the source
+    /// dimensions and the cell pixel size when either is omitted.
+    fn placement_cell_span(&self, image_id: u32, placement: &Placement) -> (u32, u32) {
+        let (cell_width, cell_height) = (self.cell_width.max(1), self.cell_height.max(1));
+        let image = self.images.get(&image_id);
+        let mut src_width = if placement.width != 0 {
+            placement.width
+        } else {
+            image.map(|img| img.width).unwrap_or(1)
+        };
+        let mut src_height = if placement.height != 0 {
+            placement.height
+        } else {
+            image.map(|img| img.height).unwrap_or(1)
+        };
+        if let Some(image) = image {
+            src_width = src_width.min(
+                (image.width as f32 - placement.x_offset as f32)
+                    .max(0.0)
+                    .max(0.0) as u32,
+            );
+            src_height = src_height.min(
+                (image.height as f32 - placement.y_offset as f32)
+                    .max(0.0)
+                    .max(0.0) as u32,
+            );
+        }
+        let cell_x_offset = placement.cell_x_offset.min(cell_width - 1);
+        let cell_y_offset = placement.cell_y_offset.min(cell_height - 1);
+        let auto_cols = placement.num_cols == 0;
+        let auto_rows = placement.num_rows == 0;
+        let mut cols = placement.num_cols;
+        let mut rows = placement.num_rows;
+        if auto_cols {
+            if auto_rows {
+                let t = src_width.saturating_add(cell_x_offset);
+                cols = t / cell_width;
+                if t > cols * cell_width {
+                    cols += 1;
+                }
+            } else {
+                let height_px = cell_height * rows + cell_y_offset;
+                let width_px = height_px as f64 * src_width as f64 / src_height.max(1) as f64;
+                cols = (width_px / cell_width as f64).ceil() as u32;
+            }
+        }
+        if auto_rows {
+            if auto_cols {
+                let t = src_height.saturating_add(cell_y_offset);
+                rows = t / cell_height;
+                if t > rows * cell_height {
+                    rows += 1;
+                }
+            } else {
+                let width_px = cell_width * cols + cell_x_offset;
+                let height_px = width_px as f64 * src_height as f64 / src_width.max(1) as f64;
+                rows = (height_px / cell_height as f64).ceil() as u32;
+            }
+        }
+        (cols.max(1), rows.max(1))
+    }
+}
+
 impl GraphicsSink for Screen {
     fn on_image(&mut self, command: &GraphicsCommand, image: &Image) -> Result<(), GraphicsError> {
         let id = if image.id != 0 {
@@ -440,6 +504,7 @@ impl GraphicsSink for Screen {
         if image_id == 0 {
             return Ok(());
         }
+        let (effective_cols, effective_rows) = self.placement_cell_span(image_id, placement);
         let placement_anchor_x = self.cursor.x.min(self.columns.saturating_sub(1));
         let placement_anchor_y = self.cursor.y.min(self.lines.saturating_sub(1));
         // `p=0` means "anonymous": every put creates a new placement. Named
@@ -522,6 +587,16 @@ impl GraphicsSink for Screen {
             for y in start..(start + rows as usize).min(self.lines as usize) {
                 self.linebuf_mut().set_line_has_image_placeholders(y, true);
             }
+        } else if placement.cursor_movement != 1 {
+            // kitty advances the cursor by the image's effective cell span
+            // unless `C=1` asks it not to. The span uses `c=`/`r=` when given,
+            // otherwise it is derived from the source pixels and the cell
+            // pixel metrics.
+            self.cursor.x = self.cursor.x.saturating_add(effective_cols);
+            if effective_rows > 0 {
+                self.cursor.y = self.cursor.y.saturating_add(effective_rows - 1);
+            }
+            self.ensure_bounds(false, false);
         }
         Ok(())
     }
@@ -743,6 +818,32 @@ mod tests {
         s.handle_graphics_command(del).unwrap();
         assert!(s.images().is_empty());
         assert!(s.placements().is_empty());
+    }
+
+    #[test]
+    fn put_advances_cursor_by_cell_metrics() {
+        use crate::ScreenOptions;
+        let mut s = Screen::builder(10, 5)
+            .options(ScreenOptions {
+                scrollback: 8,
+                cell_width: 10,
+                cell_height: 19,
+            })
+            .build()
+            .unwrap();
+        let mut t = parse_raw(b"a=t,f=32,s=25,v=40,i=1").unwrap();
+        t.payload = vec![0u8; 25 * 40 * 4];
+        s.handle_graphics_command(t).unwrap();
+        let mut put = parse_raw(b"a=p,i=1").unwrap();
+        put.payload.clear();
+        s.handle_graphics_command(put).unwrap();
+        assert_eq!((s.cursor.x, s.cursor.y), (3, 2));
+
+        s.cursor_position(1, 1);
+        let mut no_move = parse_raw(b"a=p,i=1,C=1").unwrap();
+        no_move.payload.clear();
+        s.handle_graphics_command(no_move).unwrap();
+        assert_eq!((s.cursor.x, s.cursor.y), (0, 0));
     }
 
     #[test]

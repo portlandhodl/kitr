@@ -12,7 +12,7 @@ use kitty_os::child::{ExitStatus, SpawnConfig};
 use kitty_os::loop_utils::{self, IoOutcome};
 use kitty_os::pty::WindowSize;
 use kitty_os::ChildProcess;
-use kitty_screen::{CursorShape, Parser, Screen, ScreenHandler};
+use kitty_screen::{CursorShape, Parser, Screen, ScreenHandler, ScreenOptions};
 
 use super::input::ModeTracker;
 use crate::inherited_env;
@@ -51,6 +51,8 @@ impl Pane {
         rows: u32,
         scrollback: u32,
         cursor_shape: CursorShape,
+        cell_width: u32,
+        cell_height: u32,
     ) -> io::Result<Self> {
         let command = if spec.argv.is_empty() {
             vec![crate::default_shell()]
@@ -78,7 +80,11 @@ impl Pane {
         loop_utils::set_nonblocking(child.master_fd(), true)?;
 
         let mut screen = Screen::builder(columns.max(1), rows.max(1))
-            .scrollback(scrollback.max(1))
+            .options(ScreenOptions {
+                scrollback: scrollback.max(1),
+                cell_width,
+                cell_height,
+            })
             .build()
             .map_err(|error| io::Error::other(error.to_string()))?;
         screen.cursor.shape = cursor_shape;

@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -84,6 +85,10 @@ class Case:
     threshold: float | None = None
     settle: float | None = None
     timeout: float | None = None
+    mouse: list[str] = field(default_factory=list)
+    kitty_setup: list[str] = field(default_factory=list)
+    kitr_setup: list[str] = field(default_factory=list)
+    kitr_config: list[str] = field(default_factory=list)
 
 
 def _ppm_token(data: bytes, offset: int) -> tuple[bytes, int]:
@@ -315,11 +320,72 @@ def write_kitr_config(path: Path, case: Case, font_family: str, font_size: float
                 "background_opacity 1",
                 "cursor_blink_interval 0",
                 "cursor_shape block",
+                *case.kitr_config,
                 "",
             ]
         ),
         encoding="utf-8",
     )
+
+
+def send_mouse_actions(display: str, actions: list[str], log: Path) -> None:
+    """Inject pointer events through XTest (used by selection/hover cases).
+
+    The helper is optional: when libX11/libXtst are unavailable the caller gets
+    a clear parity error instead of silently comparing unstyled screenshots.
+    """
+    if not actions:
+        return
+    import ctypes
+    import ctypes.util
+
+    x11_name = ctypes.util.find_library("X11")
+    xtst_name = ctypes.util.find_library("Xtst")
+    if not x11_name or not xtst_name:
+        raise MissingPrerequisite("XTest is required for mouse corpus cases")
+    x11 = ctypes.CDLL(x11_name)
+    xtst = ctypes.CDLL(xtst_name)
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xtst.XTestFakeMotionEvent.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_ulong,
+    ]
+    xtst.XTestFakeButtonEvent.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_ulong,
+    ]
+    handle = x11.XOpenDisplay(display.encode())
+    if not handle:
+        raise ParityError(f"cannot open display {display} for mouse injection")
+    try:
+        for action in actions:
+            parts = action.split()
+            if not parts:
+                continue
+            with log.open("ab") as f:
+                f.write(f"$ mouse {' '.join(parts)}\n".encode())
+            if parts[0] == "move" and len(parts) == 3:
+                xtst.XTestFakeMotionEvent(handle, -1, int(parts[1]), int(parts[2]), 0)
+            elif parts[0] in ("down", "up") and len(parts) == 2:
+                xtst.XTestFakeButtonEvent(
+                    handle, int(parts[1]), 1 if parts[0] == "down" else 0, 0
+                )
+            elif parts[0] == "sleep" and len(parts) == 2:
+                time.sleep(float(parts[1]))
+            else:
+                raise ParityError(f"invalid mouse action: {action!r}")
+            x11.XFlush(handle)
+            time.sleep(0.05)
+    finally:
+        x11.XCloseDisplay(handle)
 
 
 def run_kitty(
@@ -358,6 +424,19 @@ def run_kitty(
     try:
         wait_for_path(sock, process, timeout, log)
         time.sleep(max(0.0, settle))
+        for setup in case.kitty_setup:
+            cmd = [kitten, "@", "--to", f"unix:{sock}", *shlex.split(setup)]
+            with rc_log.open("ab") as f:
+                f.write(("$ " + " ".join(cmd) + "\n").encode())
+                f.flush()
+                result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
+            if result.returncode != 0:
+                raise ParityError(f"C kitty setup command failed: {setup}")
+        if case.kitty_setup:
+            time.sleep(0.25)
+        if case.mouse:
+            send_mouse_actions(env.get("DISPLAY", ""), case.mouse, log)
+            time.sleep(0.15)
         rc_cmd = [kitten, "@", "--to", f"unix:{sock}", "screenshot", str(out)]
         with rc_log.open("ab") as f:
             f.write(("$ " + " ".join(rc_cmd) + "\n").encode())
@@ -397,6 +476,7 @@ def run_kitr(
     out = artifacts / "kitr.ppm"
     log = artifacts / "kitr.log"
     config = artifacts / "kitr.conf"
+    rc_sock = artifacts / "kitr-rc.sock"
     write_kitr_config(config, case, font_family, font_size)
     cols, rows = case.size
     run_timeout = max(timeout, settle + 2.0)
@@ -409,10 +489,18 @@ def run_kitr(
         f"{cols}x{rows}",
         "--timeout",
         f"{run_timeout:g}",
+        "--screenshot-delay",
+        f"{(int((settle + 0.45) * 1000) if case.mouse else 150)}",
         "--config",
         str(config),
-        *case.kitr_args,
     ]
+    if case.kitr_setup:
+        try:
+            rc_sock.unlink()
+        except OSError:
+            pass
+        cmd += ["--listen-on", f"unix:{rc_sock}"]
+    cmd += [*case.kitr_args]
     if case.mode == "session":
         assert case.session is not None
         cmd += ["--session", str(case.session.resolve())]
@@ -430,6 +518,26 @@ def run_kitr(
             start_new_session=True,
         )
     try:
+        if case.kitr_setup:
+            deadline = time.monotonic() + run_timeout
+            while time.monotonic() < deadline and not rc_sock.exists():
+                if process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            for setup in case.kitr_setup:
+                setup_cmd = [kitr, "@", "--to", f"unix:{rc_sock}", *shlex.split(setup)]
+                with log.open("ab") as f:
+                    f.write(("$ " + " ".join(setup_cmd) + "\n").encode())
+                    f.flush()
+                    result = subprocess.run(
+                        setup_cmd, stdout=f, stderr=subprocess.STDOUT, env=env
+                    )
+                if result.returncode != 0:
+                    raise ParityError(f"kitr setup command failed: {setup}")
+            time.sleep(0.25)
+        if case.mouse:
+            time.sleep(max(0.2, settle))
+            send_mouse_actions(env.get("DISPLAY", ""), case.mouse, log)
         deadline = time.monotonic() + run_timeout + 20.0
         while time.monotonic() < deadline:
             if out.is_file() and out.stat().st_size > 0:
@@ -666,6 +774,10 @@ def _case_from_sidecar(
         threshold=float(sidecar["threshold"]) if sidecar.get("threshold") is not None else None,
         settle=float(sidecar["settle"]) if sidecar.get("settle") is not None else None,
         timeout=float(sidecar["timeout"]) if sidecar.get("timeout") is not None else None,
+        mouse=[str(x) for x in sidecar.get("mouse", [])],
+        kitty_setup=[str(x) for x in sidecar.get("kitty_setup", [])],
+        kitr_setup=[str(x) for x in sidecar.get("kitr_setup", [])],
+        kitr_config=[str(x) for x in sidecar.get("kitr_config", [])],
     )
 
 

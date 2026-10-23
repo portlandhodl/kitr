@@ -466,6 +466,44 @@ pub fn luminance(color: Rgba8) -> f32 {
         + 0.0722 * gamma_lut_lookup(color.b)
 }
 
+/// Apply kitty's cell-shader foreground contrast curve to a non-premultiplied
+/// glyph colour. `contrast` is already the uniform value (`1 + percent/100`),
+/// and `gamma_adjustment` is the reciprocal of the configured option.
+///
+/// This mirrors `foreground_contrast_new()` in `shaders/cell.slang`. The
+/// renderer applies the same curve in the cell shader; this scalar form exists
+/// for CPU composition (custom shaders, tests and headless rendering).
+pub fn apply_text_contrast(
+    over: Rgba8,
+    under: Rgba8,
+    contrast: f32,
+    gamma_adjustment: f32,
+) -> Rgba8 {
+    let contrast = contrast.max(0.0);
+    let gamma = gamma_adjustment.max(0.01);
+    if (contrast - 1.0).abs() < 1e-6 && (gamma - 1.0).abs() < 1e-6 {
+        return over;
+    }
+    let y = [0.2126f32, 0.7152, 0.0722];
+    let under_linear = [
+        gamma_lut_lookup(under.r),
+        gamma_lut_lookup(under.g),
+        gamma_lut_lookup(under.b),
+    ];
+    let over_linear = [
+        gamma_lut_lookup(over.r),
+        gamma_lut_lookup(over.g),
+        gamma_lut_lookup(over.b),
+    ];
+    let under_luminance = under_linear[0] * y[0] + under_linear[1] * y[1] + under_linear[2] * y[2];
+    let over_luminance = over_linear[0] * y[0] + over_linear[1] * y[1] + over_linear[2] * y[2];
+    let alpha = over.a as f32 / 255.0;
+    let scaled = (1.0 - over_luminance + under_luminance) * 0.5;
+    let adjusted = alpha + (alpha.powf(gamma) - alpha) * scaled;
+    let out = (adjusted * contrast).clamp(0.0, 1.0);
+    Rgba8::rgba(over.r, over.g, over.b, (out * 255.0).round() as u8)
+}
+
 /// WCAG contrast ratio, clamped to `[1, 21]` like `contrast_ratio()`.
 #[inline]
 pub fn contrast_ratio(a: Rgba8, b: Rgba8) -> f32 {
@@ -626,6 +664,17 @@ mod tests {
             r.resolve_premultiplied(encode_rgb(255, 128, 0), Rgba8::BLACK),
             Rgba8::rgba(255, 128, 0, 255)
         );
+    }
+
+    #[test]
+    fn text_contrast_identity_and_gamma() {
+        let fg = Rgba8::rgb(221, 221, 221);
+        let bg = Rgba8::rgb(0, 0, 0);
+        assert_eq!(apply_text_contrast(fg, bg, 1.0, 1.0), fg);
+        let adjusted = apply_text_contrast(fg, bg, 1.3, 1.7);
+        assert!(adjusted.a <= fg.a);
+        let dark = apply_text_contrast(Rgba8::rgb(0, 0, 0), Rgba8::rgb(255, 255, 255), 1.3, 1.7);
+        assert_eq!(dark.a, 255);
     }
 
     #[test]

@@ -513,6 +513,41 @@ impl TabPowerlineStyle {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabBarEdge {
+    Top,
+    #[default]
+    Bottom,
+    Left,
+    Right,
+}
+
+impl TabBarEdge {
+    pub fn from_setting(value: &str) -> Result<Self, String> {
+        match value.to_lowercase().as_str() {
+            "top" => Ok(Self::Top),
+            "bottom" => Ok(Self::Bottom),
+            "left" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
+            other => Err(format!(
+                "The value {other} is not a valid choice for tab_bar_edge"
+            )),
+        }
+    }
+
+    pub const fn is_horizontal(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom)
+    }
+
+    pub const fn is_top(self) -> bool {
+        matches!(self, Self::Top)
+    }
+
+    pub const fn is_bottom(self) -> bool {
+        matches!(self, Self::Bottom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TabBarAlign {
     #[default]
     Start,
@@ -679,6 +714,7 @@ pub struct Options {
     pub scrollback_lines: u64,
 
     pub tab_bar_style: TabBarStyle,
+    pub tab_bar_edge: TabBarEdge,
     pub tab_bar_min_tabs: u32,
     pub tab_bar_align: TabBarAlign,
     pub tab_bar_background: Option<Color>,
@@ -726,6 +762,14 @@ pub struct Options {
     pub background_blur: i64,
     pub inactive_text_alpha: f64,
     pub strip_trailing_spaces: String,
+    /// Raw `text_composition_strategy` setting.
+    pub text_composition_strategy: String,
+    /// Gamma adjustment derived from `text_composition_strategy`.
+    pub text_gamma_adjustment: f64,
+    /// Contrast percentage derived from `text_composition_strategy`.
+    pub text_contrast: f64,
+    /// True for the pre-0.28 gamma-incorrect blending mode.
+    pub text_old_gamma: bool,
 }
 
 impl Default for Options {
@@ -747,6 +791,7 @@ impl Default for Options {
             cursor_blink_interval: CursorBlinkInterval::default(),
             scrollback_lines: 2000,
             tab_bar_style: TabBarStyle::Fade,
+            tab_bar_edge: TabBarEdge::Bottom,
             tab_bar_min_tabs: 2,
             tab_bar_align: TabBarAlign::Start,
             tab_bar_background: None,
@@ -787,6 +832,10 @@ impl Default for Options {
             background_blur: 0,
             inactive_text_alpha: 1.0,
             strip_trailing_spaces: "never".into(),
+            text_composition_strategy: "platform".into(),
+            text_gamma_adjustment: 1.0,
+            text_contrast: 0.0,
+            text_old_gamma: false,
         }
     }
 }
@@ -873,6 +922,7 @@ impl Options {
             }
 
             "tab_bar_style" => self.tab_bar_style = TabBarStyle::from_setting(value)?,
+            "tab_bar_edge" => self.tab_bar_edge = TabBarEdge::from_setting(value)?,
             "tab_bar_min_tabs" => {
                 let parsed = value
                     .trim()
@@ -961,6 +1011,9 @@ impl Options {
                     .map_err(|_| format!("Invalid integer: {value}"))?
             }
             "inactive_text_alpha" => self.inactive_text_alpha = parse_signed_unit_float(value)?,
+            "text_composition_strategy" => {
+                self.apply_text_composition_strategy(value)?;
+            }
             "strip_trailing_spaces" => {
                 let lowered = value.to_lowercase();
                 if !matches!(lowered.as_str(), "always" | "never" | "smart") {
@@ -973,6 +1026,42 @@ impl Options {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    fn apply_text_composition_strategy(&mut self, value: &str) -> Result<(), String> {
+        self.text_composition_strategy = value.trim().to_string();
+        self.text_old_gamma = false;
+        self.text_gamma_adjustment = 1.0;
+        self.text_contrast = 0.0;
+        let value = value.trim();
+        if value == "platform" {
+            #[cfg(target_os = "macos")]
+            {
+                self.text_gamma_adjustment = 1.7;
+                self.text_contrast = 30.0;
+            }
+        } else if value == "legacy" {
+            self.text_old_gamma = true;
+        } else {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            if parts.is_empty() || parts.len() > 2 {
+                return Err(
+                    "text_composition_strategy must be 'platform', 'legacy' or up to two numbers"
+                        .into(),
+                );
+            }
+            let gamma = parts[0]
+                .parse::<f64>()
+                .map_err(|_| format!("Invalid text gamma adjustment: {}", parts[0]))?;
+            self.text_gamma_adjustment = gamma.max(0.01);
+            if let Some(contrast) = parts.get(1) {
+                let contrast = contrast
+                    .parse::<f64>()
+                    .map_err(|_| format!("Invalid text contrast: {contrast}"))?;
+                self.text_contrast = contrast.clamp(0.0, 100.0);
+            }
+        }
+        Ok(())
     }
 
     fn apply_env(&mut self, value: &str) -> Result<(), String> {

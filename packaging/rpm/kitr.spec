@@ -8,7 +8,7 @@ Release:        1%{?dist}
 Summary:        Fast GPU-accelerated terminal emulator (kitty-compatible Rust port)
 License:        GPL-3.0-or-later
 URL:            https://github.com/portlandhodl/kitr
-Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  rust >= 1.89
 BuildRequires:  cargo >= 1.89
 BuildRequires:  pkgconfig(freetype2)
@@ -22,8 +22,9 @@ BuildRequires:  pkgconfig(xcursor)
 BuildRequires:  pkgconfig(libpng)
 BuildRequires:  pkgconfig(zlib)
 BuildRequires:  pkgconfig(libcrypto)
+BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  pkgconfig(wayland-client)
-BuildRequires:  pkgconfig(wayland-protocols)
+BuildRequires:  pkgconfig(wayland-egl)
 BuildRequires:  ncurses-devel
 Requires:       terminfo-base
 Provides:       xterm-kitty
@@ -38,23 +39,22 @@ split layouts, tabs, sessions, remote control and the common kittens on Linux.
 %autosetup -n %{name}-%{version}
 
 %build
-cd rust
-%cargo_build --release --workspace
+cargo build --release --workspace
 
 %install
-cd rust
 rm -rf %{buildroot}
 make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 %check
-cd rust
-%cargo_test --workspace --offline
+cargo test --workspace --lib
 
 %files
 %license LICENSE
 %doc NOTICE README.md
 %{_bindir}/kitr
+%{_bindir}/kitten
 %{_libexecdir}/kitr/kitr
+%{_libexecdir}/kitr/kitten
 %{_datadir}/terminfo/x/xterm-kitty
 %{_datadir}/terminfo/78/xterm-kitty
 %{_datadir}/kitr/

@@ -580,6 +580,10 @@ fn absolute(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+fn delta_spool_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("kitr-transfer-deltas-{}", std::process::id()))
+}
+
 fn remote_join(base: &str, child: &str) -> String {
     if base.is_empty() {
         return child.to_owned();
@@ -604,6 +608,9 @@ pub struct SendFile {
     pub compressed: bool,
     pub ttype: TransmissionType,
     pub delta: Option<Vec<u8>>,
+    /// Disk-backed delta for large files (see `rsync::DISK_DELTA_THRESHOLD`).
+    pub delta_path: Option<PathBuf>,
+    pub delta_len: u64,
     pub sent: u64,
 }
 
@@ -777,6 +784,8 @@ fn collect_one(
             && should_compress(expanded, opts.compress),
         ttype: TransmissionType::Simple,
         delta: None,
+        delta_path: None,
+        delta_len: 0,
         sent: 0,
     });
     if file_type == FileType::Directory {
@@ -927,9 +936,23 @@ impl SendEngine {
                         let parsed = rsync::parse_signature(&signature)
                             .map_err(|err| TransferError::Protocol(err.to_string()))?;
                         let source = fs::read(&self.files[index].local_path)?;
-                        let delta = rsync::create_delta(&source, &parsed)
+                        if rsync::should_spill_delta(source.len() as u64) {
+                            let dir = delta_spool_dir();
+                            fs::create_dir_all(&dir)?;
+                            let path = dir.join(format!("{}.delta", self.files[index].file_id));
+                            let len = rsync::create_delta_file(
+                                &self.files[index].local_path,
+                                &parsed,
+                                &path,
+                            )
                             .map_err(|err| TransferError::Protocol(err.to_string()))?;
-                        self.files[index].delta = Some(delta);
+                            self.files[index].delta_path = Some(path);
+                            self.files[index].delta_len = len;
+                        } else {
+                            let delta = rsync::create_delta(&source, &parsed)
+                                .map_err(|err| TransferError::Protocol(err.to_string()))?;
+                            self.files[index].delta = Some(delta);
+                        }
                         self.files[index].state = SendFileState::Transmitting;
                     }
                 }
@@ -1045,7 +1068,11 @@ impl SendEngine {
                     .into_bytes()
             }
             FileType::Regular => {
-                let (mut data, compress) = if let Some(delta) = file.delta.take() {
+                let (mut data, compress) = if let Some(path) = file.delta_path.take() {
+                    let data = fs::read(&path).unwrap_or_default();
+                    let _ = fs::remove_file(&path);
+                    (data, false)
+                } else if let Some(delta) = file.delta.take() {
                     (delta, false)
                 } else {
                     let data = fs::read(&file.local_path).ok().unwrap_or_default();
@@ -1137,6 +1164,7 @@ pub struct ReceiveEngine {
     pub use_rsync: bool,
     queued: HashSet<String>,
     received: HashMap<String, Vec<u8>>,
+    delta_files: HashMap<String, PathBuf>,
     signatures: HashMap<String, Vec<u8>>,
     finished: bool,
 }
@@ -1171,6 +1199,7 @@ impl ReceiveEngine {
             use_rsync: opts.transmit_deltas,
             queued: HashSet::new(),
             received: HashMap::new(),
+            delta_files: HashMap::new(),
             signatures: HashMap::new(),
             finished: false,
         }
@@ -1280,29 +1309,66 @@ impl ReceiveEngine {
                     else {
                         return Ok(frames);
                     };
-                    let buffer = self.received.entry(cmd.file_id.clone()).or_default();
-                    buffer.extend_from_slice(&cmd.data);
+                    let spill = self.files[index].expects_delta
+                        && rsync::should_spill_delta(self.files[index].size.max(0) as u64);
+                    if spill {
+                        let dir = delta_spool_dir();
+                        fs::create_dir_all(&dir)?;
+                        let path = self
+                            .delta_files
+                            .entry(cmd.file_id.clone())
+                            .or_insert_with(|| dir.join(format!("recv-{}.delta", cmd.file_id)));
+                        use std::io::Write;
+                        let mut file = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&*path)?;
+                        file.write_all(&cmd.data)?;
+                    } else {
+                        let buffer = self.received.entry(cmd.file_id.clone()).or_default();
+                        buffer.extend_from_slice(&cmd.data);
+                    }
                     if cmd.action == Action::EndData {
-                        let data = self.received.remove(&cmd.file_id).unwrap_or_default();
                         let expects_delta = self.files[index].expects_delta;
-                        let data = if expects_delta {
+                        if spill {
+                            let delta_path =
+                                self.delta_files.remove(&cmd.file_id).unwrap_or_default();
                             let signature = self.signatures.get(&cmd.file_id);
                             let block_size = signature
                                 .and_then(|sig| rsync::parse_signature_header(sig).ok())
                                 .map(|size| size as usize)
                                 .unwrap_or(rsync::DEFAULT_BLOCK_SIZE);
                             let target_path = self.files[index].dest_path.clone();
-                            let target = fs::read(&target_path).unwrap_or_default();
-                            rsync::apply_delta_with_block_size(&target, &data, block_size)
-                                .map_err(|err| TransferError::Protocol(err.to_string()))?
-                        } else if self.files[index].file_type == FileType::Regular
-                            && self.files[index].compression == Compression::Zlib
-                        {
-                            zlib_decompress(&data, self.files[index].size as usize).unwrap_or(data)
+                            rsync::apply_delta_file(
+                                &target_path,
+                                &delta_path,
+                                block_size,
+                                &target_path,
+                            )
+                            .map_err(|err| TransferError::Protocol(err.to_string()))?;
+                            let _ = fs::remove_file(&delta_path);
                         } else {
-                            data
-                        };
-                        write_received(&mut self.files[index], &data)?;
+                            let data = self.received.remove(&cmd.file_id).unwrap_or_default();
+                            let data = if expects_delta {
+                                let signature = self.signatures.get(&cmd.file_id);
+                                let block_size = signature
+                                    .and_then(|sig| rsync::parse_signature_header(sig).ok())
+                                    .map(|size| size as usize)
+                                    .unwrap_or(rsync::DEFAULT_BLOCK_SIZE);
+                                let target_path = self.files[index].dest_path.clone();
+                                let target = fs::read(&target_path).unwrap_or_default();
+                                rsync::apply_delta_with_block_size(&target, &data, block_size)
+                                    .map_err(|err| TransferError::Protocol(err.to_string()))?
+                            } else if self.files[index].file_type == FileType::Regular
+                                && self.files[index].compression == Compression::Zlib
+                            {
+                                zlib_decompress(&data, self.files[index].size as usize)
+                                    .unwrap_or(data)
+                            } else {
+                                data
+                            };
+                            write_received(&mut self.files[index], &data)?;
+                        }
                         self.files[index].state = ReceiveFileState::Done;
                     }
                 }

@@ -694,6 +694,8 @@ pub struct SshConnectionData {
     pub identity_file: String,
     pub is_ssh_kitten: bool,
     pub ssh_kitten_cmdline: Vec<String>,
+    /// Process id used in the shared ControlPath. Zero means this process.
+    pub control_pid: u32,
 }
 
 impl SshConnectionData {
@@ -701,10 +703,15 @@ impl SshConnectionData {
         if self.is_ssh_kitten {
             return self.ssh_kitten_cmdline.clone();
         }
+        let pid = if self.control_pid == 0 {
+            std::process::id()
+        } else {
+            self.control_pid
+        };
         let mut argv = vec![
             self.binary.clone(),
             "-o".to_owned(),
-            format!("ControlPath=~/.ssh/kitty-ssh-{}-%C", std::process::id()),
+            format!("ControlPath=~/.ssh/kitty-ssh-{pid}-%C"),
             "-o".to_owned(),
             "TCPKeepAlive=yes".to_owned(),
             "-o".to_owned(),
@@ -902,6 +909,7 @@ pub fn connection_data(args: &[String]) -> Option<SshConnectionData> {
         identity_file: identity,
         is_ssh_kitten: false,
         ssh_kitten_cmdline: Vec::new(),
+        control_pid: 0,
     })
 }
 
@@ -995,6 +1003,308 @@ pub fn serialize_ssh_env(
         });
     }
     final_env_instructions(local_env, &env)
+}
+
+/// Timeout used when probing or re-creating a stale SSH ControlMaster.
+pub const STALE_MASTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Result of one ssh child command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SshCommandOutput {
+    pub status: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl SshCommandOutput {
+    pub fn success(&self) -> bool {
+        self.status == 0
+    }
+
+    pub fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).trim().to_owned()
+    }
+}
+
+/// Abstraction over ssh process execution so ControlMaster recovery is
+/// testable without a real server.
+pub trait SshCommandRunner {
+    fn run(
+        &mut self,
+        argv: &[String],
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<SshCommandOutput>;
+}
+
+/// The default ssh runner with an optional hard timeout.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemSshRunner;
+
+impl SshCommandRunner for SystemSshRunner {
+    fn run(
+        &mut self,
+        argv: &[String],
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<SshCommandOutput> {
+        let Some(program) = argv.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty ssh command",
+            ));
+        };
+        let mut command = Command::new(program);
+        command
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn()?;
+        if let Some(timeout) = timeout {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child.wait_with_output()?;
+                    return Ok(SshCommandOutput {
+                        status: 124,
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output()?;
+            Ok(SshCommandOutput {
+                status: output.status.code().unwrap_or(1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        } else {
+            let output = child.wait_with_output()?;
+            Ok(SshCommandOutput {
+                status: output.status.code().unwrap_or(1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
+    }
+}
+
+/// A resolved port-forward target parsed from `KITTY_LISTEN_ON`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForwardTarget {
+    UnixPath(String),
+    Tcp(String),
+}
+
+impl ForwardTarget {
+    pub fn as_ssh_destination(&self) -> &str {
+        match self {
+            Self::UnixPath(path) | Self::Tcp(path) => path,
+        }
+    }
+}
+
+/// Parse `unix:/path`, a bare socket path, or `tcp:host:port`.
+pub fn parse_forward_target(listen_on: &str) -> Result<ForwardTarget, SshError> {
+    if listen_on.is_empty() {
+        return Err(SshError::Config(
+            "KITTY_LISTEN_ON is empty; cannot forward remote control".to_owned(),
+        ));
+    }
+    if let Some(rest) = listen_on.strip_prefix("unix:") {
+        if rest.starts_with('@') {
+            return Err(SshError::Config(format!(
+                "Cannot forward kitty remote control socket when an abstract UNIX socket ({rest}) is used, due to limitations in OpenSSH. Use either a path based one or a TCP socket"
+            )));
+        }
+        return Ok(ForwardTarget::UnixPath(rest.to_owned()));
+    }
+    if let Some(rest) = listen_on.strip_prefix("tcp:") {
+        if rest.is_empty() {
+            return Err(SshError::Config(format!(
+                "Invalid KITTY_LISTEN_ON: {listen_on:?}"
+            )));
+        }
+        return Ok(ForwardTarget::Tcp(rest.to_owned()));
+    }
+    if listen_on.starts_with('@') {
+        return Err(SshError::Config(format!(
+            "Cannot forward kitty remote control socket when an abstract UNIX socket ({listen_on}) is used, due to limitations in OpenSSH. Use either a path based one or a TCP socket"
+        )));
+    }
+    Ok(ForwardTarget::UnixPath(listen_on.to_owned()))
+}
+
+/// `-o ControlMaster=auto` and the matching `ControlPath`, appended to an ssh
+/// command before the destination.
+pub fn connection_sharing_args(pid: u32) -> Vec<String> {
+    vec![
+        "-o".to_owned(),
+        "ControlMaster=auto".to_owned(),
+        "-o".to_owned(),
+        "ControlPersist=yes".to_owned(),
+        "-o".to_owned(),
+        format!("ControlPath=~/.ssh/kitty-ssh-{pid}-%C"),
+    ]
+}
+
+fn master_base(conn: &SshConnectionData) -> Vec<String> {
+    let mut argv = conn.command_prefix();
+    if !argv.iter().any(|arg| arg == "ControlMaster=auto") {
+        argv.insert(1, "ControlMaster=auto".to_owned());
+        argv.insert(1, "-o".to_owned());
+    }
+    argv
+}
+
+/// `ssh -O check` for an existing ControlMaster.
+pub fn control_master_check_command(conn: &SshConnectionData) -> Vec<String> {
+    let mut argv = master_base(conn);
+    argv.extend(["-O".to_owned(), "check".to_owned(), "--".to_owned()]);
+    argv.push(conn.hostname.clone());
+    argv
+}
+
+/// `ssh -O exit` for a stale ControlMaster. It only talks to the local socket,
+/// so it is safe even when the network connection is dead.
+pub fn control_master_exit_command(conn: &SshConnectionData) -> Vec<String> {
+    let mut argv = master_base(conn);
+    argv.extend(["-O".to_owned(), "exit".to_owned(), "--".to_owned()]);
+    argv.push(conn.hostname.clone());
+    argv
+}
+
+/// `ssh -N -f` to start a new background ControlMaster.
+pub fn control_master_start_command(conn: &SshConnectionData) -> Vec<String> {
+    let mut argv = master_base(conn);
+    argv.extend(["-N".to_owned(), "-f".to_owned(), "--".to_owned()]);
+    argv.push(conn.hostname.clone());
+    argv
+}
+
+/// Request a remote forward (`-R 0:target -O forward`) and return the command.
+pub fn port_forward_command(
+    conn: &SshConnectionData,
+    listen_on: &str,
+) -> Result<Vec<String>, SshError> {
+    let target = parse_forward_target(listen_on)?;
+    let mut argv = master_base(conn);
+    argv.extend([
+        "-R".to_owned(),
+        format!("0:{}", target.as_ssh_destination()),
+        "-O".to_owned(),
+        "forward".to_owned(),
+        "--".to_owned(),
+    ]);
+    argv.push(conn.hostname.clone());
+    Ok(argv)
+}
+
+/// Check whether the ControlMaster currently answers on its local socket.
+pub fn control_master_responds(
+    conn: &SshConnectionData,
+    runner: &mut dyn SshCommandRunner,
+) -> bool {
+    runner
+        .run(
+            &control_master_check_command(conn),
+            Some(STALE_MASTER_TIMEOUT),
+        )
+        .map(|output| output.success())
+        .unwrap_or(false)
+}
+
+fn stop_stale_master(conn: &SshConnectionData, runner: &mut dyn SshCommandRunner) {
+    let _ = runner.run(
+        &control_master_exit_command(conn),
+        Some(STALE_MASTER_TIMEOUT),
+    );
+}
+
+fn ensure_master(
+    conn: &SshConnectionData,
+    runner: &mut dyn SshCommandRunner,
+) -> Result<(), SshError> {
+    if control_master_responds(conn, runner) {
+        return Ok(());
+    }
+    let output = runner
+        .run(&control_master_start_command(conn), None)
+        .map_err(|err| SshError::Config(format!("failed to start SSH ControlMaster: {err}")))?;
+    if !output.success() {
+        return Err(SshError::Config(format!(
+            "failed to start SSH ControlMaster with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if !control_master_responds(conn, runner) {
+        return Err(SshError::Config(
+            "SSH ControlMaster not functional after being started explicitly".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Result of forwarding kitty's remote-control socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardedControl {
+    pub listen_on: String,
+    pub recovered: bool,
+}
+
+/// Forward the local kitty remote-control socket through an SSH ControlMaster.
+///
+/// When an existing shared connection is dead but has not noticed, the forward
+/// request times out. The stale master is stopped and re-created, and the
+/// forward is retried exactly once.
+pub fn forward_remote_control(
+    conn: &SshConnectionData,
+    listen_on: &str,
+    runner: &mut dyn SshCommandRunner,
+) -> Result<ForwardedControl, SshError> {
+    // Validate before touching the master.
+    parse_forward_target(listen_on)?;
+    ensure_master(conn, runner)?;
+    let argv = port_forward_command(conn, listen_on)?;
+    let mut recovered = false;
+    let mut output = runner
+        .run(&argv, Some(STALE_MASTER_TIMEOUT))
+        .map_err(|err| SshError::Config(format!("failed to request SSH forward: {err}")))?;
+    let timed_out = output.status == 124;
+    if timed_out || !output.success() {
+        if timed_out {
+            stop_stale_master(conn, runner);
+            ensure_master(conn, runner)?;
+            recovered = true;
+            output = runner
+                .run(&argv, Some(STALE_MASTER_TIMEOUT))
+                .map_err(|err| SshError::Config(format!("failed to retry SSH forward: {err}")))?;
+        }
+        if !output.success() {
+            return Err(SshError::Config(format!(
+                "Setup of port forward in SSH ControlMaster failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+    }
+    let port = output.stdout_text();
+    let resolved = if let Ok(port) = port.parse::<u16>() {
+        format!("tcp:localhost:{port}")
+    } else if !port.is_empty() {
+        port
+    } else {
+        listen_on.to_owned()
+    };
+    Ok(ForwardedControl {
+        listen_on: resolved,
+        recovered,
+    })
 }
 
 /// Execute ssh with the computed arguments. Returns the exit status.
@@ -2636,5 +2946,139 @@ mod tests {
             askpass_response("OTP:", &config, now).unwrap().as_deref(),
             Some("94287082")
         );
+    }
+}
+
+#[cfg(test)]
+mod control_master_tests {
+    use super::*;
+
+    struct FakeRunner {
+        checks: usize,
+        forward_calls: usize,
+        commands: Vec<Vec<String>>,
+        forward_times_out_first: bool,
+    }
+
+    impl SshCommandRunner for FakeRunner {
+        fn run(
+            &mut self,
+            argv: &[String],
+            _timeout: Option<std::time::Duration>,
+        ) -> io::Result<SshCommandOutput> {
+            self.commands.push(argv.to_vec());
+            if argv.iter().any(|arg| arg == "check") {
+                self.checks += 1;
+                return Ok(SshCommandOutput {
+                    status: if self.checks >= 2 { 0 } else { 255 },
+                    ..SshCommandOutput::default()
+                });
+            }
+            if argv.iter().any(|arg| arg == "forward") {
+                self.forward_calls += 1;
+                if self.forward_calls == 1 && self.forward_times_out_first {
+                    return Ok(SshCommandOutput {
+                        status: 124,
+                        ..SshCommandOutput::default()
+                    });
+                }
+                return Ok(SshCommandOutput {
+                    status: 0,
+                    stdout: b"4321\n".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(SshCommandOutput::default())
+        }
+    }
+
+    fn conn() -> SshConnectionData {
+        SshConnectionData {
+            binary: "ssh".to_owned(),
+            hostname: "user@host".to_owned(),
+            ..SshConnectionData::default()
+        }
+    }
+
+    #[test]
+    fn parses_forward_targets_and_rejects_abstract_sockets() {
+        assert_eq!(
+            parse_forward_target("unix:/tmp/kitty.sock").unwrap(),
+            ForwardTarget::UnixPath("/tmp/kitty.sock".to_owned())
+        );
+        assert_eq!(
+            parse_forward_target("tcp:localhost:1234").unwrap(),
+            ForwardTarget::Tcp("localhost:1234".to_owned())
+        );
+        assert_eq!(
+            parse_forward_target("/tmp/plain.sock").unwrap(),
+            ForwardTarget::UnixPath("/tmp/plain.sock".to_owned())
+        );
+        assert!(parse_forward_target("unix:@abstract").is_err());
+        assert!(parse_forward_target("").is_err());
+    }
+
+    #[test]
+    fn control_master_commands_share_one_path() {
+        let sharing = connection_sharing_args(42);
+        assert!(sharing.contains(&"ControlMaster=auto".to_owned()));
+        assert!(sharing.iter().any(|arg| arg.contains("kitty-ssh-42-%C")));
+        let check = control_master_check_command(&conn());
+        assert_eq!(&check[..2], ["ssh", "-o"]);
+        assert!(check.contains(&"check".to_owned()));
+        assert_eq!(check.last().unwrap(), "user@host");
+        let forward = port_forward_command(&conn(), "unix:/tmp/kitty.sock").unwrap();
+        assert!(forward.contains(&"0:/tmp/kitty.sock".to_owned()));
+        assert!(forward.contains(&"forward".to_owned()));
+    }
+
+    #[test]
+    fn forward_recovers_a_stale_master_once() {
+        let mut runner = FakeRunner {
+            checks: 0,
+            forward_calls: 0,
+            commands: Vec::new(),
+            forward_times_out_first: true,
+        };
+        let forwarded =
+            forward_remote_control(&conn(), "unix:/tmp/kitty.sock", &mut runner).unwrap();
+        assert!(forwarded.recovered);
+        assert_eq!(forwarded.listen_on, "tcp:localhost:4321");
+        let forwarded_calls = runner
+            .commands
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "forward"))
+            .count();
+        assert_eq!(forwarded_calls, 2);
+        let exit_calls = runner
+            .commands
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "exit"))
+            .count();
+        assert_eq!(exit_calls, 1);
+        let start_calls = runner
+            .commands
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "-N"))
+            .count();
+        assert!(start_calls >= 1);
+    }
+
+    #[test]
+    fn forward_without_a_stale_master_does_not_recover() {
+        let mut runner = FakeRunner {
+            checks: 1,
+            forward_calls: 0,
+            commands: Vec::new(),
+            forward_times_out_first: false,
+        };
+        let forwarded = forward_remote_control(&conn(), "tcp:localhost:2222", &mut runner).unwrap();
+        assert!(!forwarded.recovered);
+        assert_eq!(forwarded.listen_on, "tcp:localhost:4321");
+        assert_eq!(runner.forward_calls, 1);
+        assert!(!runner
+            .commands
+            .iter()
+            .any(|argv| argv.iter().any(|arg| arg == "-N")));
     }
 }

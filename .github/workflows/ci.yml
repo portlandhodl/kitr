@@ -87,3 +87,172 @@ jobs:
           name: screenshot-parity
           path: artifacts/screenshot-parity
           if-no-files-found: ignore
+
+  parity-corpus:
+    name: Full C-kitty parity corpus
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfreetype-dev libharfbuzz-dev libfontconfig1-dev \
+            libegl1-mesa-dev libx11-dev libxkbcommon-dev libwayland-dev \
+            libpng-dev zlib1g-dev libssl-dev \
+            xvfb xauth imagemagick fonts-dejavu-core ncurses-bin kitty
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-parity-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-parity-
+
+      - name: Build kitr
+        run: cargo build --release -p kitty
+
+      - name: Run the full parity corpus
+        run: |
+          test -x /usr/bin/kitty
+          test -x /usr/bin/kitten
+          python3 scripts/screenshot_parity.py \
+            --corpus scripts/parity_corpus \
+            --kitty /usr/bin/kitty \
+            --kitten /usr/bin/kitten \
+            --kitr target/release/kitr \
+            --threshold 8 --strict \
+            --artifacts artifacts/parity-corpus \
+            --markdown artifacts/parity-corpus/PARITY.md \
+            --json artifacts/parity-corpus/report.json
+
+      - name: Upload parity corpus artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-corpus
+          path: artifacts/parity-corpus
+          if-no-files-found: ignore
+
+  package-deb:
+    name: Build Debian package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debhelper dpkg-dev pkg-config make \
+            libfreetype-dev libharfbuzz-dev libfontconfig-dev \
+            libegl-dev libgl-dev libx11-dev libxi-dev libxcursor-dev \
+            libxkbcommon-dev libwayland-dev libwayland-egl-backend-dev \
+            wayland-protocols libpng-dev zlib1g-dev libssl-dev ncurses-bin
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-deb-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-deb-
+
+      - name: Build .deb
+        run: make deb
+
+      - name: Smoke-test the installed package
+        run: |
+          set -e
+          deb=$(find dist/deb-src -maxdepth 1 -name '*.deb' | head -n1)
+          test -n "$deb"
+          sudo dpkg -i "$deb"
+          kitr --version
+          test -x /usr/libexec/kitr/kitr
+
+      - name: Upload Debian artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-package
+          path: dist/deb-src/*.deb
+
+  package-rpm:
+    name: Build RPM package
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y 'dnf-command(builddep)' rpm-build make gcc gcc-c++
+          dnf builddep -y packaging/rpm/kitr.spec
+
+      - name: Build RPM
+        run: make rpm
+
+      - name: Verify RPM contents
+        run: |
+          set -e
+          rpm=$(find dist/rpmbuild/RPMS -name '*.rpm' | head -n1)
+          test -n "$rpm"
+          rpm -qlp "$rpm" | grep -q '/usr/bin/kitr'
+          rpm -qlp "$rpm" | grep -q 'xterm-kitty'
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package
+          path: dist/rpmbuild/RPMS/**/*.rpm
+
+  package-flatpak:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//24.08
+
+      - name: Verify generated Cargo sources
+        run: make flatpak-sources-check
+
+      - name: Build the Flatpak
+        run: |
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --repo=dist/flatpak-repo dist/flatpak-build \
+            packaging/flatpak/io.github.portlandhodl.kitr.yml
+          flatpak build-bundle dist/flatpak-repo \
+            dist/kitr.flatpak io.github.portlandhodl.kitr
+
+      - name: Upload Flatpak artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-bundle
+          path: |
+            dist/kitr.flatpak
+            dist/flatpak-repo

@@ -29,13 +29,24 @@ pub enum WindowBackend {
 impl WindowBackend {
     /// Open a window on the display server selected from the environment.
     pub fn open(config: &WindowConfig) -> Result<Self, WindowError> {
+        Self::open_on_display(config, None)
+    }
+
+    /// Open on an explicit X11 display name, or select the backend from the
+    /// environment when `display_name` is `None`.
+    pub fn open_on_display(
+        config: &WindowConfig,
+        display_name: Option<&str>,
+    ) -> Result<Self, WindowError> {
         #[cfg(feature = "wayland")]
         {
-            if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()) {
+            if display_name.is_none()
+                && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+            {
                 return WaylandWindow::new(config).map(|window| Self::Wayland(Box::new(window)));
             }
         }
-        X11Window::new(config).map(|window| Self::X11(Box::new(window)))
+        X11Window::open(config, display_name).map(|window| Self::X11(Box::new(window)))
     }
 
     pub fn is_wayland(&self) -> bool {

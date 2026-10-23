@@ -820,3 +820,66 @@ fn raster_cache_codepoint_api() {
         Err(Error::MissingGlyph(_))
     ));
 }
+
+#[test]
+fn bundled_colr_v1_glyph_composites_opaque_pixels() {
+    let f = face(TWEMOJI);
+    let bitmap = f.rasterize_codepoint(0x1F601).unwrap();
+    assert_eq!(bitmap.format, PixelFormat::Rgba8);
+    assert!(!bitmap.is_empty());
+    assert!(bitmap.data.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+    assert_eq!(
+        f.color_glyph_type(f.glyph_id(0x1F601)),
+        Some(kitty_fonts::ColorGlyphType::ColrV1)
+    );
+}
+
+#[test]
+fn cbdt_strike_is_decoded_when_freetype_has_no_png_support() {
+    let fc = Fontconfig::new().unwrap();
+    let Some(m) = fc
+        .match_for_codepoint(0x1F600, FontStyle::Regular, true)
+        .unwrap()
+    else {
+        return;
+    };
+    let Ok(f) = m.load(12.0, 96.0, 96.0) else {
+        return;
+    };
+    if f.sfnt_table(b"CBDT").is_none() && f.sfnt_table(b"CBLC").is_none() {
+        return;
+    }
+    match f.rasterize_codepoint(0x1F600) {
+        Ok(bitmap) => {
+            assert_alpha_bitmap(&bitmap);
+            assert!(!bitmap.is_empty(), "CBDT strike should decode");
+        }
+        Err(Error::MissingGlyph(_)) => {}
+        Err(error) => panic!("CBDT rasterization failed: {error}"),
+    }
+}
+
+fn assert_alpha_bitmap(bitmap: &GlyphBitmap) {
+    assert!(matches!(
+        bitmap.format,
+        PixelFormat::Bgra8 | PixelFormat::Rgba8 | PixelFormat::Gray8
+    ));
+    if !bitmap.is_empty() {
+        assert_bitmap_integrity(bitmap);
+    }
+}
+
+#[test]
+fn arabic_shaping_reports_rtl_and_visual_order() {
+    let path = "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf";
+    if !Path::new(path).is_file() {
+        return;
+    }
+    let f = Face::from_path(path, 0).unwrap();
+    let text: Vec<u32> = "مرحبا".chars().map(|c| c as u32).collect();
+    let run = f.shape(&text, &ShapeOptions::default()).unwrap();
+    assert!(run.direction.is_rtl());
+    assert!(!run.glyphs.is_empty());
+    let clusters: Vec<u32> = run.glyphs.iter().map(|g| g.cluster).collect();
+    assert!(clusters.windows(2).all(|w| w[0] >= w[1]), "{clusters:?}");
+}

@@ -192,6 +192,10 @@ pub struct GlBackendConfig {
     /// Corner radius for block/beam/underline cursor rectangles. `0.0` draws
     /// plain rectangles.
     pub cursor_radius: f32,
+    /// kitty cell-shader text contrast multiplier (`1 + percent / 100`).
+    pub text_contrast: f32,
+    /// kitty cell-shader text gamma adjustment (reciprocal of the option).
+    pub text_gamma_adjustment: f32,
 }
 
 impl Default for GlBackendConfig {
@@ -201,6 +205,8 @@ impl Default for GlBackendConfig {
             gamma: GammaMode::None,
             atlas_filter: FilterMode::Linear,
             cursor_radius: 0.0,
+            text_contrast: 1.0,
+            text_gamma_adjustment: 1.0,
         }
     }
 }
@@ -2412,6 +2418,8 @@ impl GlBackend {
         config: &RenderConfig,
     ) -> Result<RenderStats, GlBackendError> {
         self.ensure_current()?;
+        self.config.text_contrast = config.text_contrast.max(0.0);
+        self.config.text_gamma_adjustment = config.text_gamma_adjustment.max(0.01);
         if let Some(palette) = frame.indexed_palette.as_ref() {
             self.upload_indexed_palette(palette);
         }
@@ -3171,6 +3179,18 @@ impl GlBackend {
             (self.gl.glUniform1ui)(program.uniform("draw_bg_bitfield"), bitfield);
             (self.gl.glUniform1i)(program.uniform("sprites"), 0);
             (self.gl.glUniform1i)(program.uniform("sprite_decorations_map"), 1);
+            if program.uniform("text_contrast") >= 0 {
+                (self.gl.glUniform1f)(
+                    program.uniform("text_contrast"),
+                    self.config.text_contrast.max(0.0),
+                );
+            }
+            if program.uniform("text_gamma_adjustment") >= 0 {
+                (self.gl.glUniform1f)(
+                    program.uniform("text_gamma_adjustment"),
+                    self.config.text_gamma_adjustment.max(0.01),
+                );
+            }
             (self.gl.glActiveTexture)(GL_TEXTURE0);
             (self.gl.glBindTexture)(GL_TEXTURE_2D_ARRAY, sprites_texture);
             (self.gl.glActiveTexture)(GL_TEXTURE0 + 1);
