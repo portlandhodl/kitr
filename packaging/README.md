@@ -180,7 +180,9 @@ decorations for C kitty, but does not attempt to match fonts or scale.
 Distribution metadata skeletons live in:
 
 - `debian/` — Debian/Ubuntu `debian/rules`, `control`, `changelog` and
-  `copyright`; `make deb` stages a source tree and runs `dpkg-buildpackage -b`.
+  `copyright`; `make deb` runs `dpkg-buildpackage -b` when available and falls
+  back to `scripts/build_deb.sh`, a direct `ar`/`tar` builder that needs only
+  `xz`, `tar` and `ar`.
 - `rpm/kitr.spec` — Fedora/RHEL/openSUSE RPM spec; `make rpm` builds a source
   tarball and runs `rpmbuild -bb`.
 - `flatpak/io.github.portlandhodl.kitr.yml` — reproducible Flatpak manifest.

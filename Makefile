@@ -38,7 +38,7 @@ ICON_SVG := $(wildcard packaging/icons/kitr.svg)
 .PHONY: all build test lint fmt clippy install uninstall terminfo \
 	install-binary install-terminfo install-shell-integration \
 	install-desktop install-man screenshot-parity license-check validate \
-	package package-smoke flatpak-sources flatpak-sources-check deb rpm \
+	package package-smoke flatpak-sources flatpak-sources-check deb deb-source rpm \
 	parity-corpus clean help
 
 all: build
@@ -180,6 +180,13 @@ flatpak-sources-check:
 		Cargo.lock -o packaging/flatpak/cargo-sources.json --check
 
 deb:
+	@if command -v dpkg-buildpackage >/dev/null 2>&1; then \
+		$(MAKE) deb-source; \
+	else \
+		VERSION="$(VERSION)" ARCH="$(ARCH)" scripts/build_deb.sh; \
+	fi
+
+deb-source:
 	rm -rf "$(DIST)/deb-src"
 	mkdir -p "$(DIST)/deb-src/kitr-$(VERSION)"
 	tar --exclude=.git --exclude=target --exclude=dist --exclude=artifacts \
@@ -223,6 +230,6 @@ help:
 		'  parity-corpus         run the full C-kitty vs kitr screenshot corpus' \
 		'  flatpak-sources       regenerate packaging/flatpak/cargo-sources.json' \
 		'  flatpak-sources-check fail if the generated Cargo sources are stale' \
-		'  deb                   build a Debian binary package with dpkg-buildpackage' \
+		'  deb                   build a Debian binary package (fallback builder without dpkg)' \
 		'  rpm                   build a source tarball and RPM with rpmbuild' \
 		'  clean                 cargo clean and remove generated artifacts'
