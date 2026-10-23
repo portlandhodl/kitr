@@ -1,6 +1,6 @@
 # kitr vs C kitty screenshot parity
 
-Generated: 2026-10-22 10:55:01 PDT
+Generated: 2026-10-22 18:37:24 PDT
 
 ## Environment
 
@@ -8,7 +8,7 @@ Generated: 2026-10-22 10:55:01 PDT
 - kitten: `../kitty/launcher/kitten`
 - kitr: `/home/qrsnap/kitty/rust/target/release/kitr`
 - Python: `3.9.25`
-- display: `:469` (Xvfb unless `--display` was used)
+- display: `:134` (Xvfb unless `--display` was used)
 - font: `DejaVu Sans Mono` at `12.0pt`
 - kitr startup settle: `1.5s`
 
@@ -161,11 +161,33 @@ ramp entries. `05_sgr` is 2.857% aligned tolerant.
 
 Indexed protocol images (`f=8`/`f=16`) now stay as integer index textures; the
 GL indexed-graphics shader looks each pixel up in the std140-padded live
-palette, so changing terminal colours does not re-upload the image. Animation
-frames remain delta-compressed and can be spilled to a private disk cache under
-the renderer's temp directory; the cache subdirectory is removed on drop/clear.
-Neither path is exercised by the screenshot corpus (no graphics protocol case or
-animated image is included), but both have CPU/GPU unit tests.
+palette, so changing terminal colours does not re-upload the image and the
+change is visible on the next draw. Animation frames remain delta-compressed and
+can be spilled to a private disk cache under the renderer's temp directory;
+deleted, edited, evicted and replaced frame files are unlinked immediately, and
+the cache subdirectory is removed on drop/clear. Neither path is exercised by
+the screenshot corpus (no graphics protocol case or animated image is included),
+but both have CPU/GPU unit tests, including a live-palette redraw and a
+per-frame disk-cleanup test. Placements without a `p` id now keep distinct graph
+instances (the protocol allows several per image), and cascade deletion follows
+the first-placement rule for `Q=0`. The screen sink still does not advance the
+cursor after a put without `C=1`, since that needs cell pixel metrics, so that
+side effect is not modelled by the screenshot corpus.
+
+### 4b. Shader-path completion
+
+The deferred renderer paths are now selected and covered by headless GL tests:
+the `cell`/`cell_bg`/`cell_fg` programs consume a fixed-cell
+`GL_TEXTURE_2D_ARRAY` sprite atlas adapted from the packed CPU pages (via
+`GlBackend::set_cell_programs`/`render_cells_with_atlas`), `bgimage` draws
+representable opaque background layouts, `blit`/`screenshot` are exposed as
+offscreen/readback operations, and animated multi-group custom shader pipelines
+run through ping-pong and named textures with kitty's start/toggle/stop timing.
+These paths do not change the default frame adapter used by the screenshot
+corpus, so the percentages above are unchanged. Remaining limits are documented
+in `crates/kitty-render/SHADERS.md` (multi-cell glyphs fall back to the graphics
+path, `border`/`padding` still use solid chrome instances, and the full
+`KittyCustomShaderData`/pointer-map payload is not populated).
 
 ### 5. Cursor, selection and colours
 

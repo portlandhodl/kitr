@@ -151,11 +151,22 @@ pub fn color_to_image_id(color: u32) -> u32 {
 pub struct ImagePlacement {
     pub image_id: u32,
     pub placement_id: u32,
+    /// Unique identity for anonymous (`p=0`) placements. The protocol allows
+    /// several placements of one image without a placement id; this stays zero
+    /// for named placements and is non-zero for each anonymous one.
+    pub graph_id: u32,
     pub image_number: u32,
     pub placement: Placement,
     /// Screen cell where the placement was created (used by `d=c`/`d=C`).
     pub anchor_x: u32,
     pub anchor_y: u32,
+}
+
+impl ImagePlacement {
+    /// Key used by [`Screen::placement_graph`] and cascade deletion.
+    pub const fn graph_key(&self) -> PlacementKey {
+        PlacementKey::new(self.image_id, self.placement_id).with_instance(self.graph_id)
+    }
 }
 
 /// Query bookkeeping for `a=q`.
@@ -347,7 +358,7 @@ impl Screen {
         for placement in &self.placements {
             let p = &placement.placement;
             let mut record = PlacementRecord::new(
-                PlacementKey::new(placement.image_id, placement.placement_id),
+                placement.graph_key(),
                 placement.anchor_x,
                 placement.anchor_y,
             )
@@ -395,7 +406,7 @@ impl Screen {
             return;
         }
         self.placements
-            .retain(|p| !removed.contains(&PlacementKey::new(p.image_id, p.placement_id)));
+            .retain(|p| !removed.contains(&p.graph_key()));
     }
 }
 
@@ -431,9 +442,24 @@ impl GraphicsSink for Screen {
         }
         let placement_anchor_x = self.cursor.x.min(self.columns.saturating_sub(1));
         let placement_anchor_y = self.cursor.y.min(self.lines.saturating_sub(1));
+        // `p=0` means "anonymous": every put creates a new placement. Named
+        // placements replace an existing placement with the same id.
+        let graph_id = if placement.placement_id == 0 {
+            self.placements
+                .iter()
+                .filter(|p| p.image_id == image_id && p.placement_id == 0)
+                .map(|p| p.graph_id)
+                .max()
+                .unwrap_or(0)
+                .wrapping_add(1)
+                .max(1)
+        } else {
+            0
+        };
         let entry = ImagePlacement {
             image_id,
             placement_id: placement.placement_id,
+            graph_id,
             image_number: placement.image_number,
             placement: placement.clone(),
             anchor_x: placement_anchor_x,
@@ -444,30 +470,26 @@ impl GraphicsSink for Screen {
         // graph is rebuilt from the stored placements so it also sees anchors
         // that were materialised from Unicode placeholder cells.
         let mut graph = self.placement_graph();
-        let record = PlacementRecord::new(
-            PlacementKey::new(entry.image_id, entry.placement_id),
-            entry.anchor_x,
-            entry.anchor_y,
-        )
-        .with_parent(
-            entry.placement.parent_id,
-            entry.placement.parent_placement_id,
-        )
-        .with_offset(
-            entry.placement.offset_from_parent_x,
-            entry.placement.offset_from_parent_y,
-        )
-        .with_source(SourceRect::new(
-            entry.placement.x_offset,
-            entry.placement.y_offset,
-            entry.placement.width,
-            entry.placement.height,
-        ))
-        .with_z_index(entry.placement.z_index)
-        .inheriting(
-            entry.placement.parent_id != 0 && entry.placement.z_index == 0,
-            entry.placement.parent_id != 0,
-        );
+        let record = PlacementRecord::new(entry.graph_key(), entry.anchor_x, entry.anchor_y)
+            .with_parent(
+                entry.placement.parent_id,
+                entry.placement.parent_placement_id,
+            )
+            .with_offset(
+                entry.placement.offset_from_parent_x,
+                entry.placement.offset_from_parent_y,
+            )
+            .with_source(SourceRect::new(
+                entry.placement.x_offset,
+                entry.placement.y_offset,
+                entry.placement.width,
+                entry.placement.height,
+            ))
+            .with_z_index(entry.placement.z_index)
+            .inheriting(
+                entry.placement.parent_id != 0 && entry.placement.z_index == 0,
+                entry.placement.parent_id != 0,
+            );
         let record = if entry.placement.unicode_placement {
             record.as_virtual()
         } else {
@@ -477,12 +499,16 @@ impl GraphicsSink for Screen {
         graph.insert(record)?;
         graph.validate(key)?;
 
-        if let Some(existing) = self
-            .placements
-            .iter_mut()
-            .find(|p| p.image_id == entry.image_id && p.placement_id == entry.placement_id)
-        {
-            *existing = entry;
+        if entry.placement_id != 0 {
+            if let Some(existing) = self
+                .placements
+                .iter_mut()
+                .find(|p| p.image_id == entry.image_id && p.placement_id == entry.placement_id)
+            {
+                *existing = entry;
+            } else {
+                self.placements.push(entry);
+            }
         } else {
             self.placements.push(entry);
         }
@@ -503,9 +529,7 @@ impl GraphicsSink for Screen {
     fn on_delete(&mut self, command: &GraphicsCommand) -> Result<(), GraphicsError> {
         let action = command.delete_action.unwrap_or(DeleteAction::All);
         let mut graph = self.placement_graph();
-        let keys = |placement: &ImagePlacement| {
-            PlacementKey::new(placement.image_id, placement.placement_id)
-        };
+        let keys = ImagePlacement::graph_key;
         let point = (
             i64::from(command.x_offset.saturating_sub(1)),
             i64::from(command.y_offset.saturating_sub(1)),
@@ -785,6 +809,61 @@ mod more_tests {
         assert_eq!(cells[1].screen_x, 1);
         assert_eq!(cells[0].screen_y, 0);
         assert!(cells.iter().all(|cell| cell.image_id == 7));
+    }
+
+    #[test]
+    fn anonymous_placements_are_distinct_and_cascade_by_instance() {
+        let mut screen = Screen::builder(8, 4).scrollback(4).build().unwrap();
+        transmit(&mut screen, 1);
+        transmit(&mut screen, 2);
+        screen.cursor_position(1, 1);
+        put(&mut screen, b"a=p,i=1,c=1,r=1,C=1").unwrap();
+        screen.cursor_position(3, 4);
+        put(&mut screen, b"a=p,i=1,c=1,r=1,C=1").unwrap();
+        assert_eq!(screen.placements().len(), 2, "p=0 must not replace");
+
+        let first = screen.placements()[0].clone();
+        let second = screen.placements()[1].clone();
+        assert_eq!((first.graph_id, second.graph_id), (1, 2));
+        assert_ne!(first.graph_key(), second.graph_key());
+        let graph = screen.placement_graph();
+        assert_eq!(
+            (
+                graph.resolve(first.graph_key()).unwrap().anchor_x,
+                graph.resolve(first.graph_key()).unwrap().anchor_y
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            (
+                graph.resolve(second.graph_key()).unwrap().anchor_x,
+                graph.resolve(second.graph_key()).unwrap().anchor_y
+            ),
+            (3, 2)
+        );
+
+        // Q=0 names the first anonymous placement only.
+        screen.cursor_position(6, 4);
+        put(&mut screen, b"a=p,i=2,p=1,P=1,Q=0,c=1,r=1,C=1").unwrap();
+        let child = screen.placement(2, 1).unwrap().clone();
+        let graph = screen.placement_graph();
+        assert_eq!(
+            (
+                graph.resolve(child.graph_key()).unwrap().anchor_x,
+                graph.resolve(child.graph_key()).unwrap().anchor_y
+            ),
+            (0, 0)
+        );
+
+        screen.cursor_position(3, 4);
+        put(&mut screen, b"a=d,d=c").unwrap();
+        assert!(screen.placement(2, 1).is_some(), "child belongs to first");
+        assert_eq!(screen.placements().len(), 2);
+
+        screen.cursor_position(1, 1);
+        put(&mut screen, b"a=d,d=c").unwrap();
+        assert!(screen.placement(2, 1).is_none(), "child must cascade");
+        assert!(screen.placements().is_empty());
     }
 
     #[test]

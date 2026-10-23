@@ -4,13 +4,15 @@
 //! This module implements the portable desktop-service state and installation
 //! logic: appearance settings, color/number parsing, `portals.conf` patching,
 //! the xdg-desktop-portal definition and the D-Bus activation service file.
-//! The live D-Bus service and file-chooser portal require a D-Bus connection;
-//! [`run_server`] reports that limitation instead of silently doing nothing.
+//! [`serve_portal`] exports the Settings and FileChooser interfaces on the
+//! session bus and serves until shutdown; [`run_server`] serves forever.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use zbus::zvariant::{OwnedValue, Value};
 
 pub const PORTAL_APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
 pub const PORTAL_COLOR_SCHEME_KEY: &str = "color-scheme";
@@ -21,6 +23,10 @@ pub const SETTINGS_INTERFACE: &str = "org.freedesktop.impl.portal.Settings";
 pub const FILE_CHOOSER_INTERFACE: &str = "org.freedesktop.impl.portal.FileChooser";
 pub const SETTINGS_CANARY_NAMESPACE: &str = "net.kovidgoyal.kitty";
 pub const SETTINGS_CANARY_KEY: &str = "status";
+
+pub const DESKTOP_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+pub const KITTY_OBJECT_PATH: &str = "/net/kovidgoyal/kitty/portal";
+pub const CHANGE_SETTINGS_INTERFACE: &str = "net.kovidgoyal.kitty.settings";
 
 pub const DESKTOP_UI_USAGE: &str = "\
 Usage: kitten desktop-ui <command>
@@ -365,10 +371,806 @@ pub fn enable_portal(kitten_exe: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(written)
 }
 
-/// The live service requires a D-Bus connection, which this dependency-free
-/// crate does not implement. The settings/installation engine remains usable.
+// The live portal service ///////////////////////////////////////////////////
+
+/// A file chooser request sent by xdg-desktop-portal.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileChooserRequest {
+    pub handle: String,
+    pub app_id: String,
+    pub parent_window: String,
+    pub title: String,
+    pub mode: String,
+    pub directory: bool,
+    pub multiple: bool,
+    pub current_folder: String,
+    pub current_name: String,
+    pub current_file: String,
+    pub filters: Vec<(String, String, String)>,
+}
+
+/// The result returned by a [`ChooserLauncher`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileChooserResult {
+    pub paths: Vec<String>,
+    pub interrupted: bool,
+    pub current_filter: Option<String>,
+}
+
+/// A host-supplied file chooser implementation.
+///
+/// The default implementation runs the native `choose-files` kitten. Tests and
+/// embedding applications can provide a different implementation without a
+/// display server.
+pub trait ChooserLauncher: Send + Sync {
+    fn choose(&self, request: &FileChooserRequest) -> Result<FileChooserResult, String>;
+}
+
+#[derive(Clone, Debug)]
+struct ProcessChooserLauncher {
+    kitten_exe: PathBuf,
+}
+
+impl ChooserLauncher for ProcessChooserLauncher {
+    fn choose(&self, request: &FileChooserRequest) -> Result<FileChooserResult, String> {
+        let temp = std::env::temp_dir().join(format!(
+            "kitty-portal-{}-{}",
+            std::process::id(),
+            new_request_suffix()
+        ));
+        fs::create_dir_all(&temp).map_err(|err| err.to_string())?;
+        let output = temp.join("output.json");
+        let mut command = std::process::Command::new(&self.kitten_exe);
+        command
+            .arg("choose-files")
+            .arg("--mode")
+            .arg(&request.mode)
+            .arg("--write-output-to")
+            .arg(&output)
+            .arg("--output-format=json");
+        if !request.title.is_empty() {
+            command.arg("--title").arg(&request.title);
+        }
+        if !request.current_name.is_empty() {
+            command
+                .arg("--suggested-save-file-name")
+                .arg(&request.current_name);
+        }
+        if !request.current_file.is_empty() {
+            command
+                .arg("--suggested-save-file-path")
+                .arg(&request.current_file);
+        }
+        for (kind, value, name) in &request.filters {
+            command
+                .arg("--file-filter")
+                .arg(format!("{kind}:{value}:{name}"));
+        }
+        let target = if request.current_folder.is_empty() {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("~"))
+        } else {
+            PathBuf::from(&request.current_folder)
+        };
+        command.arg(target);
+        let status = command.status().map_err(|err| err.to_string())?;
+        let result = if status.success() {
+            let text = fs::read_to_string(&output).map_err(|err| err.to_string())?;
+            parse_chooser_output(&text)?
+        } else {
+            FileChooserResult {
+                interrupted: true,
+                ..FileChooserResult::default()
+            }
+        };
+        let _ = fs::remove_dir_all(temp);
+        Ok(result)
+    }
+}
+
+fn parse_chooser_output(text: &str) -> Result<FileChooserResult, String> {
+    let value = kitty_remote::json::parse(text.as_bytes()).map_err(|err| err.to_string())?;
+    let paths = value
+        .get("paths")
+        .and_then(kitty_remote::json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(kitty_remote::json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(error) = value
+        .get("error")
+        .and_then(kitty_remote::json::Value::as_str)
+        .filter(|error| !error.is_empty())
+    {
+        return Err(error.to_owned());
+    }
+    let interrupted = value
+        .get("interrupted")
+        .and_then(kitty_remote::json::Value::as_bool)
+        .unwrap_or(false);
+    let current_filter = value
+        .get("current_filter")
+        .and_then(kitty_remote::json::Value::as_str)
+        .map(str::to_owned);
+    Ok(FileChooserResult {
+        paths,
+        interrupted,
+        current_filter,
+    })
+}
+
+/// Configuration for the live portal service.
+#[derive(Clone)]
+pub struct PortalConfig {
+    pub bus_name: String,
+    pub object_path: String,
+    pub settings: DesktopSettings,
+    pub accent_color: String,
+    pub chooser: std::sync::Arc<dyn ChooserLauncher>,
+}
+
+impl std::fmt::Debug for PortalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortalConfig")
+            .field("bus_name", &self.bus_name)
+            .field("object_path", &self.object_path)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PortalConfig {
+    pub fn new(color_scheme: ColorScheme, accent: &str, contrast: Contrast) -> Self {
+        let settings = DesktopSettings::new(color_scheme, accent, contrast);
+        let kitten_exe = std::env::var_os("KITTEN_EXE")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| PathBuf::from("kitten"));
+        Self {
+            bus_name: PORTAL_BUS_NAME.to_owned(),
+            object_path: DESKTOP_OBJECT_PATH.to_owned(),
+            settings,
+            accent_color: accent.to_owned(),
+            chooser: std::sync::Arc::new(ProcessChooserLauncher { kitten_exe }),
+        }
+    }
+
+    pub fn with_chooser(mut self, chooser: std::sync::Arc<dyn ChooserLauncher>) -> Self {
+        self.chooser = chooser;
+        self
+    }
+}
+
+impl Default for PortalConfig {
+    fn default() -> Self {
+        Self::new(ColorScheme::NoPreference, "cyan", Contrast::Normal)
+    }
+}
+
+fn value_to_owned_u32(value: u32) -> OwnedValue {
+    OwnedValue::try_from(Value::from(value)).expect("u32 is representable")
+}
+
+fn text_to_owned(value: &str) -> OwnedValue {
+    OwnedValue::try_from(Value::from(value)).expect("strings are representable")
+}
+
+/// Convert the portable string map used by [`DesktopSettings`] to D-Bus
+/// variants. Appearance values that are numeric are typed as `u32`; everything
+/// else is a string.
+fn settings_to_variants(
+    settings: &DesktopSettings,
+) -> BTreeMap<String, BTreeMap<String, OwnedValue>> {
+    let mut out = BTreeMap::new();
+    for (namespace, keys) in &settings.values {
+        let mut converted = BTreeMap::new();
+        for (key, value) in keys {
+            let owned = if namespace == PORTAL_APPEARANCE_NAMESPACE
+                && matches!(key.as_str(), PORTAL_COLOR_SCHEME_KEY | PORTAL_CONTRAST_KEY)
+            {
+                value
+                    .parse::<u32>()
+                    .map(value_to_owned_u32)
+                    .unwrap_or_else(|_| text_to_owned(value))
+            } else {
+                text_to_owned(value)
+            };
+            converted.insert(key.clone(), owned);
+        }
+        out.insert(namespace.clone(), converted);
+    }
+    out
+}
+
+#[derive(Default)]
+struct PortalState {
+    values: BTreeMap<String, BTreeMap<String, OwnedValue>>,
+}
+
+impl PortalState {
+    fn new(settings: &DesktopSettings) -> Self {
+        Self {
+            values: settings_to_variants(settings),
+        }
+    }
+
+    fn read(&self, namespace: &str, key: &str) -> Option<OwnedValue> {
+        self.values
+            .get(namespace)
+            .and_then(|keys| keys.get(key))
+            .cloned()
+    }
+
+    fn read_all(&self, namespaces: &[String]) -> BTreeMap<String, BTreeMap<String, OwnedValue>> {
+        if namespaces.is_empty() || namespaces.iter().any(String::is_empty) {
+            return self.values.clone();
+        }
+        let mut out = BTreeMap::new();
+        for requested in namespaces {
+            if let Some(prefix) = requested.strip_suffix(".*") {
+                let prefix = format!("{prefix}.");
+                for (namespace, keys) in &self.values {
+                    if namespace == prefix.trim_end_matches('.') || namespace.starts_with(&prefix) {
+                        out.insert(namespace.clone(), keys.clone());
+                    }
+                }
+            } else if let Some(keys) = self.values.get(requested) {
+                out.insert(requested.clone(), keys.clone());
+            }
+        }
+        out
+    }
+
+    fn change(&mut self, namespace: &str, key: &str, value: Option<OwnedValue>) {
+        let keys = self.values.entry(namespace.to_owned()).or_default();
+        match value {
+            Some(value) => {
+                keys.insert(key.to_owned(), value);
+            }
+            None => {
+                keys.remove(key);
+            }
+        }
+    }
+}
+
+type SharedState = std::sync::Arc<std::sync::Mutex<PortalState>>;
+type SharedConnection = std::sync::Arc<std::sync::Mutex<Option<zbus::blocking::Connection>>>;
+
+fn emit_setting_changed(
+    connection: &SharedConnection,
+    namespace: &str,
+    key: &str,
+    value: OwnedValue,
+) {
+    if let Ok(guard) = connection.lock() {
+        if let Some(connection) = guard.as_ref() {
+            let _ = connection.emit_signal(
+                None::<()>,
+                DESKTOP_OBJECT_PATH,
+                SETTINGS_INTERFACE,
+                "SettingChanged",
+                &(namespace, key, value),
+            );
+        }
+    }
+}
+
+struct SettingsInterface {
+    state: SharedState,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Settings")]
+impl SettingsInterface {
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn read(&self, namespace: &str, key: &str) -> zbus::fdo::Result<OwnedValue> {
+        let state = self.state.lock().map_err(|_| {
+            zbus::fdo::Error::Failed("portal settings state is poisoned".to_owned())
+        })?;
+        state.read(namespace, key).ok_or_else(|| {
+            zbus::fdo::Error::Failed(format!(
+                "the setting {key} in the namespace {namespace} is not supported"
+            ))
+        })
+    }
+
+    fn read_all(
+        &self,
+        namespaces: Vec<String>,
+    ) -> zbus::fdo::Result<BTreeMap<String, BTreeMap<String, OwnedValue>>> {
+        let state = self.state.lock().map_err(|_| {
+            zbus::fdo::Error::Failed("portal settings state is poisoned".to_owned())
+        })?;
+        Ok(state.read_all(&namespaces))
+    }
+
+    #[zbus(signal)]
+    async fn setting_changed(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        namespace: &str,
+        key: &str,
+        value: OwnedValue,
+    ) -> zbus::Result<()>;
+}
+
+struct ChangeSettingsInterface {
+    state: SharedState,
+    connection: SharedConnection,
+}
+
+#[zbus::interface(name = "net.kovidgoyal.kitty.settings")]
+impl ChangeSettingsInterface {
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn change_setting(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: OwnedValue,
+    ) -> zbus::fdo::Result<()> {
+        {
+            let mut state = self.state.lock().map_err(|_| {
+                zbus::fdo::Error::Failed("portal settings state is poisoned".to_owned())
+            })?;
+            state.change(namespace, key, Some(value.clone()));
+        }
+        emit_setting_changed(&self.connection, namespace, key, value);
+        Ok(())
+    }
+
+    fn remove_setting(&self, namespace: &str, key: &str) -> zbus::fdo::Result<()> {
+        {
+            let mut state = self.state.lock().map_err(|_| {
+                zbus::fdo::Error::Failed("portal settings state is poisoned".to_owned())
+            })?;
+            state.change(namespace, key, None);
+        }
+        Ok(())
+    }
+}
+
+struct FileChooserInterface {
+    chooser: std::sync::Arc<dyn ChooserLauncher>,
+}
+
+fn option_bool(options: &std::collections::HashMap<String, OwnedValue>, key: &str) -> bool {
+    options
+        .get(key)
+        .and_then(|value| value.downcast_ref::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn option_bytes(options: &std::collections::HashMap<String, OwnedValue>, key: &str) -> String {
+    options
+        .get(key)
+        .and_then(|value| Vec::<u8>::try_from(value.clone()).ok())
+        .map(|bytes| {
+            let end = bytes
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        })
+        .unwrap_or_default()
+}
+
+fn option_filters(
+    options: &std::collections::HashMap<String, OwnedValue>,
+) -> Vec<(String, String, String)> {
+    let Some(value) = options.get("filters") else {
+        return Vec::new();
+    };
+    let Ok(filters) = Vec::<(String, Vec<(u32, String)>)>::try_from(value.clone()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, expressions) in filters {
+        for (kind, pattern) in expressions {
+            out.push((
+                if kind == 0 { "glob" } else { "mime" }.to_owned(),
+                pattern.clone(),
+                name.clone(),
+            ));
+        }
+    }
+    out
+}
+
+fn file_chooser_request(
+    handle: &str,
+    app_id: &str,
+    parent_window: &str,
+    title: &str,
+    options: &std::collections::HashMap<String, OwnedValue>,
+    save: bool,
+) -> FileChooserRequest {
+    let directory = option_bool(options, "directory");
+    let multiple = option_bool(options, "multiple");
+    let mode = if save {
+        if multiple {
+            "save-files"
+        } else {
+            "save-file"
+        }
+    } else if directory {
+        if multiple {
+            "dirs"
+        } else {
+            "dir"
+        }
+    } else if multiple {
+        "files"
+    } else {
+        "file"
+    };
+    FileChooserRequest {
+        handle: handle.to_owned(),
+        app_id: app_id.to_owned(),
+        parent_window: parent_window.to_owned(),
+        title: title.to_owned(),
+        mode: mode.to_owned(),
+        directory,
+        multiple,
+        current_folder: option_bytes(options, "current_folder"),
+        current_name: option_bytes(options, "current_name"),
+        current_file: option_bytes(options, "current_file"),
+        filters: option_filters(options),
+    }
+}
+
+fn uri_for_path(path: &str) -> String {
+    let mut out = String::from("file://");
+    for byte in path.as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(byte) {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn chooser_response(
+    result: &FileChooserResult,
+) -> (u32, std::collections::HashMap<String, OwnedValue>) {
+    let mut results = std::collections::HashMap::new();
+    if result.interrupted {
+        return (1, results);
+    }
+    let uris: Vec<String> = result.paths.iter().map(|path| uri_for_path(path)).collect();
+    let uris = OwnedValue::try_from(Value::from(uris)).expect("string arrays are representable");
+    results.insert("uris".to_owned(), uris);
+    (0, results)
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.FileChooser")]
+impl FileChooserInterface {
+    #[zbus(out_args("response", "results"))]
+    fn open_file(
+        &self,
+        handle: &str,
+        app_id: &str,
+        parent_window: &str,
+        title: &str,
+        options: std::collections::HashMap<String, OwnedValue>,
+    ) -> (u32, std::collections::HashMap<String, OwnedValue>) {
+        let request = file_chooser_request(handle, app_id, parent_window, title, &options, false);
+        match self.chooser.choose(&request) {
+            Ok(result) => chooser_response(&result),
+            Err(_) => (2, std::collections::HashMap::new()),
+        }
+    }
+
+    #[zbus(out_args("response", "results"))]
+    fn save_file(
+        &self,
+        handle: &str,
+        app_id: &str,
+        parent_window: &str,
+        title: &str,
+        options: std::collections::HashMap<String, OwnedValue>,
+    ) -> (u32, std::collections::HashMap<String, OwnedValue>) {
+        let request = file_chooser_request(handle, app_id, parent_window, title, &options, true);
+        match self.chooser.choose(&request) {
+            Ok(result) => chooser_response(&result),
+            Err(_) => (2, std::collections::HashMap::new()),
+        }
+    }
+}
+
+fn new_request_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}", nanos as u64)
+}
+
+fn session_connection() -> Result<zbus::blocking::Connection, String> {
+    zbus::blocking::Connection::session()
+        .map_err(|err| format!("could not connect to session D-Bus: {err}"))
+}
+
+fn call_change_setting(namespace: &str, key: &str, value: OwnedValue) -> Result<(), String> {
+    let connection = session_connection()?;
+    connection
+        .call_method(
+            Some(PORTAL_BUS_NAME),
+            KITTY_OBJECT_PATH,
+            Some(CHANGE_SETTINGS_INTERFACE),
+            "ChangeSetting",
+            &(namespace, key, value),
+        )
+        .map_err(|err| format!("failed to call ChangeSetting: {err}"))?;
+    Ok(())
+}
+
+fn call_remove_setting(namespace: &str, key: &str) -> Result<(), String> {
+    let connection = session_connection()?;
+    connection
+        .call_method(
+            Some(PORTAL_BUS_NAME),
+            KITTY_OBJECT_PATH,
+            Some(CHANGE_SETTINGS_INTERFACE),
+            "RemoveSetting",
+            &(namespace, key),
+        )
+        .map_err(|err| format!("failed to call RemoveSetting: {err}"))?;
+    Ok(())
+}
+
+fn call_read_all(
+    namespaces: &[String],
+) -> Result<BTreeMap<String, BTreeMap<String, OwnedValue>>, String> {
+    let connection = session_connection()?;
+    let reply = connection
+        .call_method(
+            Some(PORTAL_BUS_NAME),
+            DESKTOP_OBJECT_PATH,
+            Some(SETTINGS_INTERFACE),
+            "ReadAll",
+            &(namespaces,),
+        )
+        .map_err(|err| format!("failed to call ReadAll: {err}"))?;
+    reply
+        .body()
+        .deserialize()
+        .map_err(|err| format!("failed to decode ReadAll response: {err}"))
+}
+
+/// Register the portal interfaces on the session bus and serve forever (or
+/// until `shutdown` becomes true). Returns once the bus name is owned and all
+/// objects are exported.
+pub fn serve_portal(
+    config: PortalConfig,
+    shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(PortalState::new(&config.settings)));
+    let connection_slot: SharedConnection = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let builder = zbus::blocking::connection::Builder::session()
+        .map_err(|err| format!("could not connect to session D-Bus: {err}"))?
+        .name(config.bus_name.clone())
+        .map_err(|err| format!("invalid D-Bus name {}: {err}", config.bus_name))?
+        .serve_at(
+            config.object_path.clone(),
+            SettingsInterface {
+                state: state.clone(),
+            },
+        )
+        .map_err(|err| format!("failed to export Settings interface: {err}"))?
+        .serve_at(
+            config.object_path.clone(),
+            FileChooserInterface {
+                chooser: config.chooser.clone(),
+            },
+        )
+        .map_err(|err| format!("failed to export FileChooser interface: {err}"))?
+        .serve_at(
+            KITTY_OBJECT_PATH,
+            ChangeSettingsInterface {
+                state: state.clone(),
+                connection: connection_slot.clone(),
+            },
+        )
+        .map_err(|err| format!("failed to export settings control interface: {err}"))?;
+    let connection = builder
+        .build()
+        .map_err(|err| format!("failed to register portal D-Bus name: {err}"))?;
+    if let Ok(mut slot) = connection_slot.lock() {
+        *slot = Some(connection.clone());
+    }
+    match shutdown {
+        Some(flag) => {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        None => loop {
+            std::thread::park();
+        },
+    }
+    Ok(())
+}
+
+/// Run the live desktop portal service on the session bus.
 pub fn run_server() -> Result<(), String> {
-    Err("The desktop-ui D-Bus service is not available in this build; use `enable-portal` and the settings commands, which are implemented".to_owned())
+    serve_portal(PortalConfig::default(), None)
+}
+
+fn owned_to_text(value: &OwnedValue) -> String {
+    if let Ok(text) = value.downcast_ref::<String>() {
+        return text;
+    }
+    if let Ok(value) = value.downcast_ref::<u32>() {
+        return value.to_string();
+    }
+    if let Ok(value) = value.downcast_ref::<i32>() {
+        return value.to_string();
+    }
+    if let Ok(value) = value.downcast_ref::<bool>() {
+        return value.to_string();
+    }
+    if let Ok(value) = value.downcast_ref::<f64>() {
+        return value.to_string();
+    }
+    if let Ok(array) = Vec::<f64>::try_from(value.clone()) {
+        return array
+            .iter()
+            .map(|value| format!("{value:.6}"))
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    format!("{}", **value)
+}
+
+fn live_read(namespace: &str, key: &str) -> Option<OwnedValue> {
+    let values = call_read_all(&[namespace.to_owned()]).ok()?;
+    values.get(namespace)?.get(key).cloned()
+}
+
+fn try_live_set_color_scheme(which: &str) -> Result<String, String> {
+    let current = live_read(PORTAL_APPEARANCE_NAMESPACE, PORTAL_COLOR_SCHEME_KEY)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let current = match current {
+        1 => ColorScheme::Dark,
+        2 => ColorScheme::Light,
+        _ => ColorScheme::NoPreference,
+    };
+    let new = match which {
+        "toggle" => current.toggle(),
+        value => ColorScheme::parse(value)
+            .ok_or_else(|| format!("{value} is not a valid value of the color-scheme"))?,
+    };
+    call_change_setting(
+        PORTAL_APPEARANCE_NAMESPACE,
+        PORTAL_COLOR_SCHEME_KEY,
+        value_to_owned_u32(new.as_value()),
+    )?;
+    Ok(new.as_value().to_string())
+}
+
+fn try_live_set_accent(value: &str) -> Result<String, String> {
+    let color = parse_color(value).ok_or_else(|| format!("{value} is not a valid color"))?;
+    let array = Value::Array(
+        vec![
+            Value::from(color[0]),
+            Value::from(color[1]),
+            Value::from(color[2]),
+        ]
+        .into(),
+    );
+    let owned = OwnedValue::try_from(array).map_err(|err| err.to_string())?;
+    call_change_setting(PORTAL_APPEARANCE_NAMESPACE, PORTAL_ACCENT_COLOR_KEY, owned)?;
+    Ok(format!("{:.6},{:.6},{:.6}", color[0], color[1], color[2]))
+}
+
+fn try_live_set_contrast(value: &str) -> Result<String, String> {
+    let contrast =
+        Contrast::parse(value).ok_or_else(|| format!("{value} is not a valid contrast value"))?;
+    call_change_setting(
+        PORTAL_APPEARANCE_NAMESPACE,
+        PORTAL_CONTRAST_KEY,
+        value_to_owned_u32(contrast.as_value()),
+    )?;
+    Ok(contrast.as_value().to_string())
+}
+
+fn try_live_set_setting(namespace: &str, key: &str, value: Option<&str>) -> Result<String, String> {
+    match value {
+        Some(value) if !value.is_empty() => {
+            let owned = if namespace == PORTAL_APPEARANCE_NAMESPACE
+                && matches!(key, PORTAL_COLOR_SCHEME_KEY | PORTAL_CONTRAST_KEY)
+            {
+                value
+                    .parse::<u32>()
+                    .map(value_to_owned_u32)
+                    .unwrap_or_else(|_| text_to_owned(value))
+            } else if namespace == PORTAL_APPEARANCE_NAMESPACE && key == PORTAL_ACCENT_COLOR_KEY {
+                let color =
+                    parse_color(value).ok_or_else(|| format!("{value} is not a valid color"))?;
+                let array = Value::Array(
+                    vec![
+                        Value::from(color[0]),
+                        Value::from(color[1]),
+                        Value::from(color[2]),
+                    ]
+                    .into(),
+                );
+                OwnedValue::try_from(array).map_err(|err| err.to_string())?
+            } else {
+                text_to_owned(value)
+            };
+            call_change_setting(namespace, key, owned)?;
+        }
+        _ => call_remove_setting(namespace, key)?,
+    }
+    Ok(String::new())
+}
+
+fn live_show_settings(namespaces: &[String], as_json: bool) -> Result<String, String> {
+    let values = call_read_all(namespaces)?;
+    if as_json {
+        let mut out = String::from(
+            "{
+",
+        );
+        let mut first_namespace = true;
+        for (namespace, keys) in &values {
+            if !first_namespace {
+                out.push_str(
+                    ",
+",
+                );
+            }
+            first_namespace = false;
+            out.push_str(&format!(
+                "  \"{}\": {{
+",
+                escape_json(namespace)
+            ));
+            let mut first_key = true;
+            for (key, value) in keys {
+                if !first_key {
+                    out.push_str(
+                        ",
+",
+                    );
+                }
+                first_key = false;
+                out.push_str(&format!(
+                    "    \"{}\": \"{}\"",
+                    escape_json(key),
+                    escape_json(&owned_to_text(value))
+                ));
+            }
+            out.push_str("\n  }");
+        }
+        out.push_str("\n}\n");
+        return Ok(out);
+    }
+    let mut out = String::new();
+    for (namespace, keys) in &values {
+        out.push_str(namespace);
+        out.push_str(":\n");
+        for (key, value) in keys {
+            out.push_str(&format!("\t{key}: {}\n", owned_to_text(value)));
+        }
+    }
+    Ok(out)
 }
 
 /// Execute one desktop-ui subcommand. Returns text to print.
@@ -390,6 +1192,9 @@ pub fn run_desktop_ui_command(args: &[String], kitten_exe: &Path) -> Result<Stri
             let value = args
                 .get(1)
                 .ok_or_else(|| "must specify the new color scheme value".to_owned())?;
+            if let Ok(value) = try_live_set_color_scheme(value) {
+                return Ok(value);
+            }
             let mut settings =
                 DesktopSettings::new(ColorScheme::NoPreference, "cyan", Contrast::Normal);
             settings.set_color_scheme(value)?;
@@ -402,6 +1207,9 @@ pub fn run_desktop_ui_command(args: &[String], kitten_exe: &Path) -> Result<Stri
             let value = args
                 .get(1)
                 .ok_or_else(|| "must specify the new accent color value".to_owned())?;
+            if let Ok(value) = try_live_set_accent(value) {
+                return Ok(value);
+            }
             parse_color(value)
                 .map(|color| format!("{:.6},{:.6},{:.6}", color[0], color[1], color[2]))
                 .ok_or_else(|| format!("{value} is not a valid color"))
@@ -410,6 +1218,9 @@ pub fn run_desktop_ui_command(args: &[String], kitten_exe: &Path) -> Result<Stri
             let value = args
                 .get(1)
                 .ok_or_else(|| "must specify the new contrast value".to_owned())?;
+            if let Ok(value) = try_live_set_contrast(value) {
+                return Ok(value);
+            }
             Contrast::parse(value)
                 .map(|contrast| contrast.as_value().to_string())
                 .ok_or_else(|| format!("{value} is not a valid contrast value"))
@@ -419,12 +1230,30 @@ pub fn run_desktop_ui_command(args: &[String], kitten_exe: &Path) -> Result<Stri
                 .get(1)
                 .ok_or_else(|| "must specify the key".to_owned())?;
             let value = args.get(2).map(String::as_str);
+            let namespace = args
+                .iter()
+                .position(|arg| arg == "--namespace")
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+                .unwrap_or(PORTAL_APPEARANCE_NAMESPACE);
+            if let Ok(value) = try_live_set_setting(namespace, actual_key, value) {
+                return Ok(value);
+            }
             let mut settings = DesktopSettings::default();
-            settings.change(PORTAL_APPEARANCE_NAMESPACE, actual_key, value);
+            settings.change(namespace, actual_key, value);
             Ok(settings.as_json())
         }
         "show-settings" => {
             let as_json = args.iter().any(|arg| arg == "--as-json");
+            let namespaces: Vec<String> = args
+                .iter()
+                .position(|arg| arg == "--namespace")
+                .and_then(|index| args.get(index + 1))
+                .map(|value| vec![value.clone()])
+                .unwrap_or_default();
+            if let Ok(text) = live_show_settings(&namespaces, as_json) {
+                return Ok(text);
+            }
             let settings =
                 DesktopSettings::new(ColorScheme::NoPreference, "cyan", Contrast::Normal);
             if as_json {
@@ -510,8 +1339,167 @@ mod tests {
             "0.000000,1.000000,0.000000"
         );
         assert!(
-            run_desktop_ui_command(&["run-server".to_owned()], Path::new("/bin/kitten")).is_err()
+            !run_desktop_ui_command(&["show-settings".to_owned()], Path::new("/bin/kitten"))
+                .unwrap()
+                .is_empty()
         );
+    }
+
+    struct FakeChooser;
+
+    impl ChooserLauncher for FakeChooser {
+        fn choose(&self, request: &FileChooserRequest) -> Result<FileChooserResult, String> {
+            if request.mode == "file" && request.title == "Pick one" {
+                Ok(FileChooserResult {
+                    paths: vec!["/tmp/a b.txt".to_owned()],
+                    interrupted: false,
+                    current_filter: None,
+                })
+            } else {
+                Ok(FileChooserResult {
+                    interrupted: true,
+                    ..FileChooserResult::default()
+                })
+            }
+        }
+    }
+
+    struct LivePortal {
+        bus_name: String,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for LivePortal {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn start_live_portal() -> LivePortal {
+        let bus_name = format!(
+            "org.freedesktop.impl.portal.desktop.kitty.test{}",
+            std::process::id()
+        );
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut config = PortalConfig::new(ColorScheme::Dark, "#112233", Contrast::High);
+        config.bus_name = bus_name.clone();
+        config = config.with_chooser(std::sync::Arc::new(FakeChooser));
+        let flag = shutdown.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = serve_portal(config, Some(flag));
+        });
+        // The connection builder owns the name before returning from
+        // serve_portal, so retry briefly until the client can resolve it.
+        for _ in 0..100 {
+            if zbus::blocking::Connection::session()
+                .and_then(|connection| {
+                    connection.call_method(
+                        Some(bus_name.as_str()),
+                        "/org/freedesktop/portal/desktop",
+                        Some("org.freedesktop.impl.portal.Settings"),
+                        "Read",
+                        &(PORTAL_APPEARANCE_NAMESPACE, PORTAL_COLOR_SCHEME_KEY),
+                    )
+                })
+                .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        LivePortal {
+            bus_name,
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+
+    #[test]
+    fn live_dbus_portal_settings_and_file_chooser() {
+        let portal = start_live_portal();
+        let connection = zbus::blocking::Connection::session().unwrap();
+        let read = |namespace: &str, key: &str| -> OwnedValue {
+            connection
+                .call_method(
+                    Some(portal.bus_name.as_str()),
+                    "/org/freedesktop/portal/desktop",
+                    Some(SETTINGS_INTERFACE),
+                    "Read",
+                    &(namespace, key),
+                )
+                .unwrap()
+                .body()
+                .deserialize()
+                .unwrap()
+        };
+        assert_eq!(
+            u32::try_from(read(PORTAL_APPEARANCE_NAMESPACE, PORTAL_COLOR_SCHEME_KEY)).unwrap(),
+            ColorScheme::Dark.as_value()
+        );
+        assert_eq!(
+            u32::try_from(read(PORTAL_APPEARANCE_NAMESPACE, PORTAL_CONTRAST_KEY)).unwrap(),
+            Contrast::High.as_value()
+        );
+
+        let all: BTreeMap<String, BTreeMap<String, OwnedValue>> = connection
+            .call_method(
+                Some(portal.bus_name.as_str()),
+                "/org/freedesktop/portal/desktop",
+                Some(SETTINGS_INTERFACE),
+                "ReadAll",
+                &(vec![PORTAL_APPEARANCE_NAMESPACE],),
+            )
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        assert!(all.contains_key(PORTAL_APPEARANCE_NAMESPACE));
+
+        connection
+            .call_method(
+                Some(portal.bus_name.as_str()),
+                KITTY_OBJECT_PATH,
+                Some(CHANGE_SETTINGS_INTERFACE),
+                "ChangeSetting",
+                &(
+                    PORTAL_APPEARANCE_NAMESPACE,
+                    PORTAL_COLOR_SCHEME_KEY,
+                    value_to_owned_u32(ColorScheme::Light.as_value()),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            u32::try_from(read(PORTAL_APPEARANCE_NAMESPACE, PORTAL_COLOR_SCHEME_KEY)).unwrap(),
+            ColorScheme::Light.as_value()
+        );
+
+        let empty = std::collections::HashMap::<String, OwnedValue>::new();
+        let response: (u32, std::collections::HashMap<String, OwnedValue>) = connection
+            .call_method(
+                Some(portal.bus_name.as_str()),
+                "/org/freedesktop/portal/desktop",
+                Some(FILE_CHOOSER_INTERFACE),
+                "OpenFile",
+                &(
+                    "/org/freedesktop/portal/desktop/request/1",
+                    "app",
+                    "",
+                    "Pick one",
+                    empty,
+                ),
+            )
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        assert_eq!(response.0, 0);
+        let uris = Vec::<String>::try_from(response.1.get("uris").unwrap().clone()).unwrap();
+        assert_eq!(uris, vec!["file:///tmp/a%20b.txt"]);
     }
 
     #[test]

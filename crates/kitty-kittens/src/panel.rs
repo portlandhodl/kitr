@@ -190,7 +190,10 @@ pub struct PanelOptions {
     pub name: String,
     pub single_instance: bool,
     pub instance_group: String,
+    pub wait_for_single_instance_window_close: bool,
     pub listen_on: String,
+    pub detach: bool,
+    pub detached_log: Option<PathBuf>,
     pub items: Vec<String>,
     pub help: bool,
 }
@@ -201,7 +204,7 @@ impl Default for PanelOptions {
             config: Vec::new(),
             override_opts: Vec::new(),
             edge: Edge::Top,
-            layer: Layer::Top,
+            layer: Layer::Bottom,
             lines: String::new(),
             columns: String::new(),
             margin_top: 0,
@@ -209,7 +212,7 @@ impl Default for PanelOptions {
             margin_bottom: 0,
             margin_right: 0,
             focus_policy: FocusPolicy::NotAllowed,
-            exclusive_zone: 0,
+            exclusive_zone: -1,
             override_exclusive_zone: false,
             hide_on_focus_loss: false,
             output_name: String::new(),
@@ -219,11 +222,14 @@ impl Default for PanelOptions {
             hold: false,
             start_as_hidden: false,
             grab_keyboard: false,
-            class: String::new(),
+            class: "kitty-panel".to_owned(),
             name: String::new(),
             single_instance: false,
             instance_group: String::new(),
+            wait_for_single_instance_window_close: false,
             listen_on: String::new(),
+            detach: false,
+            detached_log: None,
             items: Vec::new(),
             help: false,
         }
@@ -286,11 +292,16 @@ pub fn parse_panel_args(args: &[String]) -> Result<PanelOptions, String> {
             "--hold" => opts.hold = true,
             "--start-as-hidden" => opts.start_as_hidden = true,
             "--grab-keyboard" => opts.grab_keyboard = true,
-            "--class" => opts.class = take(),
-            "--name" => opts.name = take(),
-            "--single-instance" => opts.single_instance = true,
+            "--class" | "--app-id" => opts.class = take(),
+            "--name" | "--os-window-tag" => opts.name = take(),
+            "--single-instance" | "-1" => opts.single_instance = true,
             "--instance-group" => opts.instance_group = take(),
+            "--wait-for-single-instance-window-close" => {
+                opts.wait_for_single_instance_window_close = true
+            }
             "--listen-on" => opts.listen_on = take(),
+            "--detach" => opts.detach = true,
+            "--detached-log" => opts.detached_log = Some(PathBuf::from(take())),
             "--config" | "-c" => opts.config.push(PathBuf::from(take())),
             "--override" | "-o" => opts.override_opts.push(take()),
             "--debug-rendering" | "--debug-input" => {}
@@ -432,6 +443,21 @@ pub fn build_panel_command(kitty_exe: &Path, opts: &PanelOptions) -> Vec<String>
     if opts.hide_on_focus_loss {
         argv.push("--hide-on-focus-loss".to_owned());
     }
+    if !opts.class.is_empty() {
+        argv.push(format!("--app-id={}", opts.class));
+    }
+    if !opts.name.is_empty() {
+        argv.push(format!("--name={}", opts.name));
+    }
+    if opts.single_instance {
+        argv.push("--single-instance".to_owned());
+    }
+    if !opts.instance_group.is_empty() {
+        argv.push(format!("--instance-group={}", opts.instance_group));
+    }
+    if opts.wait_for_single_instance_window_close {
+        argv.push("--wait-for-single-instance-window-close".to_owned());
+    }
     if !opts.output_name.is_empty() {
         argv.push(format!("--output-name={}", opts.output_name));
     }
@@ -450,6 +476,18 @@ pub fn build_panel_command(kitty_exe: &Path, opts: &PanelOptions) -> Vec<String>
     if opts.grab_keyboard {
         argv.push("--grab-keyboard".to_owned());
     }
+    if !opts.listen_on.is_empty() {
+        argv.push(format!("--listen-on={}", opts.listen_on));
+    }
+    if !opts.if_running.is_empty() && opts.if_running != "ignore" {
+        argv.push(format!("--if-running={}", opts.if_running));
+    }
+    if opts.detach {
+        argv.push("--detach".to_owned());
+    }
+    if let Some(log) = &opts.detached_log {
+        argv.push(format!("--detached-log={}", log.display()));
+    }
     for config in &opts.config {
         argv.push(format!("--config={}", config.display()));
     }
@@ -458,6 +496,23 @@ pub fn build_panel_command(kitty_exe: &Path, opts: &PanelOptions) -> Vec<String>
     }
     argv.extend(opts.items.iter().cloned());
     argv
+}
+
+/// A panel launch ready for the GUI: the command line and the layer-shell
+/// configuration it should create.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelLaunch {
+    pub argv: Vec<String>,
+    pub layer_shell: LayerShellConfig,
+}
+
+/// Build a panel launch for a GUI host. The host is expected to create the
+/// layer-shell surface if it supports one, or fall back to a normal window.
+pub fn build_panel_launch(kitty_exe: &Path, opts: &PanelOptions) -> PanelLaunch {
+    PanelLaunch {
+        argv: build_panel_command(kitty_exe, opts),
+        layer_shell: layer_shell_config(opts),
+    }
 }
 
 #[cfg(test)]
@@ -516,12 +571,22 @@ mod tests {
             edge: Edge::Bottom,
             lines: "20".to_owned(),
             items: vec!["top".to_owned()],
+            single_instance: true,
+            instance_group: "group".to_owned(),
+            listen_on: "unix:/tmp/panel".to_owned(),
             ..PanelOptions::default()
         };
-        let argv = build_panel_command(Path::new("/usr/bin/kitty"), &opts);
+        let launch = build_panel_launch(Path::new("/usr/bin/kitty"), &opts);
+        let argv = &launch.argv;
         assert_eq!(argv[0], "/usr/bin/kitty");
         assert!(argv.contains(&"--edge=bottom".to_owned()));
         assert!(argv.contains(&"--lines=20".to_owned()));
+        assert!(argv.contains(&"--single-instance".to_owned()));
+        assert!(argv.contains(&"--instance-group=group".to_owned()));
+        assert!(argv.contains(&"--listen-on=unix:/tmp/panel".to_owned()));
+        assert!(argv.contains(&"--app-id=kitty-panel".to_owned()));
         assert_eq!(argv.last().map(String::as_str), Some("top"));
+        assert_eq!(launch.layer_shell.edge, Edge::Bottom);
+        assert_eq!(launch.layer_shell.exclusive_zone, -1);
     }
 }

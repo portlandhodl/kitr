@@ -195,13 +195,19 @@ class VirtualDisplay:
     @classmethod
     def start(cls, xvfb: str, geometry: str, log: Path) -> "VirtualDisplay":
         xdpyinfo = shutil.which("xdpyinfo")
-        for attempt in range(64):
-            number = 200 + (os.getpid() + attempt) % 700
+        # Stale lock/socket files accumulate across parallel runs, so scan a
+        # wide range and try several genuinely free display numbers. (The old
+        # narrow pid-derived range could be almost entirely occupied.)
+        attempts = 0
+        for number in range(100, 20000):
+            if attempts >= 64:
+                break
             name = f":{number}"
             lock = Path(f"/tmp/.X{number}-lock")
             socket = Path(f"/tmp/.X11-unix/X{number}")
             if lock.exists() or socket.exists():
                 continue
+            attempts += 1
             f = log.open("ab")
             f.write(f"$ {xvfb} {name} -screen 0 {geometry} -nolisten tcp -ac\n".encode())
             f.flush()
@@ -735,7 +741,7 @@ def write_markdown(
         f"- kitten: `{suite['kitten']}`",
         f"- kitr: `{suite['kitr_binary']}`",
         f"- Python: `{sys.version.split()[0]}`",
-        f"- display: `{suite['display']}` (Xvfb unless `--display` was used)",
+        f"- display: `{suite.get('display', 'unavailable')}` (Xvfb unless `--display` was used)",
         f"- font: `{suite['font_family']}` at `{suite['font_size']}pt`",
         f"- kitr startup settle: `{suite['settle']}s`",
         "",

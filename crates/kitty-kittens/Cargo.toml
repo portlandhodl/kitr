@@ -12,6 +12,9 @@ kitty-config = { path = "../kitty-config" }
 kitty-remote = { path = "../kitty-remote" }
 kitty-graphics = { path = "../kitty-graphics" }
 kitty-os = { path = "../kitty-os" }
+flate2 = "1"
+libc = "0.2"
+zbus = "5"
 
 [[bin]]
 name = "kitten"

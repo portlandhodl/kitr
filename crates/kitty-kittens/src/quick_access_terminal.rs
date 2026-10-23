@@ -130,6 +130,12 @@ impl QuickAccessConfig {
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut out = Self::default();
+        out.merge(text)?;
+        Ok(out)
+    }
+
+    /// Apply a config file on top of the current values.
+    pub fn merge(&mut self, text: &str) -> Result<(), String> {
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -138,9 +144,9 @@ impl QuickAccessConfig {
             let (key, value) = line
                 .split_once(char::is_whitespace)
                 .map_or((line, ""), |(a, b)| (a, b.trim()));
-            out.apply(key, value)?;
+            self.apply(key, value)?;
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -234,11 +240,20 @@ pub fn load_config(
         if path.as_os_str() == "NONE" {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
+        let text = if path.as_os_str() == "-" || path == Path::new("/dev/stdin") {
+            let mut text = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|err| err.to_string())?;
+            text
+        } else {
+            match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(_) => continue,
+            }
         };
-        let loaded = QuickAccessConfig::parse(&text)?;
-        config = loaded;
+        config.merge(&text)?;
     }
     for override_opt in &opts.override_opts {
         let (key, value) = override_opt
@@ -259,6 +274,10 @@ pub fn config_paths() -> Vec<PathBuf> {
         out.push(PathBuf::from(dir).join("kitty/quick-access-terminal.conf"));
     } else if let Some(home) = std::env::var_os("HOME") {
         out.push(PathBuf::from(home).join(".config/kitty/quick-access-terminal.conf"));
+    }
+    let dirs = std::env::var("XDG_CONFIG_DIRS").unwrap_or_else(|_| "/etc/xdg".to_owned());
+    for dir in dirs.split(':').filter(|dir| !dir.is_empty()) {
+        out.push(PathBuf::from(dir).join("kitty/quick-access-terminal.conf"));
     }
     out
 }
@@ -335,6 +354,13 @@ pub fn build_quick_access_command(
         argv.push("--detach".to_owned());
     }
     if let Some(log) = &opts.detached_log {
+        let log = if log.is_absolute() {
+            log.clone()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(log))
+                .unwrap_or_else(|_| log.clone())
+        };
         argv.push(format!("--detached-log={}", log.display()));
     }
     if !opts.instance_group.is_empty() {
@@ -351,6 +377,58 @@ pub fn build_quick_access_command(
     }
     argv.extend(opts.items.iter().cloned());
     argv
+}
+
+/// A quick-access launch ready for a GUI host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuickAccessLaunch {
+    pub argv: Vec<String>,
+    pub layer_shell: crate::panel::LayerShellConfig,
+    pub instance_group: String,
+}
+
+/// Build a quick-access launch, including the panel layer-shell configuration.
+pub fn build_quick_access_launch(
+    kitty_exe: &Path,
+    config: &QuickAccessConfig,
+    opts: &QuickAccessOptions,
+    config_dir: &Path,
+) -> QuickAccessLaunch {
+    let panel_opts = crate::panel::PanelOptions {
+        edge: config.edge,
+        layer: config.layer,
+        lines: config.lines.clone(),
+        columns: config.columns.clone(),
+        margin_top: config.margin_top as i32,
+        margin_left: config.margin_left as i32,
+        margin_bottom: config.margin_bottom as i32,
+        margin_right: config.margin_right as i32,
+        focus_policy: config.focus_policy,
+        exclusive_zone: 0,
+        override_exclusive_zone: true,
+        hide_on_focus_loss: config.hide_on_focus_loss,
+        output_name: config.output_name.clone(),
+        toggle_visibility: true,
+        move_to_active_monitor: true,
+        if_running: opts.if_running.clone(),
+        hold: opts.hold,
+        start_as_hidden: config.start_as_hidden,
+        grab_keyboard: config.grab_keyboard,
+        class: config.app_id.clone(),
+        name: String::new(),
+        single_instance: true,
+        instance_group: opts.instance_group.clone(),
+        listen_on: opts.listen_on.clone(),
+        detach: opts.detach,
+        detached_log: opts.detached_log.clone(),
+        items: opts.items.clone(),
+        ..crate::panel::PanelOptions::default()
+    };
+    QuickAccessLaunch {
+        argv: build_quick_access_command(kitty_exe, config, opts, config_dir),
+        layer_shell: crate::panel::layer_shell_config(&panel_opts),
+        instance_group: opts.instance_group.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +463,16 @@ mod tests {
     }
 
     #[test]
+    fn later_config_files_merge_onto_defaults() {
+        let mut config = QuickAccessConfig::default();
+        config.merge("lines 10\nedge bottom\n").unwrap();
+        config.merge("lines 20\n").unwrap();
+        assert_eq!(config.lines, "20");
+        assert_eq!(config.edge, Edge::Bottom);
+        assert_eq!(config.columns, "80");
+    }
+
+    #[test]
     fn builds_panel_command() {
         let config = QuickAccessConfig::default();
         let opts = QuickAccessOptions {
@@ -404,6 +492,15 @@ mod tests {
         assert!(argv.contains(&"--lines=25".to_owned()));
         assert!(argv.contains(&"--hold".to_owned()));
         assert_eq!(argv.last().map(String::as_str), Some("htop"));
+        let launch = build_quick_access_launch(
+            Path::new("/usr/bin/kitty"),
+            &config,
+            &opts,
+            Path::new("/home/u/.config/kitty"),
+        );
+        assert_eq!(launch.instance_group, "quick-access");
+        assert_eq!(launch.layer_shell.edge, Edge::Top);
+        assert_eq!(launch.layer_shell.exclusive_zone, 0);
     }
 
     #[test]

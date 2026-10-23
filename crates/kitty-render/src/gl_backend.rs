@@ -65,26 +65,31 @@
 //!
 //! The frame instance stream is drawn with the real `tint`, `rounded_rect`,
 //! `graphics` (default and alpha-mask), `trail` and indexed-graphics programs.
-//! See `SHADERS.md` for the exact mapping and the variants that are compiled
-//! but not yet selected by this backend.
+//! Background images use the `bgimage` program when their layout and opacity
+//! can be represented by it (transparent or arbitrary-source-rectangle
+//! backgrounds fall back to the general image path). See `SHADERS.md` for the
+//! exact mapping.
 //!
 //! * Gray8 atlas pages (`GL_R8`) and RGBA8 pages (`GL_RGBA8`);
 //! * RGBA8 image textures keyed by [`ImageKey`], with nearest/linear filtering
 //!   and clamp/repeat/mirrored-repeat wrapping for background layouts;
+//! * a fixed-cell `GL_TEXTURE_2D_ARRAY` sprite atlas adapted from the packed
+//!   CPU pages, driving the `cell`/`cell_bg`/`cell_fg` UBO programs when
+//!   [`GlBackend::set_cell_programs`] is enabled;
 //! * nearest or linear atlas filtering;
 //! * premultiplied alpha blending;
 //! * scissor-based damage, viewport, clear, offscreen `glReadPixels`;
+//! * offscreen `blit` and colour-space-correct `screenshot` scaling;
+//! * animated multi-group custom-shader post-processing;
 //! * optional CPU-side gamma conversion (`GammaMode`).
 //!
-//! # Not wired to the frame API yet
+//! # Limits
 //!
-//! The full cell vertex/UBO path (fixed-cell sprite arrays and the decoration
-//! map), the `bgimage` program for background images, `blit`/`screenshot`
-//! targets and kitty's multi-group custom-shader post-processing pipeline are
-//! compiled and reflected but the current [`Frame`] abstraction does not drive
-//! them yet. Image transforms beyond source-rectangle scaling, per-window
-//! background image lists and the full cursor-trail corner animation remain
-//! out of scope.
+//! The cell path requires an origin-aligned full grid without multi-cell
+//! glyphs; other frames fall back to the instance path. Image transforms
+//! beyond source-rectangle scaling, per-window background-image lists, full
+//! cursor-trail corner animation and the complete `KittyCustomShaderData`
+//! payload (pointer mapping in particular) remain out of scope.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
@@ -93,18 +98,24 @@ use std::mem::size_of;
 use std::ptr;
 
 use crate::atlas::{AtlasEvent, AtlasFormat, GlyphAtlas};
+use crate::cell::{build_cell_sprites, CellSpriteData};
 use crate::colors::{linear_to_srgb, srgb_to_linear, Rgba8};
+use crate::custom_shader::{
+    CustomShaderAnimationState, CustomShaderPipeline, NamedTexture, ShaderEventMask,
+};
 use crate::egl::{
     ConfigAttribs, ContextConfig, EglError, GlApi, GlContext, GlError, GlFns, GlVersion, LoadError,
-    GL_ARRAY_BUFFER, GL_BLEND, GL_CLAMP_TO_EDGE, GL_COLOR_BUFFER_BIT, GL_COMPILE_STATUS,
-    GL_CULL_FACE, GL_DEPTH_TEST, GL_DYNAMIC_DRAW, GL_FALSE, GL_FLOAT, GL_FRAGMENT_SHADER,
-    GL_INFO_LOG_LENGTH, GL_LINEAR, GL_LINK_STATUS, GL_NEAREST, GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
-    GL_PACK_ALIGNMENT, GL_R8, GL_R8UI, GL_RED, GL_RED_INTEGER, GL_RG8UI, GL_RGBA, GL_RGBA8,
-    GL_RG_INTEGER, GL_SCISSOR_TEST, GL_STATIC_DRAW, GL_TEXTURE0, GL_TEXTURE_2D,
-    GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
-    GL_TRIANGLE_FAN, GL_UNIFORM_BUFFER, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE, GL_VERTEX_SHADER,
+    GL_ARRAY_BUFFER, GL_BLEND, GL_CLAMP_TO_EDGE, GL_COLOR_ATTACHMENT0, GL_COLOR_BUFFER_BIT,
+    GL_COMPILE_STATUS, GL_CULL_FACE, GL_DEPTH_TEST, GL_DYNAMIC_DRAW, GL_FALSE, GL_FLOAT,
+    GL_FRAGMENT_SHADER, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_INFO_LOG_LENGTH, GL_LINEAR,
+    GL_LINK_STATUS, GL_NEAREST, GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_PACK_ALIGNMENT, GL_R32UI, GL_R8,
+    GL_R8UI, GL_RED, GL_RED_INTEGER, GL_RG8UI, GL_RGBA, GL_RGBA16F, GL_RGBA8, GL_RG_INTEGER,
+    GL_SCISSOR_TEST, GL_SRGB8_ALPHA8, GL_STATIC_DRAW, GL_TEXTURE0, GL_TEXTURE_2D,
+    GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S,
+    GL_TEXTURE_WRAP_T, GL_TRIANGLE_FAN, GL_UNIFORM_BUFFER, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE,
+    GL_UNSIGNED_INT, GL_VERTEX_SHADER,
 };
-use crate::geom::Rect;
+use crate::geom::{Rect, Region};
 use crate::images::{ImageFilter, ImageKey, ImageWrap};
 use crate::instances::{CursorGeometry, Frame, RenderConfig};
 use kitty_graphics::ImageFormat;
@@ -220,10 +231,16 @@ pub struct RenderStats {
     pub images_skipped: usize,
     /// Whether the background image was drawn.
     pub background_image_drawn: bool,
+    /// Background images drawn through the `bgimage` program.
+    pub bgimage_draws: usize,
     /// Whether the window logo was drawn.
     pub logo_drawn: bool,
     /// Cursor-trail quads drawn.
     pub trail_instances: usize,
+    /// Cells submitted to the fixed-cell sprite-array programs.
+    pub cell_instances: usize,
+    /// Whether cell/background/foreground programs were used.
+    pub cell_programs: bool,
 }
 
 /// Statistics from one [`GlBackend::sync_atlas`] call.
@@ -245,6 +262,14 @@ pub struct ImageSyncStats {
     pub removed: usize,
     /// Uploads that were already current and skipped.
     pub unchanged: usize,
+}
+
+/// Pixels returned by [`GlBackend::screenshot_region`], top-down RGBA8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Screenshot {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
 /// Errors produced by the OpenGL backend.
@@ -326,9 +351,23 @@ const GL_MIRRORED_REPEAT: u32 = 0x8370;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatchKind {
     Solid,
-    Glyph { page: u32, is_color: bool },
+    Glyph {
+        page: u32,
+        is_color: bool,
+    },
     Image(ImageKey),
+    BackgroundImage(ImageKey),
     Trail,
+    /// Draw the cell grid through `cell` (both background and foreground).
+    CellBoth,
+    /// Draw non-default backgrounds and text through `cell`.
+    CellBothNonDefault,
+    /// Draw only default backgrounds through `cell_bg`.
+    CellBackgroundDefault,
+    /// Draw only non-default backgrounds through `cell_bg`.
+    CellBackgroundNonDefault,
+    /// Draw only text through `cell_fg`.
+    CellForeground,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -355,6 +394,47 @@ struct CachedImage {
     wrap: ImageWrap,
     indexed_format: Option<ImageFormat>,
     fingerprint: u64,
+}
+
+struct CellSprites {
+    texture: u32,
+    decorations: u32,
+    data: CellSpriteData,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OffscreenTarget {
+    framebuffer: u32,
+    texture: u32,
+    width: u32,
+    height: u32,
+}
+
+struct InstalledCustomPipeline {
+    pipeline: CustomShaderPipeline,
+    program: u32,
+    uniforms: HashMap<String, i32>,
+    data_ubo: u32,
+    shader_data_ubo: u32,
+    source_texture: u32,
+    named: [Option<OffscreenTarget>; 3],
+    ping: [Option<OffscreenTarget>; 2],
+    width: u32,
+    height: u32,
+}
+
+impl InstalledCustomPipeline {
+    fn uniform(&self, name: &str) -> i32 {
+        if let Some(location) = self.uniforms.get(name).copied() {
+            if location >= 0 {
+                return location;
+            }
+        }
+        self.uniforms
+            .get(&format!("{name}_0"))
+            .copied()
+            .unwrap_or(-1)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -777,6 +857,198 @@ unsafe fn create_geometry(gl: &GlFns) -> Result<(u32, u32, u32), GlError> {
     }
 }
 
+unsafe fn ensure_offscreen(
+    gl: &GlFns,
+    target: &mut Option<OffscreenTarget>,
+    width: u32,
+    height: u32,
+) -> Result<OffscreenTarget, GlError> {
+    if let Some(existing) = *target {
+        if existing.width == width && existing.height == height {
+            return Ok(existing);
+        }
+        // SAFETY: the caller guarantees a current context and owns the ids.
+        unsafe {
+            (gl.glDeleteFramebuffers)(1, &existing.framebuffer);
+            (gl.glDeleteTextures)(1, &existing.texture);
+        }
+    }
+    // SAFETY: the caller guarantees a current context.
+    let created = unsafe { create_offscreen_target(gl, width, height, GL_RGBA8 as i32)? };
+    *target = Some(created);
+    Ok(created)
+}
+
+/// std140 size of kitty's `CellRenderData` block (the C mirror has the same
+/// size; the final scalar is padded to the block's 16-byte alignment).
+const CELL_RENDER_DATA_SIZE: usize = 320;
+
+unsafe fn create_cell_geometry(gl: &GlFns) -> Result<(u32, u32, u32, u32), GlError> {
+    // SAFETY: the caller guarantees a current context; ids are owned by the
+    // caller on success.
+    unsafe {
+        let mut vao = 0u32;
+        (gl.glGenVertexArrays)(1, &mut vao);
+        if vao == 0 {
+            return Err(GlError {
+                code: 1,
+                operation: "glGenVertexArrays",
+            });
+        }
+        let mut buffers = [0u32; 3];
+        (gl.glGenBuffers)(3, buffers.as_mut_ptr());
+        if buffers.contains(&0) {
+            (gl.glDeleteVertexArrays)(1, &vao);
+            (gl.glDeleteBuffers)(3, buffers.as_ptr());
+            return Err(GlError {
+                code: 1,
+                operation: "glGenBuffers",
+            });
+        }
+        (gl.glBindVertexArray)(vao);
+        // colors: location 0, three uint32 per cell
+        (gl.glBindBuffer)(GL_ARRAY_BUFFER, buffers[0]);
+        (gl.glEnableVertexAttribArray)(0);
+        (gl.glVertexAttribIPointer)(0, 3, GL_UNSIGNED_INT, 12, ptr::null());
+        (gl.glVertexAttribDivisor)(0, 1);
+        // sprite_idx: location 1, two uint32 per cell
+        (gl.glBindBuffer)(GL_ARRAY_BUFFER, buffers[1]);
+        (gl.glEnableVertexAttribArray)(1);
+        (gl.glVertexAttribIPointer)(1, 2, GL_UNSIGNED_INT, 8, ptr::null());
+        (gl.glVertexAttribDivisor)(1, 1);
+        // is_selected: location 2, one ubyte per cell
+        (gl.glBindBuffer)(GL_ARRAY_BUFFER, buffers[2]);
+        (gl.glEnableVertexAttribArray)(2);
+        (gl.glVertexAttribIPointer)(2, 1, GL_UNSIGNED_BYTE, 1, ptr::null());
+        (gl.glVertexAttribDivisor)(2, 1);
+        (gl.glBindVertexArray)(0);
+        (gl.glBindBuffer)(GL_ARRAY_BUFFER, 0);
+        Ok((vao, buffers[0], buffers[1], buffers[2]))
+    }
+}
+
+unsafe fn create_offscreen_target(
+    gl: &GlFns,
+    width: u32,
+    height: u32,
+    internal_format: i32,
+) -> Result<OffscreenTarget, GlError> {
+    // SAFETY: the caller guarantees a current context.
+    unsafe {
+        let mut texture = 0u32;
+        (gl.glGenTextures)(1, &mut texture);
+        (gl.glBindTexture)(GL_TEXTURE_2D, texture);
+        (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+        (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+        (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
+        (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+        (gl.glTexImage2D)(
+            GL_TEXTURE_2D,
+            0,
+            internal_format,
+            width as i32,
+            height as i32,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            ptr::null(),
+        );
+        let mut framebuffer = 0u32;
+        (gl.glGenFramebuffers)(1, &mut framebuffer);
+        (gl.glBindFramebuffer)(GL_FRAMEBUFFER, framebuffer);
+        (gl.glFramebufferTexture2D)(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            texture,
+            0,
+        );
+        let status = (gl.glCheckFramebufferStatus)(GL_FRAMEBUFFER);
+        (gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+        (gl.glBindTexture)(GL_TEXTURE_2D, 0);
+        if status != GL_FRAMEBUFFER_COMPLETE {
+            (gl.glDeleteFramebuffers)(1, &framebuffer);
+            (gl.glDeleteTextures)(1, &texture);
+            return Err(GlError {
+                code: 0x0506,
+                operation: "glCheckFramebufferStatus",
+            });
+        }
+        Ok(OffscreenTarget {
+            framebuffer,
+            texture,
+            width,
+            height,
+        })
+    }
+}
+
+fn put_f32(buf: &mut [u8], offset: usize, value: f32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_linear_vec4(buf: &mut [u8], offset: usize, color: Rgba8) {
+    // Same conversion as linear_color_vec4() in kitty/shaders.c: linear RGB,
+    // with the fourth component as unused padding.
+    for (index, channel) in [color.r, color.g, color.b].iter().enumerate() {
+        put_f32(
+            buf,
+            offset + index * 4,
+            srgb_to_linear(*channel as f32 / 255.0),
+        );
+    }
+    put_f32(buf, offset + 12, 0.0);
+}
+
+/// Pack the std140 `CellRenderData` block for one cell draw.
+fn pack_cell_render_data(data: &CellSpriteData, frame: &Frame) -> [u8; CELL_RENDER_DATA_SIZE] {
+    let mut buf = [0u8; CELL_RENDER_DATA_SIZE];
+    put_linear_vec4(&mut buf, 0, frame.default_fg);
+    put_linear_vec4(&mut buf, 16, frame.default_bg);
+    put_linear_vec4(&mut buf, 32, frame.default_fg);
+    put_linear_vec4(&mut buf, 48, frame.default_bg);
+    put_linear_vec4(&mut buf, 64, frame.default_fg);
+    put_linear_vec4(&mut buf, 80, frame.default_bg);
+    put_linear_vec4(&mut buf, 96, frame.default_fg);
+    put_linear_vec4(&mut buf, 112, frame.default_fg);
+    put_linear_vec4(&mut buf, 128, frame.default_bg);
+    // use_cell_* selection flags stay zero: the CPU stage already resolved
+    // selection colours into the cell colour stream.
+    put_u32(
+        &mut buf,
+        156,
+        crate::colors::encode_rgb(frame.default_fg.r, frame.default_fg.g, frame.default_fg.b),
+    );
+    put_u32(&mut buf, 180, data.columns);
+    put_u32(&mut buf, 184, data.lines);
+    put_u32(&mut buf, 188, data.sprites_xnum);
+    put_u32(&mut buf, 192, data.sprites_ynum);
+    put_u32(&mut buf, 196, 0); // cursor_shape
+    put_u32(&mut buf, 200, data.cell_width);
+    put_u32(&mut buf, 204, data.cell_height);
+    put_u32(&mut buf, 208, data.columns + 1); // cursor_x1
+    put_u32(&mut buf, 212, data.columns); // cursor_x2
+    put_u32(&mut buf, 216, data.lines + 1); // cursor_y1
+    put_u32(&mut buf, 220, data.lines); // cursor_y2
+    put_f32(&mut buf, 224, 1.0); // cursor_opacity
+    put_f32(&mut buf, 228, 1.0); // inactive_text_alpha
+    put_f32(&mut buf, 232, 0.0); // fg_override_threshold
+    put_f32(&mut buf, 236, 0.0); // row_offset
+    put_f32(&mut buf, 240, 1.0); // dim_opacity
+    put_f32(&mut buf, 244, 1.0); // blink_opacity
+    let default_bg =
+        crate::colors::encode_rgb(frame.default_bg.r, frame.default_bg.g, frame.default_bg.b);
+    for slot in 0..8 {
+        put_u32(&mut buf, 248 + slot * 4, default_bg);
+        put_f32(&mut buf, 280 + slot * 4, 1.0);
+    }
+    buf
+}
+
 // }}}
 // {{{ Backend
 
@@ -799,6 +1071,16 @@ pub struct GlBackend {
     last_stats: RenderStats,
     custom_program: u32,
     color_table_ubo: u32,
+    cell_data_ubo: u32,
+    cell_vao: u32,
+    cell_colors_vbo: u32,
+    cell_sprite_vbo: u32,
+    cell_selection_vbo: u32,
+    cell_instance_capacity: usize,
+    cell_sprites: Option<CellSprites>,
+    cell_offscreen: Option<OffscreenTarget>,
+    cell_programs: bool,
+    custom_pipeline: Option<InstalledCustomPipeline>,
     // Keep the context last: Rust drops fields in declaration order, so all
     // GL resources are released while an owned context is still alive.
     // `None` means the caller owns and manages the current EGL context.
@@ -873,7 +1155,8 @@ impl GlBackend {
         // SAFETY: the caller guarantees a current context.
         let (vao, quad_vbo, instance_vbo) = unsafe { create_geometry(&gl)? };
         let mut color_table_ubo = 0u32;
-        // SAFETY: a context is current; the UBO is owned by the backend.
+        let mut cell_data_ubo = 0u32;
+        // SAFETY: a context is current; the UBOs are owned by the backend.
         unsafe {
             (gl.glGenBuffers)(1, &mut color_table_ubo);
             (gl.glBindBuffer)(GL_UNIFORM_BUFFER, color_table_ubo);
@@ -885,8 +1168,19 @@ impl GlBackend {
                 GL_DYNAMIC_DRAW,
             );
             (gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 1, color_table_ubo);
+            (gl.glGenBuffers)(1, &mut cell_data_ubo);
+            (gl.glBindBuffer)(GL_UNIFORM_BUFFER, cell_data_ubo);
+            (gl.glBufferData)(
+                GL_UNIFORM_BUFFER,
+                CELL_RENDER_DATA_SIZE as isize,
+                ptr::null(),
+                GL_DYNAMIC_DRAW,
+            );
+            (gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 0, cell_data_ubo);
             (gl.glBindBuffer)(GL_UNIFORM_BUFFER, 0);
         }
+        let (cell_vao, cell_colors_vbo, cell_sprite_vbo, cell_selection_vbo) =
+            unsafe { create_cell_geometry(&gl)? };
         programs.upload_gamma_lut();
         let width = width.max(1);
         let height = height.max(1);
@@ -920,6 +1214,16 @@ impl GlBackend {
             last_stats: RenderStats::default(),
             custom_program: 0,
             color_table_ubo,
+            cell_data_ubo,
+            cell_vao,
+            cell_colors_vbo,
+            cell_sprite_vbo,
+            cell_selection_vbo,
+            cell_instance_capacity: 0,
+            cell_sprites: None,
+            cell_offscreen: None,
+            cell_programs: false,
+            custom_pipeline: None,
             context,
         })
     }
@@ -998,6 +1302,50 @@ impl GlBackend {
     pub fn image_texture_count(&self) -> usize {
         self.image_textures.len()
     }
+    /// Select whether ordinary frame rendering uses the `cell`/`cell_bg`/
+    /// `cell_fg` sprite-array programs instead of the per-instance graphics
+    /// path for backgrounds and glyphs.
+    ///
+    /// The sprite array is rebuilt from [`GlyphAtlas`] during
+    /// [`sync_atlas`](Self::sync_atlas). Frames that are not a plain
+    /// origin-aligned cell grid, or that contain multi-cell glyphs, silently
+    /// fall back to the graphics path.
+    pub fn set_cell_programs(&mut self, enabled: bool) {
+        self.cell_programs = enabled;
+        if !enabled {
+            self.cell_sprites = None;
+        }
+    }
+
+    /// Whether [`render`](Self::render) uses the cell program family.
+    #[inline]
+    pub const fn cell_programs_enabled(&self) -> bool {
+        self.cell_programs
+    }
+
+    /// Number of sprites in the most recently uploaded fixed-cell array.
+    #[inline]
+    pub fn cell_sprite_count(&self) -> usize {
+        self.cell_sprites
+            .as_ref()
+            .map(|sprites| sprites.data.sprite_indices.len())
+            .unwrap_or(0)
+    }
+
+    /// Draw a frame using the cell sprite-array programs, uploading `atlas`
+    /// first. This is the explicit form of
+    /// [`set_cell_programs`](Self::set_cell_programs); the setting is left
+    /// enabled afterwards.
+    pub fn render_cells_with_atlas(
+        &mut self,
+        frame: &Frame,
+        config: &RenderConfig,
+        atlas: &GlyphAtlas,
+    ) -> Result<RenderStats, GlBackendError> {
+        self.set_cell_programs(true);
+        self.render_with_atlas(frame, config, atlas)
+    }
+
     /// Programs compiled by this backend.
     pub fn compiled_programs(&self) -> Vec<crate::shaders::ProgramKind> {
         let mut ans: Vec<_> = self.programs.programs.keys().copied().collect();
@@ -1072,6 +1420,428 @@ impl GlBackend {
         }
         self.custom_program = program;
         Ok(())
+    }
+
+    /// Compile and install an animated multi-group custom shader pipeline.
+    ///
+    /// `sources` has one entry per pipeline group; each entry is the list of
+    /// Slang sources for that group's shaders. The sources use kitty's custom
+    /// shader signature `fragment_main(float4 color, KittyTextures t,
+    /// KittyCustomShaderData d)` and are combined into a single
+    /// `CUSTOM_END_PROGRAM`-style dispatcher.
+    pub fn install_custom_pipeline(
+        &mut self,
+        compiler: &crate::shaders::SlangCompiler,
+        pipeline: &CustomShaderPipeline,
+        sources: &[Vec<String>],
+    ) -> Result<(), GlBackendError> {
+        self.ensure_current()?;
+        let custom = compiler
+            .compile_custom_pipeline(&pipeline.name, pipeline, sources)
+            .map_err(|error| GlBackendError::CustomShader(error.to_string()))?;
+        let compiled_sources = custom.sources(crate::shaders::ShaderDialect::for_api(
+            self.config.context.api,
+        ));
+        let vertex = compile_shader(
+            &self.gl,
+            GL_VERTEX_SHADER,
+            "pipeline vertex",
+            &compiled_sources.vertex,
+        )?;
+        let fragment = match compile_shader(
+            &self.gl,
+            GL_FRAGMENT_SHADER,
+            "pipeline fragment",
+            &compiled_sources.fragment,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                unsafe { (self.gl.glDeleteShader)(vertex) };
+                return Err(error);
+            }
+        };
+        let program = link_program(&self.gl, vertex, fragment, "custom pipeline")?;
+        let uniform_names = [
+            "src_rect",
+            "dest_rect",
+            "backbuffer",
+            "a",
+            "b",
+            "persist",
+            "group",
+            "viewport",
+            "animation_progress",
+            "convert_to_srgb",
+            "active_groups",
+            "source_is_srgb",
+            "viewport_size_pixels",
+        ];
+        let mut uniforms = HashMap::new();
+        for name in uniform_names {
+            uniforms.insert(name.to_owned(), uniform_location(&self.gl, program, name));
+            let suffixed = format!("{name}_0");
+            uniforms.insert(
+                suffixed.clone(),
+                uniform_location(&self.gl, program, &suffixed),
+            );
+        }
+        let mut data_ubo = 0u32;
+        let mut shader_data_ubo = 0u32;
+        // SAFETY: a context is current; the UBO and bindings are owned below.
+        unsafe {
+            (self.gl.glGenBuffers)(1, &mut data_ubo);
+            (self.gl.glBindBuffer)(GL_UNIFORM_BUFFER, data_ubo);
+            (self.gl.glBufferData)(GL_UNIFORM_BUFFER, 4096, ptr::null(), GL_DYNAMIC_DRAW);
+            let mut zeroes = [0u8; 4096];
+            (self.gl.glBufferSubData)(
+                GL_UNIFORM_BUFFER,
+                0,
+                zeroes.len() as isize,
+                zeroes.as_mut_ptr() as *const c_void,
+            );
+            (self.gl.glGenBuffers)(1, &mut shader_data_ubo);
+            (self.gl.glBindBuffer)(GL_UNIFORM_BUFFER, shader_data_ubo);
+            (self.gl.glBufferData)(GL_UNIFORM_BUFFER, 4096, ptr::null(), GL_DYNAMIC_DRAW);
+            let zeroes = [0u8; 4096];
+            (self.gl.glBufferSubData)(
+                GL_UNIFORM_BUFFER,
+                0,
+                zeroes.len() as isize,
+                zeroes.as_ptr() as *const c_void,
+            );
+            (self.gl.glBindBuffer)(GL_UNIFORM_BUFFER, 0);
+            for (names, binding) in [
+                (["block_GlobalParams_0", "GlobalParams"].as_slice(), 3u32),
+                (
+                    ["block_KittyCustomShaderData_0", "KittyCustomShaderData"].as_slice(),
+                    4u32,
+                ),
+            ] {
+                for block_name in names {
+                    if let Ok(name) = CString::new(*block_name) {
+                        let index = (self.gl.glGetUniformBlockIndex)(program, name.as_ptr());
+                        if index != u32::MAX {
+                            (self.gl.glUniformBlockBinding)(program, index, binding);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.destroy_custom_pipeline();
+        // SAFETY: a context is current; the capture texture is owned by the
+        // installed pipeline struct.
+        let mut source_texture = 0u32;
+        unsafe { (self.gl.glGenTextures)(1, &mut source_texture) };
+        self.custom_pipeline = Some(InstalledCustomPipeline {
+            pipeline: pipeline.clone(),
+            program,
+            uniforms,
+            data_ubo,
+            shader_data_ubo,
+            source_texture,
+            named: [None, None, None],
+            ping: [None, None],
+            width: 0,
+            height: 0,
+        });
+        Ok(())
+    }
+
+    /// Compile and install a pipeline using the compiler located from the
+    /// environment.
+    pub fn install_custom_pipeline_from_env(
+        &mut self,
+        pipeline: &CustomShaderPipeline,
+        sources: &[Vec<String>],
+    ) -> Result<(), GlBackendError> {
+        let compiler = crate::shaders::SlangCompiler::from_env()
+            .map_err(|error| GlBackendError::CustomShader(error.to_string()))?;
+        self.install_custom_pipeline(&compiler, pipeline, sources)
+    }
+
+    /// Whether a custom-shader pipeline is installed.
+    pub fn has_custom_pipeline(&self) -> bool {
+        self.custom_pipeline.is_some()
+    }
+
+    /// Installed pipeline definition, if any.
+    pub fn custom_pipeline(&self) -> Option<&CustomShaderPipeline> {
+        self.custom_pipeline
+            .as_ref()
+            .map(|installed| &installed.pipeline)
+    }
+
+    /// Remove the installed pipeline and free its GPU resources.
+    pub fn remove_custom_pipeline(&mut self) {
+        self.destroy_custom_pipeline();
+    }
+
+    fn destroy_custom_pipeline(&mut self) {
+        let Some(mut installed) = self.custom_pipeline.take() else {
+            return;
+        };
+        // SAFETY: all ids are owned by the installed pipeline and a context is
+        // current during install/remove/teardown.
+        unsafe {
+            (self.gl.glDeleteProgram)(installed.program);
+            (self.gl.glDeleteBuffers)(1, &installed.data_ubo);
+            (self.gl.glDeleteBuffers)(1, &installed.shader_data_ubo);
+            if installed.source_texture != 0 {
+                (self.gl.glDeleteTextures)(1, &installed.source_texture);
+            }
+            for target in installed
+                .named
+                .iter_mut()
+                .chain(installed.ping.iter_mut())
+                .flatten()
+            {
+                (self.gl.glDeleteFramebuffers)(1, &target.framebuffer);
+                (self.gl.glDeleteTextures)(1, &target.texture);
+            }
+        }
+    }
+
+    /// Run the installed custom-shader pipeline over the current framebuffer.
+    ///
+    /// `events` is this tick's [`ShaderEventMask`]; `now_ms` is a monotonic
+    /// millisecond clock. The first call initialises the animation state if
+    /// `state` does not match the installed pipeline. Returns the number of
+    /// group passes actually drawn (zero when every group is inactive).
+    pub fn render_custom_pipeline(
+        &mut self,
+        state: &mut CustomShaderAnimationState,
+        events: ShaderEventMask,
+        now_ms: u64,
+        cursor_stop_ms: i64,
+    ) -> Result<usize, GlBackendError> {
+        self.ensure_current()?;
+        let Some(installed) = self.custom_pipeline.as_mut() else {
+            return Err(GlBackendError::CustomShader(
+                "no custom shader pipeline installed".into(),
+            ));
+        };
+        let pipeline = installed.pipeline.clone();
+        if state.groups.len() != pipeline.groups.len() {
+            *state = CustomShaderAnimationState::new(&pipeline);
+        }
+        state.update(&pipeline, events, now_ms, cursor_stop_ms);
+        if !state.has_active_shaders {
+            return Ok(0);
+        }
+        let progresses = state.progresses(&pipeline, now_ms, cursor_stop_ms);
+        let width = self.width;
+        let height = self.height;
+        let gl = self.gl;
+        // SAFETY: a context is current; every id used below is owned by this
+        // backend or the installed pipeline.
+        unsafe {
+            if installed.width != width || installed.height != height {
+                for target in installed
+                    .named
+                    .iter_mut()
+                    .chain(installed.ping.iter_mut())
+                    .flatten()
+                {
+                    (gl.glDeleteFramebuffers)(1, &target.framebuffer);
+                    (gl.glDeleteTextures)(1, &target.texture);
+                }
+                installed.named = [None, None, None];
+                installed.ping = [None, None];
+                (gl.glBindTexture)(GL_TEXTURE_2D, installed.source_texture);
+                (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as i32);
+                (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as i32);
+                (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
+                (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+                (gl.glTexImage2D)(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA8 as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    ptr::null(),
+                );
+                installed.width = width;
+                installed.height = height;
+            } else {
+                (gl.glBindTexture)(GL_TEXTURE_2D, installed.source_texture);
+            }
+            (gl.glCopyTexSubImage2D)(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width as i32, height as i32);
+            let active_bits = pipeline
+                .groups
+                .iter()
+                .enumerate()
+                .fold(0u32, |mask, (index, _)| {
+                    mask | if state.group_active(&pipeline, index) {
+                        1u32 << index.min(31)
+                    } else {
+                        0
+                    }
+                });
+            let last_active = pipeline
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| state.group_active(&pipeline, *index))
+                .map(|(index, _)| index as i32)
+                .next_back()
+                .unwrap_or(-1);
+            if last_active < 0 {
+                return Ok(0);
+            }
+            (gl.glBindBuffer)(GL_UNIFORM_BUFFER, installed.shader_data_ubo);
+            (gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 4, installed.shader_data_ubo);
+            (gl.glBindBuffer)(GL_UNIFORM_BUFFER, 0);
+            let mut current_texture = installed.source_texture;
+            let mut current_is_srgb = true;
+            let mut ping_index = 0usize;
+            let mut passes = 0usize;
+            (gl.glDisable)(GL_BLEND);
+            (gl.glDisable)(GL_SCISSOR_TEST);
+            (gl.glBindVertexArray)(self.vao);
+            for (group_index, group) in pipeline.groups.iter().enumerate() {
+                if !state.group_active(&pipeline, group_index) {
+                    continue;
+                }
+                let is_last = group_index as i32 == last_active;
+                let (output_framebuffer, output_texture) = if is_last {
+                    (0, None)
+                } else if group.output_texture == NamedTexture::Default {
+                    let target =
+                        ensure_offscreen(&gl, &mut installed.ping[ping_index], width, height)?;
+                    ping_index ^= 1;
+                    (target.framebuffer, Some(target.texture))
+                } else {
+                    let slot = match group.output_texture {
+                        NamedTexture::A => 0,
+                        NamedTexture::B => 1,
+                        NamedTexture::Persist => 2,
+                        NamedTexture::Default => unreachable!(),
+                    };
+                    let target = ensure_offscreen(&gl, &mut installed.named[slot], width, height)?;
+                    (target.framebuffer, Some(target.texture))
+                };
+                let updates_backbuffer = !is_last && group.output_texture == NamedTexture::Default;
+                (gl.glBindFramebuffer)(GL_FRAMEBUFFER, output_framebuffer);
+                if is_last {
+                    (gl.glViewport)(0, 0, width as i32, height as i32);
+                } else {
+                    let x0 = (group.viewport_pos.0 * width as f32).floor().max(0.0) as i32;
+                    let y0 = (group.viewport_pos.1 * height as f32).floor().max(0.0) as i32;
+                    let x1 = ((group.viewport_pos.0 + group.viewport_size.0) * width as f32)
+                        .ceil()
+                        .min(width as f32) as i32;
+                    let y1 = ((group.viewport_pos.1 + group.viewport_size.1) * height as f32)
+                        .ceil()
+                        .min(height as f32) as i32;
+                    (gl.glViewport)(x0, y0, (x1 - x0).max(0), (y1 - y0).max(0));
+                }
+                let mut params = [0u8; 64];
+                put_u32(&mut params, 0, group_index as u32);
+                put_f32(&mut params, 16, group.viewport_pos.0);
+                put_f32(&mut params, 20, group.viewport_pos.1);
+                put_f32(&mut params, 24, group.viewport_size.0);
+                put_f32(&mut params, 28, group.viewport_size.1);
+                put_f32(&mut params, 32, progresses[group_index]);
+                put_u32(&mut params, 36, u32::from(is_last));
+                put_u32(&mut params, 40, active_bits);
+                put_u32(&mut params, 44, u32::from(current_is_srgb));
+                put_f32(&mut params, 48, width as f32);
+                put_f32(&mut params, 52, height as f32);
+                (gl.glBindBuffer)(GL_UNIFORM_BUFFER, installed.data_ubo);
+                (gl.glBufferSubData)(
+                    GL_UNIFORM_BUFFER,
+                    0,
+                    params.len() as isize,
+                    params.as_ptr() as *const c_void,
+                );
+                (gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 3, installed.data_ubo);
+                (gl.glBindBuffer)(GL_UNIFORM_BUFFER, 0);
+                (gl.glUseProgram)(installed.program);
+                (gl.glUniform4f)(installed.uniform("src_rect"), 0.0, 0.0, 1.0, 1.0);
+                (gl.glUniform4f)(installed.uniform("dest_rect"), -1.0, -1.0, 1.0, 1.0);
+                (gl.glUniform1i)(installed.uniform("group"), group_index as i32);
+                (gl.glUniform4f)(
+                    installed.uniform("viewport"),
+                    group.viewport_pos.0,
+                    group.viewport_pos.1,
+                    group.viewport_size.0,
+                    group.viewport_size.1,
+                );
+                (gl.glUniform1f)(
+                    installed.uniform("animation_progress"),
+                    progresses[group_index],
+                );
+                (gl.glUniform1i)(installed.uniform("convert_to_srgb"), i32::from(is_last));
+                (gl.glUniform1ui)(installed.uniform("active_groups"), active_bits);
+                (gl.glUniform1ui)(
+                    installed.uniform("source_is_srgb"),
+                    u32::from(current_is_srgb),
+                );
+                (gl.glUniform2f)(
+                    installed.uniform("viewport_size_pixels"),
+                    width as f32,
+                    height as f32,
+                );
+                for (name, unit) in [("backbuffer", 0u32), ("a", 1), ("b", 2), ("persist", 3)] {
+                    (gl.glUniform1i)(installed.uniform(name), unit as i32);
+                }
+                (gl.glActiveTexture)(GL_TEXTURE0);
+                (gl.glBindTexture)(GL_TEXTURE_2D, current_texture);
+                for (slot, unit, name) in [(0usize, 1u32, "a"), (1, 2, "b"), (2, 3, "persist")] {
+                    let declared = pipeline.textures.iter().any(|texture| {
+                        matches!(
+                            (*texture, name),
+                            (NamedTexture::A, "a")
+                                | (NamedTexture::B, "b")
+                                | (NamedTexture::Persist, "persist")
+                        )
+                    });
+                    let is_output = !is_last
+                        && matches!(
+                            (group.output_texture, name),
+                            (NamedTexture::A, "a")
+                                | (NamedTexture::B, "b")
+                                | (NamedTexture::Persist, "persist")
+                        );
+                    let texture = if !declared || is_output {
+                        current_texture
+                    } else {
+                        let target =
+                            ensure_offscreen(&gl, &mut installed.named[slot], width, height)?;
+                        target.texture
+                    };
+                    (gl.glActiveTexture)(GL_TEXTURE0 + unit);
+                    (gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                }
+                (gl.glActiveTexture)(GL_TEXTURE0);
+                (gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                passes += 1;
+                if updates_backbuffer {
+                    if let Some(texture) = output_texture {
+                        current_texture = texture;
+                        current_is_srgb = false;
+                    }
+                }
+            }
+            (gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (gl.glViewport)(0, 0, width as i32, height as i32);
+            (gl.glBindVertexArray)(0);
+            (gl.glUseProgram)(0);
+            for unit in 0..4 {
+                (gl.glActiveTexture)(GL_TEXTURE0 + unit);
+                (gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            }
+            (gl.glActiveTexture)(GL_TEXTURE0);
+            (gl.glEnable)(GL_BLEND);
+            (gl.glBlendFunc)(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            (gl.glEnable)(GL_SCISSOR_TEST);
+            self.gl.check("custom pipeline draw")?;
+            Ok(passes)
+        }
     }
 
     /// Whether a user shader has been installed successfully.
@@ -1180,6 +1950,9 @@ impl GlBackend {
         }
 
         if changed.is_empty() {
+            if self.cell_programs {
+                self.sync_cell_sprites(atlas, frame)?;
+            }
             return Ok(stats);
         }
 
@@ -1299,7 +2072,138 @@ impl GlBackend {
             (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
         }
         self.gl.check("atlas upload")?;
+        if self.cell_programs {
+            self.sync_cell_sprites(atlas, frame)?;
+        }
         Ok(stats)
+    }
+
+    fn sync_cell_sprites(
+        &mut self,
+        atlas: &GlyphAtlas,
+        frame: &Frame,
+    ) -> Result<(), GlBackendError> {
+        let Some(data) = build_cell_sprites(atlas, frame) else {
+            self.cell_sprites = None;
+            return Ok(());
+        };
+        let width = data.sprites_xnum * data.cell_width;
+        let height = data.sprites_ynum * data.tile_height;
+        let layers = data.layers;
+        let decorate_width = (data.decorations.len() as u32).max(1);
+        let recreate = self.cell_sprites.as_ref().is_none_or(|sprites| {
+            sprites.data.sprites_xnum != data.sprites_xnum
+                || sprites.data.sprites_ynum != data.sprites_ynum
+                || sprites.data.cell_width != data.cell_width
+                || sprites.data.tile_height != data.tile_height
+                || sprites.data.layers != data.layers
+                || sprites.data.decorations.len() != data.decorations.len()
+        });
+        // SAFETY: a context is current; all data pointers outlive the calls.
+        unsafe {
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+            (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, 1);
+            if recreate {
+                if let Some(old) = self.cell_sprites.take() {
+                    let textures = [old.texture, old.decorations];
+                    (self.gl.glDeleteTextures)(2, textures.as_ptr());
+                }
+                let mut textures = [0u32; 2];
+                (self.gl.glGenTextures)(2, textures.as_mut_ptr());
+                if textures.contains(&0) {
+                    return Err(GlError {
+                        code: 1,
+                        operation: "glGenTextures",
+                    }
+                    .into());
+                }
+                (self.gl.glBindTexture)(GL_TEXTURE_2D_ARRAY, textures[0]);
+                (self.gl.glTexParameteri)(
+                    GL_TEXTURE_2D_ARRAY,
+                    GL_TEXTURE_MIN_FILTER,
+                    GL_NEAREST as i32,
+                );
+                (self.gl.glTexParameteri)(
+                    GL_TEXTURE_2D_ARRAY,
+                    GL_TEXTURE_MAG_FILTER,
+                    GL_NEAREST as i32,
+                );
+                (self.gl.glTexParameteri)(
+                    GL_TEXTURE_2D_ARRAY,
+                    GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE as i32,
+                );
+                (self.gl.glTexParameteri)(
+                    GL_TEXTURE_2D_ARRAY,
+                    GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE as i32,
+                );
+                (self.gl.glTexImage3D)(
+                    GL_TEXTURE_2D_ARRAY,
+                    0,
+                    GL_SRGB8_ALPHA8 as i32,
+                    width as i32,
+                    height as i32,
+                    layers as i32,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    data.pixels.as_ptr() as *const c_void,
+                );
+                (self.gl.glBindTexture)(GL_TEXTURE_2D, textures[1]);
+                (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+                (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+                (self.gl.glTexImage2D)(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_R32UI as i32,
+                    decorate_width as i32,
+                    1,
+                    0,
+                    GL_RED_INTEGER,
+                    GL_UNSIGNED_INT,
+                    data.decorations.as_ptr() as *const c_void,
+                );
+                self.cell_sprites = Some(CellSprites {
+                    texture: textures[0],
+                    decorations: textures[1],
+                    data,
+                });
+            } else if let Some(sprites) = self.cell_sprites.as_mut() {
+                (self.gl.glBindTexture)(GL_TEXTURE_2D_ARRAY, sprites.texture);
+                (self.gl.glTexSubImage3D)(
+                    GL_TEXTURE_2D_ARRAY,
+                    0,
+                    0,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    layers as i32,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    data.pixels.as_ptr() as *const c_void,
+                );
+                (self.gl.glBindTexture)(GL_TEXTURE_2D, sprites.decorations);
+                (self.gl.glTexSubImage2D)(
+                    GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    decorate_width as i32,
+                    1,
+                    GL_RED_INTEGER,
+                    GL_UNSIGNED_INT,
+                    data.decorations.as_ptr() as *const c_void,
+                );
+                sprites.data = data;
+            }
+            (self.gl.glBindTexture)(GL_TEXTURE_2D_ARRAY, 0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
+        }
+        self.gl.check("cell sprite upload")?;
+        Ok(())
     }
 
     /// Upload image textures referenced by `frame` and delete unreferenced
@@ -1355,32 +2259,17 @@ impl GlBackend {
                     self.upload_indexed_palette(palette);
                 }
             }
-            // Expand indexed uploads through their palette when one is
-            // available. The integer-texture + indexed-graphics path is kept
-            // for uploads without a palette; expansion also keeps the texture
-            // valid for ordinary graphics draws and tests.
-            let expanded = match (upload.indexed_format, upload.palette.as_ref()) {
-                (Some(format), Some(palette)) => {
-                    Some(palette.expand(&upload.data, format, upload.width, upload.height))
-                }
-                _ => None,
-            };
-            let indexed_format = if expanded.is_some() {
-                None
-            } else {
-                upload.indexed_format
-            };
+            // Indexed uploads stay integer textures. The indexed-graphics
+            // shader performs the palette lookup against the live ColorTable
+            // UBO, so terminal colour changes never re-upload image pixels.
+            let indexed_format = upload.indexed_format;
             let indexed = indexed_format.is_some();
             let (internal_format, pixel_format) = match indexed_format {
                 Some(ImageFormat::IndexedAlpha) => (GL_RG8UI, GL_RG_INTEGER),
                 Some(_) => (GL_R8UI, GL_RED_INTEGER),
                 None => (GL_RGBA8, GL_RGBA),
             };
-            let bytes_per_pixel = if expanded.is_some() {
-                4
-            } else {
-                upload.bytes_per_pixel()
-            };
+            let bytes_per_pixel = upload.bytes_per_pixel();
             let alignment = if indexed || bytes_per_pixel != 4 {
                 1
             } else {
@@ -1391,7 +2280,7 @@ impl GlBackend {
             unsafe {
                 (self.gl.glPixelStorei)(GL_UNPACK_ALIGNMENT, alignment);
             }
-            let pixel_data: &[u8] = expanded.as_deref().unwrap_or(&upload.data);
+            let pixel_data: &[u8] = &upload.data;
             let current = self.image_textures.get(&upload.key).copied();
             let recreate = current.is_none_or(|cached| {
                 cached.width != upload.width
@@ -1543,6 +2432,7 @@ impl GlBackend {
 
         self.build_instances(frame, &mut stats);
         self.upload_instances()?;
+        self.upload_cell_instances(frame)?;
         self.draw(&scissors, frame, &mut stats)?;
         stats.instances = self.instances.len();
         self.last_stats = stats;
@@ -1583,6 +2473,211 @@ impl GlBackend {
             }
         }
         Ok(pixels)
+    }
+
+    /// Draw an already-resident 2D `texture` over the whole drawable with the
+    /// real `blit` program.
+    ///
+    /// `src_rect` and `dest_rect` use the same convention as `blit.slang`:
+    /// source coordinates are normalised texture coordinates and destination
+    /// coordinates are NDC. The source is treated as premultiplied linear RGB
+    /// and converted to sRGB, exactly like kitty's offscreen-to-window blit.
+    pub fn blit_texture(
+        &mut self,
+        texture: u32,
+        src_rect: [f32; 4],
+        dest_rect: [f32; 4],
+    ) -> Result<(), GlBackendError> {
+        self.ensure_current()?;
+        // SAFETY: a context is current and the program/texture ids are live.
+        unsafe {
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.glViewport)(0, 0, self.width as i32, self.height as i32);
+            let program = self.programs.get(crate::shaders::ProgramKind::Blit);
+            (self.gl.glUseProgram)(program.id);
+            (self.gl.glUniform4f)(
+                program.uniform("src_rect"),
+                src_rect[0],
+                src_rect[1],
+                src_rect[2],
+                src_rect[3],
+            );
+            (self.gl.glUniform4f)(
+                program.uniform("dest_rect"),
+                dest_rect[0],
+                dest_rect[1],
+                dest_rect[2],
+                dest_rect[3],
+            );
+            (self.gl.glUniform1i)(program.uniform("image"), 0);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+            (self.gl.glBindVertexArray)(self.vao);
+            (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+            (self.gl.glBindVertexArray)(0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glUseProgram)(0);
+        }
+        self.gl.check("blit")?;
+        Ok(())
+    }
+
+    /// Capture a rectangular region of the current framebuffer.
+    ///
+    /// With `no_scaling` the region is read back 1:1. Otherwise the real
+    /// `screenshot` program performs the colour-space-correct downsample into
+    /// a `thumb_width` x `thumb_height` target (pass zero to keep the source
+    /// dimensions). Pixels are returned top-down RGBA8, matching
+    /// [`read_pixels`](Self::read_pixels).
+    pub fn screenshot_region(
+        &mut self,
+        region: Region,
+        thumb_width: u32,
+        thumb_height: u32,
+        no_scaling: bool,
+    ) -> Result<Screenshot, GlBackendError> {
+        self.ensure_current()?;
+        let vw = self.width;
+        let vh = self.height;
+        let left = region.left.floor().max(0.0).min(vw as f32) as u32;
+        let top = region.top.floor().max(0.0).min(vh as f32) as u32;
+        let right = region.right.ceil().max(0.0).min(vw as f32) as u32;
+        let bottom = region.bottom.ceil().max(0.0).min(vh as f32) as u32;
+        if right <= left || bottom <= top {
+            return Ok(Screenshot {
+                width: 0,
+                height: 0,
+                pixels: Vec::new(),
+            });
+        }
+        let src_width = right - left;
+        let src_height = bottom - top;
+        if no_scaling {
+            let mut pixels = vec![0u8; src_width as usize * src_height as usize * 4];
+            // SAFETY: the buffer is exactly the requested size and a context
+            // is current. GL rows are bottom-up, flipped below.
+            unsafe {
+                (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+                (self.gl.glPixelStorei)(GL_PACK_ALIGNMENT, 1);
+                (self.gl.glReadPixels)(
+                    left as i32,
+                    (vh - bottom) as i32,
+                    src_width as i32,
+                    src_height as i32,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    pixels.as_mut_ptr().cast(),
+                );
+                (self.gl.glFinish)();
+            }
+            self.gl.check("screenshot readback")?;
+            flip_rows(&mut pixels, src_width, src_height);
+            return Ok(Screenshot {
+                width: src_width,
+                height: src_height,
+                pixels,
+            });
+        }
+
+        let width = if thumb_width == 0 {
+            src_width
+        } else {
+            thumb_width.min(src_width)
+        };
+        let height = if thumb_height == 0 {
+            src_height
+        } else {
+            thumb_height.min(src_height)
+        };
+        if width == 0 || height == 0 {
+            return Ok(Screenshot {
+                width: 0,
+                height: 0,
+                pixels: Vec::new(),
+            });
+        }
+        let mut src_texture = 0u32;
+        // SAFETY: a context is current; all resources are owned here.
+        unsafe {
+            (self.gl.glGenTextures)(1, &mut src_texture);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, src_texture);
+            (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as i32);
+            (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as i32);
+            (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
+            (self.gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.glCopyTexImage2D)(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, vw as i32, vh as i32, 0);
+        }
+        let target = unsafe { create_offscreen_target(&self.gl, width, height, GL_RGBA8 as i32)? };
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        // SAFETY: a context is current and the temporary framebuffer/texture
+        // are live for the duration of these calls.
+        unsafe {
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, target.framebuffer);
+            (self.gl.glViewport)(0, 0, width as i32, height as i32);
+            (self.gl.glDisable)(GL_SCISSOR_TEST);
+            let program = self.programs.get(crate::shaders::ProgramKind::Screenshot);
+            (self.gl.glUseProgram)(program.id);
+            let left_norm = left as f32 / vw as f32;
+            let right_norm = right as f32 / vw as f32;
+            let top_norm = (vh - bottom) as f32 / vh as f32;
+            let bottom_norm = (vh - top) as f32 / vh as f32;
+            (self.gl.glUniform4f)(
+                program.uniform("src_rect"),
+                left_norm,
+                top_norm,
+                right_norm,
+                bottom_norm,
+            );
+            (self.gl.glUniform4f)(program.uniform("dest_rect"), -1.0, -1.0, 1.0, 1.0);
+            (self.gl.glUniform2f)(
+                program.uniform("src_size"),
+                src_width as f32,
+                src_height as f32,
+            );
+            (self.gl.glUniform1i)(program.uniform("image"), 0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, src_texture);
+            (self.gl.glBindVertexArray)(self.vao);
+            (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+            (self.gl.glBindVertexArray)(0);
+            (self.gl.glPixelStorei)(GL_PACK_ALIGNMENT, 1);
+            (self.gl.glReadPixels)(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                pixels.as_mut_ptr().cast(),
+            );
+            (self.gl.glFinish)();
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glUseProgram)(0);
+            (self.gl.glDeleteFramebuffers)(1, &target.framebuffer);
+            (self.gl.glDeleteTextures)(1, &target.texture);
+            (self.gl.glDeleteTextures)(1, &src_texture);
+            (self.gl.glPixelStorei)(GL_PACK_ALIGNMENT, 4);
+        }
+        self.gl.check("screenshot program")?;
+        flip_rows(&mut pixels, width, height);
+        Ok(Screenshot {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    /// Alias for [`screenshot_region`](Self::screenshot_region).
+    pub fn take_screenshot(
+        &mut self,
+        region: Region,
+        thumb_width: u32,
+        thumb_height: u32,
+        no_scaling: bool,
+    ) -> Result<Screenshot, GlBackendError> {
+        self.screenshot_region(region, thumb_width, thumb_height, no_scaling)
     }
 
     fn storage_color(&self, color: Rgba8) -> [f32; 4] {
@@ -1716,7 +2811,34 @@ impl GlBackend {
         if let Some(background) = &frame.background_image {
             if self.image_textures.contains_key(&background.key) {
                 stats.background_image_drawn = true;
-                self.push_images(std::slice::from_ref(background), stats);
+                let tiled =
+                    (background.uv.u1 - 1.0).abs() > 1e-6 || (background.uv.v1 - 1.0).abs() > 1e-6;
+                // bgimage has no separate opacity input. Transparent
+                // backgrounds keep the explicit UV quad path, which supports
+                // arbitrary alpha and tint combinations.
+                let uv_origin_clear =
+                    background.uv.u0.abs() < 1e-6 && background.uv.v0.abs() < 1e-6;
+                if background.opacity >= 0.999 && uv_origin_clear {
+                    let cached = self.image_textures.get(&background.key).copied();
+                    let (width, height) = cached
+                        .map(|image| (image.width as f32, image.height as f32))
+                        .unwrap_or((1.0, 1.0));
+                    let start = self.instances.len();
+                    self.push_quad(
+                        background.rect,
+                        [0.0; 4],
+                        [0.0; 4],
+                        [f32::from(tiled), width, height, background.tint],
+                    );
+                    self.draw_calls.push(DrawCall {
+                        kind: BatchKind::BackgroundImage(background.key),
+                        first: start as i32,
+                        count: 1,
+                    });
+                    stats.images_drawn += 1;
+                } else {
+                    self.push_images(std::slice::from_ref(background), stats);
+                }
             }
         }
 
@@ -1726,75 +2848,115 @@ impl GlBackend {
             stats,
         );
 
-        // Cell backgrounds.
-        let start = self.instances.len();
-        for background in &frame.backgrounds {
-            if frame.background_image.is_some() && background.is_default_bg {
-                continue;
+        let cell_mode = self.cell_programs
+            && self
+                .cell_sprites
+                .as_ref()
+                .is_some_and(|sprites| !sprites.data.cells.is_empty());
+        if cell_mode {
+            // The cell shader paints a complete fixed grid. When something has
+            // to appear between backgrounds and foreground (the logo or a
+            // below-text image) the background and foreground passes are
+            // split, exactly like kitty's CELL_BG/CELL_FG draws.
+            let has_between = frame.logo.is_some()
+                || frame
+                    .images
+                    .iter()
+                    .any(|image| image.layer == crate::images::ImageLayer::BelowText);
+            let has_background_image = self.cell_background_image_ready(frame);
+            if has_between && !has_background_image {
+                self.push_cell_call(BatchKind::CellBackgroundDefault);
             }
-            let color = self.instance_color(background.color, background.flags.dim);
-            self.push_solid(background.rect, color, 0.0);
-        }
-        if self.instances.len() > start {
-            self.draw_calls.push(DrawCall {
-                kind: BatchKind::Solid,
-                first: start as i32,
-                count: (self.instances.len() - start) as i32,
-            });
-        }
-
-        // Window logo sits between the background and the text.
-        if let Some(logo) = &frame.logo {
-            if self.image_textures.contains_key(&logo.key) {
-                stats.logo_drawn = true;
-                self.push_images(std::slice::from_ref(logo), stats);
-            }
-        }
-
-        self.push_image_layer(&frame.images, crate::images::ImageLayer::BelowText, stats);
-
-        // Glyphs, grouped by atlas page so each page is bound once.
-        for (index, glyph) in frame.glyphs.iter().enumerate() {
-            if let Some(sprite) = glyph.sprite {
-                if self.atlas_pages.contains_key(&sprite.page) {
-                    self.glyph_order.push((sprite.page, index));
-                } else {
-                    stats.glyphs_skipped += 1;
+            if let Some(logo) = &frame.logo {
+                if self.image_textures.contains_key(&logo.key) {
+                    stats.logo_drawn = true;
+                    self.push_images(std::slice::from_ref(logo), stats);
                 }
+            }
+            self.push_image_layer(&frame.images, crate::images::ImageLayer::BelowText, stats);
+            if has_between {
+                self.push_cell_call(BatchKind::CellBackgroundNonDefault);
+                self.push_cell_call(BatchKind::CellForeground);
+            } else if has_background_image {
+                self.push_cell_call(BatchKind::CellBothNonDefault);
             } else {
-                stats.glyphs_skipped += 1;
+                self.push_cell_call(BatchKind::CellBoth);
             }
-        }
-        self.glyph_order.sort_unstable_by_key(|(page, _)| *page);
-        let mut cursor = 0usize;
-        while cursor < self.glyph_order.len() {
-            let page = self.glyph_order[cursor].0;
-            let is_color = self
-                .atlas_pages
-                .get(&page)
-                .map(|texture| texture.format == AtlasFormat::Rgba8)
-                .unwrap_or(false);
+            if let Some(sprites) = &self.cell_sprites {
+                stats.cell_instances = sprites.data.cells.len();
+                stats.cell_programs = true;
+            }
+        } else {
+            // Cell backgrounds.
             let start = self.instances.len();
-            while cursor < self.glyph_order.len() && self.glyph_order[cursor].0 == page {
-                let index = self.glyph_order[cursor].1;
-                let glyph = &frame.glyphs[index];
-                if let Some(sprite) = glyph.sprite {
-                    let color = self.instance_color(glyph.fg, glyph.flags.dim);
-                    self.push_quad(
-                        glyph.rect,
-                        [sprite.uv.u0, sprite.uv.v0, sprite.uv.u1, sprite.uv.v1],
-                        color,
-                        [0.0; 4],
-                    );
+            for background in &frame.backgrounds {
+                if frame.background_image.is_some() && background.is_default_bg {
+                    continue;
                 }
-                cursor += 1;
+                let color = self.instance_color(background.color, background.flags.dim);
+                self.push_solid(background.rect, color, 0.0);
             }
             if self.instances.len() > start {
                 self.draw_calls.push(DrawCall {
-                    kind: BatchKind::Glyph { page, is_color },
+                    kind: BatchKind::Solid,
                     first: start as i32,
                     count: (self.instances.len() - start) as i32,
                 });
+            }
+
+            // Window logo sits between the background and the text.
+            if let Some(logo) = &frame.logo {
+                if self.image_textures.contains_key(&logo.key) {
+                    stats.logo_drawn = true;
+                    self.push_images(std::slice::from_ref(logo), stats);
+                }
+            }
+
+            self.push_image_layer(&frame.images, crate::images::ImageLayer::BelowText, stats);
+
+            // Glyphs, grouped by atlas page so each page is bound once.
+            for (index, glyph) in frame.glyphs.iter().enumerate() {
+                if let Some(sprite) = glyph.sprite {
+                    if self.atlas_pages.contains_key(&sprite.page) {
+                        self.glyph_order.push((sprite.page, index));
+                    } else {
+                        stats.glyphs_skipped += 1;
+                    }
+                } else {
+                    stats.glyphs_skipped += 1;
+                }
+            }
+            self.glyph_order.sort_unstable_by_key(|(page, _)| *page);
+            let mut cursor = 0usize;
+            while cursor < self.glyph_order.len() {
+                let page = self.glyph_order[cursor].0;
+                let is_color = self
+                    .atlas_pages
+                    .get(&page)
+                    .map(|texture| texture.format == AtlasFormat::Rgba8)
+                    .unwrap_or(false);
+                let start = self.instances.len();
+                while cursor < self.glyph_order.len() && self.glyph_order[cursor].0 == page {
+                    let index = self.glyph_order[cursor].1;
+                    let glyph = &frame.glyphs[index];
+                    if let Some(sprite) = glyph.sprite {
+                        let color = self.instance_color(glyph.fg, glyph.flags.dim);
+                        self.push_quad(
+                            glyph.rect,
+                            [sprite.uv.u0, sprite.uv.v0, sprite.uv.u1, sprite.uv.v1],
+                            color,
+                            [0.0; 4],
+                        );
+                    }
+                    cursor += 1;
+                }
+                if self.instances.len() > start {
+                    self.draw_calls.push(DrawCall {
+                        kind: BatchKind::Glyph { page, is_color },
+                        first: start as i32,
+                        count: (self.instances.len() - start) as i32,
+                    });
+                }
             }
         }
 
@@ -1857,6 +3019,189 @@ impl GlBackend {
                 count: (self.instances.len() - start) as i32,
             });
         }
+    }
+
+    fn cell_background_image_ready(&self, frame: &Frame) -> bool {
+        frame
+            .background_image
+            .as_ref()
+            .is_some_and(|image| self.image_textures.contains_key(&image.key))
+    }
+
+    fn push_cell_call(&mut self, kind: BatchKind) {
+        self.draw_calls.push(DrawCall {
+            kind,
+            first: 0,
+            count: 0,
+        });
+    }
+
+    fn upload_cell_instances(&mut self, frame: &Frame) -> Result<(), GlBackendError> {
+        if !self.cell_programs {
+            return Ok(());
+        }
+        let Some(sprites) = self.cell_sprites.as_ref() else {
+            return Ok(());
+        };
+        let count = sprites.data.cells.len();
+        if count == 0 {
+            return Ok(());
+        }
+        let mut colors = Vec::with_capacity(count * 4);
+        let mut sprite_idx = Vec::with_capacity(count * 2);
+        let mut selected = Vec::with_capacity(count);
+        for cell in &sprites.data.cells {
+            for value in cell.colors {
+                colors.extend_from_slice(&value.to_ne_bytes());
+            }
+            sprite_idx.extend_from_slice(&cell.sprite_idx.to_ne_bytes());
+            sprite_idx.extend_from_slice(&cell.attrs.to_ne_bytes());
+            selected.push(cell.is_selected);
+        }
+        let data = pack_cell_render_data(&sprites.data, frame);
+        let needed = colors.len().max(sprite_idx.len()).max(selected.len());
+        // SAFETY: a context is current and all slices outlive the upload calls.
+        unsafe {
+            let buffers = [
+                self.cell_colors_vbo,
+                self.cell_sprite_vbo,
+                self.cell_selection_vbo,
+            ];
+            let payloads: [&[u8]; 3] = [&colors, &sprite_idx, &selected];
+            if needed > self.cell_instance_capacity {
+                for (buffer, payload) in buffers.iter().zip(payloads.iter()) {
+                    (self.gl.glBindBuffer)(GL_ARRAY_BUFFER, *buffer);
+                    (self.gl.glBufferData)(
+                        GL_ARRAY_BUFFER,
+                        (needed * 2).max(4096) as isize,
+                        ptr::null(),
+                        GL_DYNAMIC_DRAW,
+                    );
+                    let _ = payload;
+                }
+                self.cell_instance_capacity = (needed * 2).max(4096);
+            }
+            for (buffer, payload) in buffers.iter().zip(payloads.iter()) {
+                (self.gl.glBindBuffer)(GL_ARRAY_BUFFER, *buffer);
+                (self.gl.glBufferSubData)(
+                    GL_ARRAY_BUFFER,
+                    0,
+                    payload.len() as isize,
+                    payload.as_ptr() as *const c_void,
+                );
+            }
+            (self.gl.glBindBuffer)(GL_ARRAY_BUFFER, 0);
+            (self.gl.glBindBuffer)(GL_UNIFORM_BUFFER, self.cell_data_ubo);
+            (self.gl.glBufferSubData)(
+                GL_UNIFORM_BUFFER,
+                0,
+                data.len() as isize,
+                data.as_ptr() as *const c_void,
+            );
+            (self.gl.glBindBufferBase)(GL_UNIFORM_BUFFER, 0, self.cell_data_ubo);
+        }
+        self.gl.check("cell instance upload")?;
+        Ok(())
+    }
+
+    fn ensure_cell_offscreen(&mut self) -> Result<(), GlBackendError> {
+        let (width, height) = (self.width, self.height);
+        let recreate = self
+            .cell_offscreen
+            .is_none_or(|target| target.width != width || target.height != height);
+        if !recreate {
+            return Ok(());
+        }
+        self.ensure_current()?;
+        if let Some(old) = self.cell_offscreen.take() {
+            // SAFETY: the objects are owned by this backend.
+            unsafe {
+                (self.gl.glDeleteFramebuffers)(1, &old.framebuffer);
+                (self.gl.glDeleteTextures)(1, &old.texture);
+            }
+        }
+        // SAFETY: a context is current.
+        let target =
+            unsafe { create_offscreen_target(&self.gl, width, height, GL_RGBA16F as i32)? };
+        self.cell_offscreen = Some(target);
+        Ok(())
+    }
+
+    fn draw_cell_layer(
+        &mut self,
+        kind: BatchKind,
+        scissor: ScissorRect,
+    ) -> Result<(), GlBackendError> {
+        use crate::shaders::ProgramKind;
+        let Some((sprites_texture, decorations_texture, cell_count)) =
+            self.cell_sprites.as_ref().map(|sprites| {
+                (
+                    sprites.texture,
+                    sprites.decorations,
+                    sprites.data.cells.len(),
+                )
+            })
+        else {
+            return Ok(());
+        };
+        self.ensure_cell_offscreen()?;
+        let Some(target) = self.cell_offscreen else {
+            return Ok(());
+        };
+        let (program_kind, bitfield) = match kind {
+            BatchKind::CellBoth => (ProgramKind::Cell, 3u32),
+            BatchKind::CellBothNonDefault => (ProgramKind::Cell, 2),
+            BatchKind::CellBackgroundDefault => (ProgramKind::CellBg, 1),
+            BatchKind::CellBackgroundNonDefault => (ProgramKind::CellBg, 2),
+            BatchKind::CellForeground => (ProgramKind::CellFg, 0),
+            _ => return Ok(()),
+        };
+        let y = self.height as i32 - (scissor.y + scissor.height);
+        // SAFETY: a context is current and all ids are live.
+        unsafe {
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, target.framebuffer);
+            (self.gl.glViewport)(0, 0, target.width as i32, target.height as i32);
+            (self.gl.glEnable)(GL_SCISSOR_TEST);
+            (self.gl.glScissor)(scissor.x, y, scissor.width, scissor.height);
+            (self.gl.glClearColor)(0.0, 0.0, 0.0, 0.0);
+            (self.gl.glClear)(GL_COLOR_BUFFER_BIT);
+
+            let program = self.programs.get(program_kind);
+            (self.gl.glUseProgram)(program.id);
+            (self.gl.glUniform1ui)(program.uniform("draw_bg_bitfield"), bitfield);
+            (self.gl.glUniform1i)(program.uniform("sprites"), 0);
+            (self.gl.glUniform1i)(program.uniform("sprite_decorations_map"), 1);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D_ARRAY, sprites_texture);
+            (self.gl.glActiveTexture)(GL_TEXTURE0 + 1);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, decorations_texture);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+            (self.gl.glBindVertexArray)(self.cell_vao);
+            (self.gl.glDrawArraysInstanced)(GL_TRIANGLE_FAN, 0, 4, cell_count as i32);
+            (self.gl.glBindVertexArray)(0);
+            self.gl.check("cell instanced draw")?;
+
+            // Blit the linear cell layer to the sRGB output with kitty's blit
+            // program (it performs the same linear2srgb conversion as the
+            // final custom-shader pass).
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.glViewport)(0, 0, self.width as i32, self.height as i32);
+            (self.gl.glScissor)(scissor.x, y, scissor.width, scissor.height);
+            let blit = self.programs.get(ProgramKind::Blit);
+            (self.gl.glUseProgram)(blit.id);
+            (self.gl.glUniform4f)(blit.uniform("src_rect"), 0.0, 0.0, 1.0, 1.0);
+            (self.gl.glUniform4f)(blit.uniform("dest_rect"), -1.0, -1.0, 1.0, 1.0);
+            (self.gl.glUniform1i)(blit.uniform("image"), 0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, target.texture);
+            (self.gl.glBindVertexArray)(self.vao);
+            (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+            (self.gl.glBindVertexArray)(0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glActiveTexture)(GL_TEXTURE0 + 1);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+        }
+        Ok(())
     }
 
     fn upload_instances(&mut self) -> Result<(), GlBackendError> {
@@ -1971,7 +3316,20 @@ impl GlBackend {
                     (self.gl.glClear)(GL_COLOR_BUFFER_BIT);
                 }
 
-                for call in &self.draw_calls {
+                let calls = self.draw_calls.clone();
+                for call in &calls {
+                    if matches!(
+                        call.kind,
+                        BatchKind::CellBoth
+                            | BatchKind::CellBothNonDefault
+                            | BatchKind::CellBackgroundDefault
+                            | BatchKind::CellBackgroundNonDefault
+                            | BatchKind::CellForeground
+                    ) {
+                        self.draw_cell_layer(call.kind, *scissor)?;
+                        stats.draw_calls += 1;
+                        continue;
+                    }
                     let first = call.first as usize;
                     let end = first + call.count.max(0) as usize;
                     for instance in &self.instances[first..end] {
@@ -2210,6 +3568,69 @@ impl GlBackend {
                                     (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
                                 }
                             }
+                            BatchKind::BackgroundImage(key) => {
+                                let cached = self.image_textures.get(&key).copied();
+                                let texture = cached.map(|cached| cached.texture).unwrap_or(0);
+                                let tiled = instance.params[0];
+                                let image_width = instance.params[1];
+                                let image_height = instance.params[2];
+                                let tint = instance.params[3].clamp(0.0, 1.0);
+                                let ndc = self.ndc_rect(rect);
+                                let program = self.programs.get(ProgramKind::BgImage);
+                                (self.gl.glUseProgram)(program.id);
+                                (self.gl.glUniform4f)(
+                                    program.uniform("sizes"),
+                                    self.width as f32,
+                                    self.height as f32,
+                                    image_width,
+                                    image_height,
+                                );
+                                (self.gl.glUniform1f)(program.uniform("tiled"), tiled);
+                                (self.gl.glUniform4f)(
+                                    program.uniform("positions"),
+                                    ndc[0],
+                                    ndc[1],
+                                    ndc[2],
+                                    ndc[3],
+                                );
+                                (self.gl.glUniform1i)(program.uniform("image"), 0);
+                                let background = self.storage_color(frame.default_bg);
+                                (self.gl.glUniform4f)(
+                                    program.uniform("background"),
+                                    background[0],
+                                    background[1],
+                                    background[2],
+                                    1.0,
+                                );
+                                (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
+                                (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                                stats.bgimage_draws += 1;
+                                if tint > 0.0 {
+                                    let tint_program = self.programs.get(ProgramKind::Tint);
+                                    (self.gl.glUseProgram)(tint_program.id);
+                                    (self.gl.glUniform4f)(
+                                        tint_program.uniform("edges"),
+                                        ndc[0],
+                                        ndc[1],
+                                        ndc[2],
+                                        ndc[3],
+                                    );
+                                    let color = self.storage_color(
+                                        frame
+                                            .background_image
+                                            .as_ref()
+                                            .map_or(Rgba8::BLACK, |image| image.color),
+                                    );
+                                    (self.gl.glUniform4f)(
+                                        tint_program.uniform("tint_color"),
+                                        color[0] * tint,
+                                        color[1] * tint,
+                                        color[2] * tint,
+                                        tint,
+                                    );
+                                    (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                                }
+                            }
                             BatchKind::Trail => {
                                 let program = self.programs.get(ProgramKind::Trail);
                                 (self.gl.glUseProgram)(program.id);
@@ -2236,6 +3657,11 @@ impl GlBackend {
                                 (self.gl.glUniform1f)(program.uniform("trail_opacity"), alpha);
                                 (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
                             }
+                            BatchKind::CellBoth
+                            | BatchKind::CellBothNonDefault
+                            | BatchKind::CellBackgroundDefault
+                            | BatchKind::CellBackgroundNonDefault
+                            | BatchKind::CellForeground => {}
                         }
                         stats.draw_calls += 1;
                     }
@@ -2317,6 +3743,21 @@ impl GlBackend {
     }
 }
 
+fn flip_rows(pixels: &mut [u8], width: u32, height: u32) {
+    let stride = width as usize * 4;
+    if stride == 0 {
+        return;
+    }
+    let mut scratch = vec![0u8; stride];
+    for row in 0..height as usize / 2 {
+        let top = row * stride;
+        let bottom = (height as usize - 1 - row) * stride;
+        scratch.copy_from_slice(&pixels[top..top + stride]);
+        pixels.copy_within(bottom..bottom + stride, top);
+        pixels[bottom..bottom + stride].copy_from_slice(&scratch);
+    }
+}
+
 impl Drop for GlBackend {
     fn drop(&mut self) {
         if let Some(context) = &self.context {
@@ -2352,9 +3793,38 @@ impl Drop for GlBackend {
                 (self.gl.glDeleteProgram)(self.custom_program);
                 self.custom_program = 0;
             }
+            self.destroy_custom_pipeline();
             if self.color_table_ubo != 0 {
                 (self.gl.glDeleteBuffers)(1, &self.color_table_ubo);
                 self.color_table_ubo = 0;
+            }
+            if self.cell_data_ubo != 0 {
+                (self.gl.glDeleteBuffers)(1, &self.cell_data_ubo);
+                self.cell_data_ubo = 0;
+            }
+            for buffer in [
+                self.cell_colors_vbo,
+                self.cell_sprite_vbo,
+                self.cell_selection_vbo,
+            ] {
+                if buffer != 0 {
+                    (self.gl.glDeleteBuffers)(1, &buffer);
+                }
+            }
+            self.cell_colors_vbo = 0;
+            self.cell_sprite_vbo = 0;
+            self.cell_selection_vbo = 0;
+            if self.cell_vao != 0 {
+                (self.gl.glDeleteVertexArrays)(1, &self.cell_vao);
+                self.cell_vao = 0;
+            }
+            if let Some(sprites) = self.cell_sprites.take() {
+                let textures = [sprites.texture, sprites.decorations];
+                (self.gl.glDeleteTextures)(2, textures.as_ptr());
+            }
+            if let Some(target) = self.cell_offscreen.take() {
+                (self.gl.glDeleteFramebuffers)(1, &target.framebuffer);
+                (self.gl.glDeleteTextures)(1, &target.texture);
             }
         }
         let _ = self.gl.check("teardown");

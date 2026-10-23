@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kitty_remote::base64::{decode as b64decode, encode as b64encode};
 use kitty_remote::sha256;
 
+use crate::rsync;
 use crate::terminal::InteractiveTransport;
 
 pub const FILE_TRANSFER_CODE: &str = "5113";
@@ -601,6 +602,8 @@ pub struct SendFile {
     pub symlink_target: Option<String>,
     pub state: SendFileState,
     pub compressed: bool,
+    pub ttype: TransmissionType,
+    pub delta: Option<Vec<u8>>,
     pub sent: u64,
 }
 
@@ -608,6 +611,7 @@ pub struct SendFile {
 pub enum SendFileState {
     #[default]
     Waiting,
+    WaitingForData,
     Transmitting,
     Finished,
     Acknowledged,
@@ -771,6 +775,8 @@ fn collect_one(
         compressed: file_type == FileType::Regular
             && meta.len() > 4096
             && should_compress(expanded, opts.compress),
+        ttype: TransmissionType::Simple,
+        delta: None,
         sent: 0,
     });
     if file_type == FileType::Directory {
@@ -803,7 +809,9 @@ pub struct SendEngine {
     pub state: SendState,
     pub bypass: String,
     pub confirm_paths: bool,
+    pub use_rsync: bool,
     pub errors: Vec<String>,
+    signatures: HashMap<String, Vec<u8>>,
     metadata_sent: bool,
     next_send: usize,
     finished: bool,
@@ -833,7 +841,9 @@ impl SendEngine {
             state: SendState::WaitingForPermission,
             bypass,
             confirm_paths: opts.confirm_paths,
+            use_rsync: opts.transmit_deltas,
             errors: Vec::new(),
+            signatures: HashMap::new(),
             metadata_sent: false,
             next_send: 0,
             finished: false,
@@ -879,13 +889,16 @@ impl SendEngine {
                         return Ok(frames);
                     };
                     if cmd.status.starts_with("STARTED") {
-                        file.state = SendFileState::Transmitting;
                         self.state = SendState::Transferring;
                         if !cmd.name.is_empty() {
                             file.remote_path = cmd.name;
                         }
                         if file.file_type == FileType::Directory {
                             file.state = SendFileState::Finished;
+                        } else if cmd.ttype == TransmissionType::Rsync {
+                            file.state = SendFileState::WaitingForData;
+                        } else {
+                            file.state = SendFileState::Transmitting;
                         }
                     } else if cmd.status.starts_with("PROGRESS") {
                         file.sent = cmd.size.max(0) as u64;
@@ -900,8 +913,25 @@ impl SendEngine {
                     }
                 }
                 Action::Data | Action::EndData if !cmd.file_id.is_empty() => {
-                    // Rsync signatures from the terminal. They are accepted
-                    // but this port always sends simple streams.
+                    let Some(index) = self.files.iter().position(|f| f.file_id == cmd.file_id)
+                    else {
+                        return Ok(frames);
+                    };
+                    if self.files[index].state != SendFileState::WaitingForData {
+                        return Ok(frames);
+                    }
+                    let buffer = self.signatures.entry(cmd.file_id.clone()).or_default();
+                    buffer.extend_from_slice(&cmd.data);
+                    if cmd.action == Action::EndData {
+                        let signature = self.signatures.remove(&cmd.file_id).unwrap_or_default();
+                        let parsed = rsync::parse_signature(&signature)
+                            .map_err(|err| TransferError::Protocol(err.to_string()))?;
+                        let source = fs::read(&self.files[index].local_path)?;
+                        let delta = rsync::create_delta(&source, &parsed)
+                            .map_err(|err| TransferError::Protocol(err.to_string()))?;
+                        self.files[index].delta = Some(delta);
+                        self.files[index].state = SendFileState::Transmitting;
+                    }
                 }
                 _ => {}
             },
@@ -917,7 +947,14 @@ impl SendEngine {
         }
         self.metadata_sent = true;
         let mut frames = Vec::with_capacity(self.files.len());
-        for file in &self.files {
+        for file in &mut self.files {
+            let use_rsync =
+                self.use_rsync && file.file_type == FileType::Regular && file.size > 4096;
+            file.ttype = if use_rsync {
+                TransmissionType::Rsync
+            } else {
+                TransmissionType::Simple
+            };
             let mut cmd = FileTransmissionCommand {
                 action: Action::File,
                 ftype: file.file_type,
@@ -927,6 +964,14 @@ impl SendEngine {
                 mtime: file.mtime_ns,
                 permissions: file.permissions,
                 size: file.size,
+                ttype: file.ttype,
+                compression: if use_rsync {
+                    Compression::None
+                } else if file.compressed {
+                    Compression::Zlib
+                } else {
+                    Compression::None
+                },
                 ..FileTransmissionCommand::default()
             };
             if let Some(target) = &file.hard_link_target {
@@ -944,7 +989,10 @@ impl SendEngine {
         let mut frames = Vec::new();
         while self.next_send < self.files.len() {
             let index = self.next_send;
-            if self.files[index].state == SendFileState::Waiting {
+            if matches!(
+                self.files[index].state,
+                SendFileState::Waiting | SendFileState::WaitingForData
+            ) {
                 break;
             }
             if self.files[index].state != SendFileState::Transmitting {
@@ -997,8 +1045,16 @@ impl SendEngine {
                     .into_bytes()
             }
             FileType::Regular => {
-                let mut data = fs::read(&file.local_path).ok().unwrap_or_default();
-                if file.compressed {
+                let (mut data, compress) = if let Some(delta) = file.delta.take() {
+                    (delta, false)
+                } else {
+                    let data = fs::read(&file.local_path).ok().unwrap_or_default();
+                    (
+                        data,
+                        file.compressed && file.ttype == TransmissionType::Simple,
+                    )
+                };
+                if compress {
                     if let Ok(compressed) = zlib_compress(&data) {
                         data = compressed;
                     }
@@ -1050,6 +1106,9 @@ pub struct ReceiveFile {
     pub size: i64,
     pub mtime_ns: i64,
     pub permissions: u32,
+    pub compression: Compression,
+    pub ttype: TransmissionType,
+    pub expects_delta: bool,
     pub target: String,
     pub dest_path: PathBuf,
     pub state: ReceiveFileState,
@@ -1075,8 +1134,10 @@ pub struct ReceiveEngine {
     pub files: Vec<ReceiveFile>,
     pub errors: Vec<String>,
     pub remote_home: String,
+    pub use_rsync: bool,
     queued: HashSet<String>,
     received: HashMap<String, Vec<u8>>,
+    signatures: HashMap<String, Vec<u8>>,
     finished: bool,
 }
 
@@ -1107,8 +1168,10 @@ impl ReceiveEngine {
             files: Vec::new(),
             errors: Vec::new(),
             remote_home: String::new(),
+            use_rsync: opts.transmit_deltas,
             queued: HashSet::new(),
             received: HashMap::new(),
+            signatures: HashMap::new(),
             finished: false,
         }
     }
@@ -1171,6 +1234,9 @@ impl ReceiveEngine {
                         size: cmd.size.max(0),
                         mtime_ns: cmd.mtime,
                         permissions: cmd.permissions,
+                        compression: cmd.compression,
+                        ttype: cmd.ttype,
+                        expects_delta: false,
                         target,
                         dest_path: PathBuf::new(),
                         state: ReceiveFileState::Waiting,
@@ -1210,19 +1276,34 @@ impl ReceiveEngine {
                     }
                 }
                 Action::Data | Action::EndData => {
-                    if let Some(file) = self.files.iter_mut().find(|f| f.remote_id == cmd.file_id) {
-                        let buffer = self.received.entry(cmd.file_id.clone()).or_default();
-                        buffer.extend_from_slice(&cmd.data);
-                        if cmd.action == Action::EndData {
-                            let data = self.received.remove(&cmd.file_id).unwrap_or_default();
-                            let data = if file.file_type == FileType::Regular && file.size > 4096 {
-                                zlib_decompress(&data, file.size as usize).unwrap_or(data)
-                            } else {
-                                data
-                            };
-                            write_received(file, &data)?;
-                            file.state = ReceiveFileState::Done;
-                        }
+                    let Some(index) = self.files.iter().position(|f| f.remote_id == cmd.file_id)
+                    else {
+                        return Ok(frames);
+                    };
+                    let buffer = self.received.entry(cmd.file_id.clone()).or_default();
+                    buffer.extend_from_slice(&cmd.data);
+                    if cmd.action == Action::EndData {
+                        let data = self.received.remove(&cmd.file_id).unwrap_or_default();
+                        let expects_delta = self.files[index].expects_delta;
+                        let data = if expects_delta {
+                            let signature = self.signatures.get(&cmd.file_id);
+                            let block_size = signature
+                                .and_then(|sig| rsync::parse_signature_header(sig).ok())
+                                .map(|size| size as usize)
+                                .unwrap_or(rsync::DEFAULT_BLOCK_SIZE);
+                            let target_path = self.files[index].dest_path.clone();
+                            let target = fs::read(&target_path).unwrap_or_default();
+                            rsync::apply_delta_with_block_size(&target, &data, block_size)
+                                .map_err(|err| TransferError::Protocol(err.to_string()))?
+                        } else if self.files[index].file_type == FileType::Regular
+                            && self.files[index].compression == Compression::Zlib
+                        {
+                            zlib_decompress(&data, self.files[index].size as usize).unwrap_or(data)
+                        } else {
+                            data
+                        };
+                        write_received(&mut self.files[index], &data)?;
+                        self.files[index].state = ReceiveFileState::Done;
                     }
                 }
                 _ => {}
@@ -1254,24 +1335,51 @@ impl ReceiveEngine {
 
     fn request_next(&mut self) -> Result<Vec<Vec<u8>>, TransferError> {
         let mut frames = Vec::new();
-        for file in &mut self.files {
-            if file.file_type == FileType::Directory {
-                if file.state == ReceiveFileState::Waiting {
-                    fs::create_dir_all(&file.dest_path)?;
-                    file.state = ReceiveFileState::Done;
+        for index in 0..self.files.len() {
+            if self.files[index].file_type == FileType::Directory {
+                if self.files[index].state == ReceiveFileState::Waiting {
+                    fs::create_dir_all(&self.files[index].dest_path)?;
+                    self.files[index].state = ReceiveFileState::Done;
                 }
                 continue;
             }
-            if file.state != ReceiveFileState::Waiting || self.queued.contains(&file.remote_id) {
+            if self.files[index].state != ReceiveFileState::Waiting
+                || self.queued.contains(&self.files[index].remote_id)
+            {
                 continue;
             }
-            self.queued.insert(file.remote_id.clone());
+            let remote_id = self.files[index].remote_id.clone();
+            self.queued.insert(remote_id.clone());
+            let should_rsync = self.use_rsync
+                && self.files[index].file_type == FileType::Regular
+                && self.files[index].size > 4096
+                && fs::metadata(&self.files[index].dest_path)
+                    .map(|meta| meta.is_file() && meta.len() > 4096)
+                    .unwrap_or(false);
+            let mut signature = None;
+            if should_rsync {
+                let target = fs::read(&self.files[index].dest_path)?;
+                let block_size = rsync::block_size_for(target.len() as u64) as u32;
+                let serialized = rsync::create_signature(&target, block_size)
+                    .map_err(|err| TransferError::Protocol(err.to_string()))?;
+                signature = Some(serialized);
+            }
+            self.files[index].ttype = if signature.is_some() {
+                TransmissionType::Rsync
+            } else {
+                TransmissionType::Simple
+            };
+            self.files[index].expects_delta = signature.is_some();
             frames.push(
                 FileTransmissionCommand {
                     action: Action::File,
-                    file_id: file.remote_id.clone(),
-                    name: file.remote_path.clone(),
-                    compression: if file.file_type == FileType::Regular && file.size > 4096 {
+                    file_id: remote_id.clone(),
+                    name: self.files[index].remote_path.clone(),
+                    ttype: self.files[index].ttype,
+                    compression: if self.files[index].file_type == FileType::Regular
+                        && self.files[index].size > 4096
+                        && signature.is_none()
+                    {
                         Compression::Zlib
                     } else {
                         Compression::None
@@ -1280,6 +1388,32 @@ impl ReceiveEngine {
                 }
                 .to_frame(&self.request_id),
             );
+            if let Some(signature) = signature {
+                self.signatures.insert(remote_id.clone(), signature.clone());
+                let chunks: Vec<&[u8]> = signature.chunks(DATA_CHUNK_SIZE).collect();
+                for (chunk_index, chunk) in chunks.iter().enumerate() {
+                    let last = chunk_index + 1 == chunks.len();
+                    frames.push(
+                        FileTransmissionCommand {
+                            action: if last { Action::EndData } else { Action::Data },
+                            file_id: remote_id.clone(),
+                            data: chunk.to_vec(),
+                            ..FileTransmissionCommand::default()
+                        }
+                        .to_frame(&self.request_id),
+                    );
+                }
+                if chunks.is_empty() {
+                    frames.push(
+                        FileTransmissionCommand {
+                            action: Action::EndData,
+                            file_id: remote_id,
+                            ..FileTransmissionCommand::default()
+                        }
+                        .to_frame(&self.request_id),
+                    );
+                }
+            }
         }
         Ok(frames)
     }
@@ -1721,6 +1855,177 @@ mod tests {
             })
             .unwrap();
         assert!(engine.is_done());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sender_uses_rsync_signature_to_transmit_a_delta() {
+        let dir = temp_dir("rsync-send");
+        let source_path = dir.join("source.txt");
+        let target_path = dir.join("target.txt");
+        let source = b"the quick brown fox jumps over the lazy dog\n".repeat(6000);
+        let mut target = source.clone();
+        target[1000..1010].copy_from_slice(b"0123456789");
+        target.extend_from_slice(b"a new tail\n");
+        fs::write(&source_path, &source).unwrap();
+        fs::write(&target_path, &target).unwrap();
+        let opts = TransferOptions {
+            transmit_deltas: true,
+            ..TransferOptions::default()
+        };
+        let args = vec![
+            source_path.to_string_lossy().into_owned(),
+            target_path.to_string_lossy().into_owned(),
+        ];
+        let files = collect_send_files(&opts, &args, &dir, &dir).unwrap();
+        let mut engine = SendEngine::new(&opts, files);
+        let metadata = engine
+            .handle(FileTransmissionCommand {
+                action: Action::Status,
+                id: engine.request_id.clone(),
+                status: "OK".to_owned(),
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        let _ = engine
+            .handle(FileTransmissionCommand {
+                action: Action::Status,
+                id: engine.request_id.clone(),
+                file_id: "1".to_owned(),
+                status: "STARTED".to_owned(),
+                ttype: TransmissionType::Rsync,
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        assert!(metadata
+            .iter()
+            .any(|frame| String::from_utf8_lossy(frame).contains("tt=rsync")));
+        let signature = rsync::create_signature(&target, 128).unwrap();
+        engine
+            .handle(FileTransmissionCommand {
+                action: Action::Data,
+                id: engine.request_id.clone(),
+                file_id: "1".to_owned(),
+                data: signature[..40].to_vec(),
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        let frames = engine
+            .handle(FileTransmissionCommand {
+                action: Action::EndData,
+                id: engine.request_id.clone(),
+                file_id: "1".to_owned(),
+                data: signature[40..].to_vec(),
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        let mut delta = Vec::new();
+        for frame in &frames {
+            let mut parser = Osc5113Parser::new();
+            parser.feed(frame);
+            let payload = parser.next_payload().unwrap();
+            let command = FileTransmissionCommand::deserialize(&payload).unwrap();
+            if matches!(command.action, Action::Data | Action::EndData) {
+                delta.extend_from_slice(&command.data);
+            }
+        }
+        assert!(!delta.is_empty());
+        assert!(delta.len() < source.len());
+        let parsed = rsync::parse_signature(&signature).unwrap();
+        assert_eq!(
+            rsync::apply_delta_with_block_size(&target, &delta, parsed.block_size as usize)
+                .unwrap(),
+            source
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receiver_requests_and_applies_rsync_delta() {
+        let dir = temp_dir("rsync-recv");
+        let dest = dir.join("dest.txt");
+        let existing = b"0123456789abcdef".repeat(4000);
+        let source = b"0123456789abcdef".repeat(4000);
+        fs::write(&dest, &existing).unwrap();
+        let opts = TransferOptions {
+            direction: Direction::Upload,
+            transmit_deltas: true,
+            ..TransferOptions::default()
+        };
+        let mut engine = ReceiveEngine::new(
+            &opts,
+            vec!["/remote/source.txt".to_owned()],
+            dest.to_string_lossy().into_owned(),
+        );
+        engine
+            .handle(FileTransmissionCommand {
+                action: Action::Status,
+                id: engine.request_id.clone(),
+                status: "OK".to_owned(),
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        engine
+            .handle(FileTransmissionCommand {
+                action: Action::File,
+                id: engine.request_id.clone(),
+                file_id: "0".to_owned(),
+                status: "remote-1".to_owned(),
+                name: "/remote/source.txt".to_owned(),
+                size: source.len() as i64,
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        let frames = engine
+            .handle(FileTransmissionCommand {
+                action: Action::Status,
+                id: engine.request_id.clone(),
+                status: "OK".to_owned(),
+                name: "/home/remote".to_owned(),
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        let mut signature = Vec::new();
+        let mut requested_rsync = false;
+        for frame in &frames {
+            let mut parser = Osc5113Parser::new();
+            parser.feed(frame);
+            let payload = parser.next_payload().unwrap();
+            let command = FileTransmissionCommand::deserialize(&payload).unwrap();
+            if command.action == Action::File {
+                requested_rsync = command.ttype == TransmissionType::Rsync;
+            } else if matches!(command.action, Action::Data | Action::EndData) {
+                signature.extend_from_slice(&command.data);
+            }
+        }
+        assert!(requested_rsync);
+        let parsed = rsync::parse_signature(&signature).unwrap();
+        let delta = rsync::create_delta(&source, &parsed).unwrap();
+        assert_eq!(
+            rsync::apply_delta_with_block_size(&existing, &delta, parsed.block_size as usize)
+                .unwrap(),
+            source
+        );
+        engine
+            .handle(FileTransmissionCommand {
+                action: Action::Status,
+                id: engine.request_id.clone(),
+                file_id: "remote-1".to_owned(),
+                status: "STARTED".to_owned(),
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        engine
+            .handle(FileTransmissionCommand {
+                action: Action::EndData,
+                id: engine.request_id.clone(),
+                file_id: "remote-1".to_owned(),
+                data: delta,
+                ..FileTransmissionCommand::default()
+            })
+            .unwrap();
+        assert!(engine.is_done());
+        assert_eq!(fs::read(&dest).unwrap(), source);
         fs::remove_dir_all(dir).unwrap();
     }
 

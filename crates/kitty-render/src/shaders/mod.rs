@@ -506,6 +506,236 @@ impl SlangCompiler {
                 .collect(),
         })
     }
+
+    /// Compile a complete multi-group post-processing pipeline.
+    ///
+    /// `sources[group]` contains the Slang sources of that group's shaders.
+    /// Each source must define `fragment_main(float4 color, KittyTextures t,
+    /// KittyCustomShaderData d)`, like kitty's built-in custom shaders. The
+    /// sources are combined into one program with a group dispatcher, matching
+    /// kitty's `CUSTOM_END_PROGRAM` layout.
+    pub fn compile_custom_pipeline(
+        &self,
+        name: &str,
+        pipeline: &crate::custom_shader::CustomShaderPipeline,
+        sources: &[Vec<String>],
+    ) -> Result<CustomShader, ShaderError> {
+        if sources.len() != pipeline.groups.len() {
+            return Err(ShaderError::Compile {
+                program: name.to_owned(),
+                log: "one source list is required for every pipeline group".into(),
+            });
+        }
+        self.ensure_custom_types_module(name)?;
+        let mut combined =
+            String::from("#language slang 2026\nimport kitty_custom_shader_types;\n\n");
+        for (group_index, group_sources) in sources.iter().enumerate() {
+            for (shader_index, source) in group_sources.iter().enumerate() {
+                let function =
+                    format!("kitr_group_{group_index}_shader_{shader_index}_fragment_main");
+                let mut body: String = source
+                    .lines()
+                    .filter(|line| {
+                        let line = line.trim_start();
+                        !line.starts_with("#language")
+                            && line != "import kitty_custom_shader_types;"
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                body = body.replace("fragment_main", &function);
+                combined.push_str(&body);
+                combined.push_str("\n\n");
+            }
+        }
+        // Rebuild the dispatcher with one branch per group.
+        let mut dispatcher = String::new();
+        for (group_index, group_sources) in sources.iter().enumerate() {
+            let prefix = if group_index == 0 {
+                "    if"
+            } else {
+                "    else if"
+            };
+            dispatcher.push_str(&format!("{prefix} (group == {group_index}) {{\n"));
+            for shader_index in 0..group_sources.len() {
+                dispatcher.push_str(&format!(
+                    "        color = kitr_group_{group_index}_shader_{shader_index}_fragment_main(color, t, csd);\n"
+                ));
+            }
+            dispatcher.push_str("    }\n");
+        }
+        combined.push_str(&format!(r#"
+struct KitrPipelineVSOut {{
+    float2 texcoord : TEXCOORD;
+    float4 position : SV_Position;
+}};
+
+[shader("vertex")]
+KitrPipelineVSOut
+vertex_main(uint vertex_id : SV_VertexID, uniform float4 src_rect, uniform float4 dest_rect) {{
+    const int2 pos_map[4] = {{ int2(2, 1), int2(2, 3), int2(0, 3), int2(0, 1) }};
+    int2 pos = pos_map[vertex_id];
+    KitrPipelineVSOut output;
+    output.texcoord = float2(src_rect[pos.x], src_rect[pos.y]);
+    output.position = float4(dest_rect[pos.x], dest_rect[pos.y], 0.0, 1.0);
+    return output;
+}}
+
+public ConstantBuffer<KittyCustomShaderData> csd;
+uniform Sampler2D backbuffer;
+uniform Sampler2D a;
+uniform Sampler2D b;
+uniform Sampler2D persist;
+uniform int group;
+uniform float4 viewport;
+uniform float animation_progress;
+uniform bool convert_to_srgb;
+uniform uint active_groups;
+uniform uint source_is_srgb;
+uniform float2 viewport_size_pixels;
+
+float3 kitr_linear2srgb(float3 x) {{
+    return lerp(12.92 * x, 1.055 * pow(max(x, float3(0.0)), float3(1.0 / 2.4)) - 0.055, step(float3(0.0031308), x));
+}}
+
+float3 kitr_srgb2linear(float3 x) {{
+    return lerp(x / 12.92, pow((x + 0.055) / 1.055, float3(2.4)), step(float3(0.04045), x));
+}}
+
+[shader("fragment")]
+float4
+fragment_main(float2 texcoord : TEXCOORD) {{
+    float4 sampled = backbuffer.Sample(texcoord);
+    if (source_is_srgb != 0u) sampled = float4(kitr_srgb2linear(sampled.rgb), sampled.a);
+    float safe_alpha = max(sampled.a, 1e-6);
+    float4 color = float4(sampled.rgb / safe_alpha, sampled.a);
+    float2 max_pos = 1.0 - 0.5 / max(viewport_size_pixels, float2(1.0));
+    KittyTextures t = {{
+        {{ backbuffer, float2(1.0), max_pos }},
+        {{ a, float2(1.0), max_pos }},
+        {{ b, float2(1.0), max_pos }},
+        {{ persist, float2(1.0), max_pos }},
+        texcoord,
+        viewport,
+        animation_progress,
+        group,
+    }};
+{dispatcher}    if (convert_to_srgb) color = float4(kitr_linear2srgb(color.rgb), color.a);
+    return float4(color.rgb * color.a, color.a);
+}}
+"#));
+        self.compile_custom_source(name, &combined, &[])
+    }
+
+    fn ensure_custom_types_module(&self, name: &str) -> Result<(), ShaderError> {
+        let types = self.shader_dir.join("custom").join("types.slang");
+        if !types.is_file() {
+            return Err(ShaderError::Io(format!(
+                "missing custom shader types at {}",
+                types.display()
+            )));
+        }
+        std::fs::create_dir_all(&self.cache_dir)
+            .map_err(|error| ShaderError::Io(error.to_string()))?;
+        let output = self
+            .cache_dir
+            .join("kitty_custom_shader_types.slang-module");
+        let mut cmd = Command::new(&self.slangc);
+        cmd.args(["-warnings-as-errors", "all", "-I"])
+            .arg(self.shader_dir.join("custom"))
+            .arg("-I")
+            .arg(&self.shader_dir)
+            .arg("-module-name")
+            .arg("kitty_custom_shader_types")
+            .arg("-o")
+            .arg(&output)
+            .arg("--")
+            .arg(&types);
+        run_slang(&mut cmd, name)
+    }
+
+    fn compile_custom_source(
+        &self,
+        name: &str,
+        source: &str,
+        defines: &[(&str, &str)],
+    ) -> Result<CustomShader, ShaderError> {
+        if !self.slangc.is_file() {
+            return Err(ShaderError::SlangNotFound(self.slangc.clone()));
+        }
+        std::fs::create_dir_all(&self.cache_dir)
+            .map_err(|error| ShaderError::Io(error.to_string()))?;
+        let source_path = self.cache_dir.join(format!("{name}.slang"));
+        std::fs::write(&source_path, source).map_err(|error| ShaderError::Io(error.to_string()))?;
+        let module_path = self.cache_dir.join(format!("{name}.slang-module"));
+        let mut cmd = Command::new(&self.slangc);
+        cmd.args(["-warnings-as-errors", "all"]);
+        for (key, value) in defines {
+            cmd.arg("-D");
+            cmd.arg(format!("{key}={value}"));
+        }
+        cmd.args([
+            "-I",
+            self.cache_dir.to_string_lossy().as_ref(),
+            "-I",
+            self.shader_dir.to_string_lossy().as_ref(),
+            "-I",
+            self.shader_dir.join("custom").to_string_lossy().as_ref(),
+            "-target",
+            "none",
+            "-o",
+            module_path.to_string_lossy().as_ref(),
+            "--",
+            source_path.to_string_lossy().as_ref(),
+        ]);
+        run_slang(&mut cmd, name)?;
+        let mut stages = Vec::new();
+        for (stage, entry) in [("vertex", "vertex_main"), ("fragment", "fragment_main")] {
+            let output = self.cache_dir.join(format!(
+                "{name}.{}.glsl",
+                if stage == "vertex" { "vert" } else { "frag" }
+            ));
+            let mut cmd = Command::new(&self.slangc);
+            cmd.args(["-warnings-as-errors", "all"]);
+            for (key, value) in defines {
+                cmd.arg("-D");
+                cmd.arg(format!("{key}={value}"));
+            }
+            cmd.args([
+                "-I",
+                self.cache_dir.to_string_lossy().as_ref(),
+                "-I",
+                self.shader_dir.to_string_lossy().as_ref(),
+                "-I",
+                self.shader_dir.join("custom").to_string_lossy().as_ref(),
+                module_path.to_string_lossy().as_ref(),
+                "-line-directive-mode",
+                "none",
+                "-target",
+                "glsl",
+                "-profile",
+                "glsl_150",
+                "-entry",
+                entry,
+                "-stage",
+                stage,
+                "-o",
+                output.to_string_lossy().as_ref(),
+            ]);
+            run_slang(&mut cmd, name)?;
+            let source = std::fs::read_to_string(&output)
+                .map_err(|error| ShaderError::Io(error.to_string()))?;
+            stages.push(source);
+        }
+        Ok(CustomShader {
+            name: name.to_owned(),
+            vertex: fixup_custom_glsl(&stages[0], false),
+            fragment: fixup_custom_glsl(&stages[1], true),
+            defines: defines
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        })
+    }
 }
 
 fn run_slang(cmd: &mut Command, name: &str) -> Result<(), ShaderError> {

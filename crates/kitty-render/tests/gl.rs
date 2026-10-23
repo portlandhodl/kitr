@@ -15,7 +15,7 @@ use kitty_render::{
     AtlasConfig, BackgroundImageConfig, BackgroundInstance, BackgroundLayout, BasicColorResolver,
     CellMetrics, ContextConfig, CursorInstance, Damage, Frame, FullRedrawReason, GlyphAtlas,
     GlyphBitmap, GlyphInstance, GlyphKey, GridGeometry, ImageAsset, ImageFilter, ImageInstance,
-    ImageKey, ImageUpload, ImageWrap, InstanceFlags, InstanceGenerator, LineRange, Rect,
+    ImageKey, ImageUpload, ImageWrap, InstanceFlags, InstanceGenerator, LineRange, Rect, Region,
     RenderConfig, RendererCore, Rgba8, TrailInstance,
 };
 use kitty_screen::{CursorShape, Screen};
@@ -1087,14 +1087,69 @@ fn indexed_image_upload_pixels() {
         .render(&frame, &RenderConfig::default())
         .expect("render indexed");
     let pixels = backend.read_pixels().expect("readback");
-    assert_pixel(pixel(&pixels, 32, 8, 8), [255, 0, 0, 255], 1, "index 1");
-    assert_pixel(pixel(&pixels, 32, 24, 8), [0, 255, 0, 255], 1, "index 2");
-    assert_pixel(pixel(&pixels, 32, 8, 24), [0, 0, 255, 255], 1, "index 3");
+    // The indexed-graphics shader performs its own bilinear lookup, so sample
+    // one pixel inside each texel rather than on a texel boundary.
+    assert_pixel(pixel(&pixels, 32, 7, 7), [255, 0, 0, 255], 1, "index 1");
+    assert_pixel(pixel(&pixels, 32, 24, 7), [0, 255, 0, 255], 1, "index 2");
+    assert_pixel(pixel(&pixels, 32, 7, 24), [0, 0, 255, 255], 1, "index 3");
     assert_pixel(
         pixel(&pixels, 32, 24, 24),
         [255, 255, 255, 255],
         1,
         "index 4",
+    );
+}
+
+#[test]
+fn indexed_palette_changes_are_live_without_reupload() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    let key = ImageKey::Protocol(22);
+    let mut palette = kitty_graphics::IndexedPalette::default();
+    let mut entries = *palette.entries();
+    entries[1] = [255, 0, 0, 255];
+    palette = kitty_graphics::IndexedPalette::from_rgba(entries);
+    let upload = ImageUpload::from_indexed(
+        key,
+        1,
+        1,
+        &[1],
+        kitty_graphics::ImageFormat::Indexed,
+        &palette,
+        ImageFilter::Nearest,
+        ImageWrap::Clamp,
+    )
+    .expect("indexed upload");
+    let mut frame = image_frame_with(
+        ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)),
+        upload,
+    );
+    backend.sync_images(&frame).expect("indexed upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render indexed");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 32, 16, 16), [255, 0, 0, 255], 1, "red");
+
+    let mut entries = *palette.entries();
+    entries[1] = [0, 0, 255, 255];
+    let live = kitty_graphics::IndexedPalette::from_rgba(entries);
+    frame.indexed_palette = Some(live.clone());
+    frame.image_uploads[0].palette = Some(live);
+    let synced = backend.sync_images(&frame).expect("sync with live palette");
+    assert_eq!(
+        synced.unchanged, 1,
+        "palette changes must not re-upload indices"
+    );
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("render with live palette");
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(
+        pixel(&pixels, 32, 16, 16),
+        [0, 0, 255, 255],
+        1,
+        "palette is looked up at draw time",
     );
 }
 
@@ -1351,5 +1406,295 @@ fn decoration_and_background_pixels_use_the_real_programs() {
         [200, 100, 50, 255],
         1,
         "decoration",
+    );
+}
+
+#[test]
+fn cell_sprite_array_programs_draw_grid_and_glyph() {
+    let _guard = lock();
+    let mut backend = try_backend!(48, 16);
+    let mut atlas = GlyphAtlas::new(AtlasConfig {
+        page_width: 16,
+        page_height: 16,
+        padding: 1,
+        max_gray_pages: 1,
+        max_rgba_pages: 1,
+        allow_eviction: false,
+    });
+    let key = GlyphKey::new(0, 1, 0);
+    let inserted = atlas
+        .insert(key, GlyphBitmap::gray(2, 2, vec![255; 4]).expect("bitmap"))
+        .expect("insert");
+
+    let mut frame = empty_frame(3, 1, 16.0, 16.0, Rgba8::BLACK);
+    frame.backgrounds.push(BackgroundInstance {
+        rect: Rect::new(0.0, 0.0, 16.0, 16.0),
+        cell_x: 0,
+        cell_y: 0,
+        color: Rgba8::rgb(10, 20, 30),
+        is_default_bg: false,
+        flags: InstanceFlags::default(),
+    });
+    frame.glyphs.push(GlyphInstance {
+        rect: Rect::new(32.0, 0.0, 16.0, 16.0),
+        cell_x: 2,
+        cell_y: 0,
+        fg: Rgba8::rgb(0, 255, 0),
+        sprite: Some(inserted.slot),
+        text: key.text,
+        flags: InstanceFlags::default(),
+    });
+
+    let stats = backend
+        .render_cells_with_atlas(&frame, &RenderConfig::default(), &atlas)
+        .expect("cell render");
+    assert!(stats.cell_programs);
+    assert_eq!(stats.cell_instances, 3);
+    assert_eq!(backend.cell_sprite_count(), 1);
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(
+        pixel(&pixels, 48, 8, 8),
+        [10, 20, 30, 255],
+        1,
+        "cell background",
+    );
+    assert_pixel(
+        pixel(&pixels, 48, 40, 8),
+        [0, 255, 0, 255],
+        1,
+        "cell glyph foreground",
+    );
+    assert_pixel(
+        pixel(&pixels, 48, 24, 8),
+        [0, 0, 0, 255],
+        1,
+        "default background",
+    );
+}
+
+#[test]
+fn background_image_uses_the_bgimage_program() {
+    let _guard = lock();
+    let mut backend = try_backend!(64, 32);
+    let asset = asset_2x2();
+    let frame = background_frame(&asset, BackgroundLayout::Scaled, 64, 32);
+    backend.sync_images(&frame).expect("upload");
+    let stats = backend
+        .render(&frame, &RenderConfig::default())
+        .expect("bgimage render");
+    assert!(stats.background_image_drawn);
+    assert_eq!(stats.bgimage_draws, 1);
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(pixel(&pixels, 64, 8, 8), [255, 0, 0, 255], 1, "bgimage tl");
+    assert_pixel(
+        pixel(&pixels, 64, 56, 24),
+        [255, 255, 255, 255],
+        1,
+        "bgimage br",
+    );
+}
+
+#[test]
+fn screenshot_program_scales_and_no_scaling_reads_back() {
+    let _guard = lock();
+    let mut backend = try_backend!(32, 32);
+    // Four coloured quadrants.
+    let key = ImageKey::Protocol(40);
+    let mut frame = image_frame_with(
+        ImageInstance::new(key, Rect::new(0.0, 0.0, 32.0, 32.0)),
+        image_2x2(key, ImageWrap::Clamp),
+    );
+    frame.damage.full_redraw = true;
+    backend.sync_images(&frame).expect("upload");
+    backend
+        .render(&frame, &RenderConfig::default())
+        .expect("draw");
+
+    let exact = backend
+        .screenshot_region(Region::new(0.0, 0.0, 32.0, 32.0), 0, 0, true)
+        .expect("exact screenshot");
+    assert_eq!((exact.width, exact.height), (32, 32));
+    assert_eq!(&exact.pixels[..4], &[255, 0, 0, 255]);
+
+    let thumb = backend
+        .screenshot_region(Region::new(0.0, 0.0, 32.0, 32.0), 16, 16, false)
+        .expect("scaled screenshot");
+    assert_eq!((thumb.width, thumb.height), (16, 16));
+    assert_eq!(thumb.pixels.len(), 16 * 16 * 4);
+    // The four source quadrants survive the downsample.
+    assert_pixel(
+        pixel(&thumb.pixels, 16, 4, 4),
+        [255, 0, 0, 255],
+        2,
+        "thumb tl",
+    );
+    assert_pixel(
+        pixel(&thumb.pixels, 16, 12, 4),
+        [0, 255, 0, 255],
+        2,
+        "thumb tr",
+    );
+    assert_pixel(
+        pixel(&thumb.pixels, 16, 4, 12),
+        [0, 0, 255, 255],
+        2,
+        "thumb bl",
+    );
+
+    let sub = backend
+        .screenshot_region(Region::new(16.0, 16.0, 32.0, 32.0), 0, 0, true)
+        .expect("sub screenshot");
+    assert_eq!((sub.width, sub.height), (16, 16));
+    assert_eq!(&sub.pixels[..4], &[255, 255, 255, 255]);
+}
+
+#[test]
+fn animated_custom_pipeline_renders_groups() {
+    use kitty_render::{CustomShaderAnimationState, CustomShaderPipeline};
+    let _guard = lock();
+    let compiler = match kitty_render::SlangCompiler::from_env() {
+        Ok(compiler) => compiler,
+        Err(error) => {
+            eprintln!("skipping custom pipeline test: {error}");
+            return;
+        }
+    };
+    let shader_path = compiler.shader_dir.join("custom").join("negative.slang");
+    let Ok(source) = std::fs::read_to_string(&shader_path) else {
+        eprintln!(
+            "skipping custom pipeline test: {} is missing",
+            shader_path.display()
+        );
+        return;
+    };
+    let pipeline =
+        CustomShaderPipeline::parse("negative", "startgroup\nshaders negative\nendgroup")
+            .expect("parse pipeline");
+    let mut backend = try_backend!(16, 16);
+    if let Err(error) = backend.install_custom_pipeline(&compiler, &pipeline, &[vec![source]]) {
+        // Shader compilation depends on the optional slangc installation.
+        eprintln!("skipping custom pipeline test: {error}");
+        return;
+    }
+    assert!(backend.has_custom_pipeline());
+    backend.clear(Rgba8::rgb(255, 0, 0)).expect("clear");
+    let mut state = CustomShaderAnimationState::new(&pipeline);
+    let passes = backend
+        .render_custom_pipeline(&mut state, 0, 0, 500)
+        .expect("pipeline render");
+    assert_eq!(passes, 1);
+    let pixels = backend.read_pixels().expect("readback");
+    assert_pixel(
+        pixel(&pixels, 16, 8, 8),
+        [0, 255, 255, 255],
+        2,
+        "negative pipeline inverts red",
+    );
+}
+
+#[test]
+fn renderer_core_frame_uses_cell_programs_when_selected() {
+    let _guard = lock();
+    let mut screen = Screen::builder(3, 2).scrollback(8).build().expect("screen");
+    screen.draw_text(&[b'a' as u32, b'b' as u32]);
+    let resolver = BasicColorResolver::default();
+    let mut rasterizer = |_key: &GlyphKey| GlyphBitmap::gray(8, 12, vec![0x80; 96]).ok();
+    let config = RenderConfig {
+        metrics: CellMetrics {
+            cell_width: 16.0,
+            cell_height: 16.0,
+            ..CellMetrics::default()
+        },
+        shaped_runs: false,
+        ..RenderConfig::default()
+    };
+    let mut core = RendererCore::new(config.clone(), AtlasConfig::default());
+    let frame = core.prepare_frame(&screen, &mut rasterizer, &resolver);
+    let mut backend = try_backend!(48, 32);
+    let stats = backend
+        .render_cells_with_atlas(&frame, &config, &core.atlas)
+        .expect("cell renderer-core frame");
+    assert!(stats.cell_programs);
+    assert_eq!(stats.cell_instances, 6);
+    assert!(backend.cell_sprite_count() >= 2);
+    let pixels = backend.read_pixels().expect("readback");
+    let background = [
+        frame.default_bg.r,
+        frame.default_bg.g,
+        frame.default_bg.b,
+        255,
+    ];
+    assert!(
+        (0..48 * 32).any(|index| pixels[index * 4..index * 4 + 4] != background),
+        "cell program frame must draw text over the clear colour"
+    );
+}
+
+#[test]
+fn animated_multi_group_pipeline_switches_the_visible_effect() {
+    use kitty_render::{CustomShaderAnimationState, CustomShaderPipeline};
+    let _guard = lock();
+    let compiler = match kitty_render::SlangCompiler::from_env() {
+        Ok(compiler) => compiler,
+        Err(error) => {
+            eprintln!("skipping animated pipeline test: {error}");
+            return;
+        }
+    };
+    let negative_path = compiler.shader_dir.join("custom").join("negative.slang");
+    let Ok(negative) = std::fs::read_to_string(&negative_path) else {
+        eprintln!(
+            "skipping animated pipeline test: {} is missing",
+            negative_path.display()
+        );
+        return;
+    };
+    let green = r#"#language slang 2026
+import kitty_custom_shader_types;
+
+public float4
+fragment_main(float4 color, KittyTextures t, KittyCustomShaderData d) {
+    return float4(0.0, 1.0, 0.0, color.a);
+}
+"#
+    .to_owned();
+    let pipeline = CustomShaderPipeline::parse(
+        "animated",
+        "startgroup\nshaders negative\nendgroup\n\
+         startgroup\nshaders green\nanimation_toggle user:flash\nendgroup",
+    )
+    .expect("parse animated pipeline");
+    let flash = pipeline.user_event_bit("flash");
+    let mut backend = try_backend!(16, 16);
+    if let Err(error) =
+        backend.install_custom_pipeline(&compiler, &pipeline, &[vec![negative], vec![green]])
+    {
+        eprintln!("skipping animated pipeline test: {error}");
+        return;
+    }
+    let mut state = CustomShaderAnimationState::new(&pipeline);
+    backend.clear(Rgba8::rgb(255, 0, 0)).expect("clear");
+    backend
+        .render_custom_pipeline(&mut state, 0, 0, 500)
+        .expect("inactive second group");
+    let pixels = backend.read_pixels().expect("readback negative");
+    assert_pixel(
+        pixel(&pixels, 16, 8, 8),
+        [0, 255, 255, 255],
+        2,
+        "first group inverts",
+    );
+
+    backend.clear(Rgba8::rgb(255, 0, 0)).expect("clear again");
+    backend
+        .render_custom_pipeline(&mut state, flash, 10, 500)
+        .expect("active second group");
+    assert!(state.group_active(&pipeline, 1));
+    let pixels = backend.read_pixels().expect("readback green");
+    assert_pixel(
+        pixel(&pixels, 16, 8, 8),
+        [0, 255, 0, 255],
+        2,
+        "second group replaces the first",
     );
 }

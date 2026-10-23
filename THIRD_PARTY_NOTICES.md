@@ -1,9 +1,8 @@
 # Third-party notices
 
-`kitr` contains no vendored third-party source code. The following third-party
-data, constants and generated tables are reproduced or derived in this
-repository and are covered by their own licenses. The notices below are
-reproduced in full.
+The following third-party data, constants and generated tables are reproduced
+or derived in this repository and are covered by their own licenses. The
+notices below are reproduced in full.
 
 ## Unicode Character Database
 
@@ -56,6 +55,39 @@ Except as contained in this notice, the name of a copyright holder shall
 not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
+```
+
+## xxh3 (XXH3 hash implementation)
+
+Files: `crates/kitty-kittens/src/xxh3.rs` (adapted from redb's copy of the
+`xxh3` crate).
+
+Copyright (c) 2022 Christopher Berner. The implementation is a copy of the
+`xxh3` crate (commit e91f09d1e930e179c11d5cfda6d14284bfb006f8), itself derived
+from xxHash. It is distributed under the MIT License:
+
+```
+MIT License
+
+Copyright (c) 2022 Christopher Berner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ## GLFW

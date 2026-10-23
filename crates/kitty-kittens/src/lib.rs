@@ -41,8 +41,8 @@
 //!   legacy/kitty modes, DCS capability queries, and resize settings/commands.
 //! * [`broadcast`], [`ask`], [`choose_files`], [`choose_fonts`] and
 //!   [`command_palette`]: interactive engines and ANSI UIs.
-//! * [`desktop_ui`]: appearance settings and xdg-desktop-portal installation
-//!   data (the live D-Bus service is not included).
+//! * [`desktop_ui`]: appearance settings, xdg-desktop-portal installation data
+//!   and a live session-bus `Settings`/`FileChooser` portal service.
 //! * [`diff`] and [`pager`]: anchored diff/patch parsing, side-by-side text,
 //!   search/scroll UI and a follow-capable input reader.
 //! * [`dnd`]: OSC 72 drag/drop framing, URI/data-URI parsing and local copy.
@@ -57,9 +57,16 @@
 //!
 //! * No Python runtime is embedded. Python kittens are launched with an
 //!   external interpreter (or directly through their shebang).
-//! * The rsync delta algorithm, image/video previews, syntax highlighting and
-//!   D-Bus portal service are not ported. The transfer engine uses the simple
-//!   stream protocol; the desktop-ui settings/installer still work.
+//! * Image/video previews and syntax highlighting are not ported.
+//! * The transfer engine now supports both simple streams and rsync block
+//!   deltas. Delta mode is only used for regular files above 4 KiB.
+//! * The desktop-ui portal service is live on the session bus. The file chooser
+//!   runs the native `choose-files` kitten; drawing an actual layer-shell panel
+//!   remains the GUI's responsibility.
+//! * The SSH kitten builds and hands off the bootstrap tar through shared
+//!   memory and implements the askpass/TOTP flow. The OpenSSH control-master
+//!   optimisation and remote-control forwarding are represented in the launch
+//!   plan but are not applied by the minimal CLI wrapper.
 //! * Theme ZIP cache downloads and the upstream theme repository are left to
 //!   the caller; local `.conf` theme directories are supported.
 //! * No remote-control socket server is started. `kitten @` arguments are
@@ -110,7 +117,9 @@ mod regex_lite;
 pub mod remote;
 pub mod remote_file;
 pub mod resize_window;
+pub mod rsync;
 pub mod shell_integration;
+pub mod shm;
 pub mod show_key;
 pub mod ssh;
 pub mod terminal;
@@ -120,6 +129,7 @@ pub mod tui;
 pub mod unicode_input;
 pub mod unicode_input_ui;
 mod unicode_table;
+mod xxh3;
 
 pub use cli::{
     execute_args, execute_command, parse_kitten_command, AtInvocation, CommandAction,
@@ -131,6 +141,9 @@ pub use clipboard::{
     run_clipboard_cli, ClipboardAction, ClipboardAction as ClipboardMode, ClipboardError,
     ClipboardOptions, ClipboardTarget, CLIPBOARD_USAGE,
     DEFAULT_CHUNK_SIZE as CLIPBOARD_DEFAULT_CHUNK_SIZE,
+};
+pub use desktop_ui::{
+    serve_portal, ChooserLauncher, FileChooserRequest, FileChooserResult, PortalConfig,
 };
 pub use discovery::{
     validate_name, BuiltinKitten, DiscoveryConfig, DiscoveryDiagnostic, KittenEntry,
@@ -160,6 +173,7 @@ pub use notify::{
     run_notify_cli, Notification, NotificationFallback, NotificationReply, NotifyError,
     NotifyOptions, NotifyOutcome, ReplyAction, ReplyTracker, Urgency, NOTIFY_USAGE,
 };
+pub use panel::{build_panel_launch, PanelLaunch};
 pub use protocol::{
     dispatch_event, encode_kitten_result, encode_overlay, encode_overlay_ready, encode_print,
     encode_remote_command, encode_remote_command_value, encode_title, parse_dcs_payload,
@@ -167,14 +181,29 @@ pub use protocol::{
     CMD_PREFIX, DCS_START, KITTEN_RESULT_PREFIX, OVERLAY_PREFIX, OVERLAY_READY_PREFIX,
     PRINT_PREFIX, TITLE_PREFIX,
 };
+pub use quick_access_terminal::{build_quick_access_launch, QuickAccessLaunch};
 pub use remote::{
     build_request, parse_remote_args, run_remote, run_remote_options, RemoteError, RemoteOptions,
     REMOTE_USAGE,
+};
+pub use remote_file::{
+    get_editor, handle_remote_file_action, CommandOutput, CommandRunner, CommandSpec, SystemRunner,
+};
+pub use rsync::{
+    apply_delta, apply_delta_with_block_size, create_delta, create_signature, parse_signature,
+    BlockHash, Signature,
 };
 pub use shell_integration::{
     as_fish_str_literal, as_str_literal, discover_shell_integration_dir,
     discover_shell_integration_dir_from, install_snippets, serialize_env, serialize_env_for_path,
     shell_integration_snippet, Shell, ShellHandoff, ShellIntegration, ShellIntegrationOptions,
+};
+pub use shm::SharedMemory;
+pub use ssh::{
+    askpass_response, build_bootstrap_plan, build_bootstrap_plan_with_options,
+    create_bootstrap_data_shm, encode_ssh_data_request, make_bootstrap_tar, perform_askpass,
+    prepare_ssh_session, run_askpass_cli, AskpassHost, AskpassRequest, BootstrapOptions,
+    BootstrapPlan, BootstrapResources, SshSessionPlan, TtyAskpassHost,
 };
 pub use terminal::{
     InteractiveTransport, ScriptedTransport, StdioTransport, DEFAULT_REPLY_TIMEOUT,

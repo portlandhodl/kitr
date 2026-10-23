@@ -19,10 +19,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const PARENT_DEPTH_LIMIT: usize = 8;
 
 /// Identity of a placement within an image.
+///
+/// Protocol placement id zero is not unique: the graphics protocol explicitly
+/// allows several placements of the same image to omit `p`. Such placements
+/// get a non-zero `instance` here so the graph keeps them distinct, while the
+/// publicly visible `placement_id` stays zero. Non-zero protocol ids always use
+/// `instance == 0`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PlacementKey {
     pub image_id: u32,
     pub placement_id: u32,
+    pub instance: u32,
 }
 
 impl PlacementKey {
@@ -30,11 +37,21 @@ impl PlacementKey {
         Self {
             image_id,
             placement_id,
+            instance: 0,
         }
     }
 
+    /// Give an otherwise anonymous (`p=0`) placement a per-image identity.
+    pub const fn with_instance(mut self, instance: u32) -> Self {
+        self.instance = instance;
+        self
+    }
+
     pub const fn parented(self, parent_id: u32, parent_placement_id: u32) -> bool {
-        parent_id != 0 && !(parent_id == self.image_id && parent_placement_id == self.placement_id)
+        parent_id != 0
+            && !(parent_id == self.image_id
+                && parent_placement_id == self.placement_id
+                && parent_placement_id != 0)
     }
 }
 
@@ -257,6 +274,7 @@ impl PlacementGraph {
         if record.has_parent()
             && (record.virtual_placement
                 || (record.parent_id == record.key.image_id
+                    && record.parent_placement_id != 0
                     && record.parent_placement_id == record.key.placement_id))
         {
             return Err(PlacementError::Invalid(record.key));
@@ -291,6 +309,7 @@ impl PlacementGraph {
             return Ok(None);
         }
         if record.parent_id == record.key.image_id
+            && record.parent_placement_id != 0
             && record.parent_placement_id == record.key.placement_id
         {
             return Err(PlacementError::Invalid(record.key));
@@ -423,9 +442,18 @@ impl PlacementGraph {
                 .records
                 .values()
                 .filter(|record| {
-                    record.parent_id == parent.image_id
-                        && (record.parent_placement_id == parent.placement_id
-                            || (record.parent_placement_id == 0 && first == Some(parent)))
+                    if record.parent_id != parent.image_id {
+                        return false;
+                    }
+                    if record.parent_placement_id != 0 {
+                        // An explicit `Q` names a placement with a non-zero
+                        // protocol id, which never carries an instance.
+                        PlacementKey::new(record.parent_id, record.parent_placement_id) == parent
+                    } else {
+                        // `Q=0` (or no `Q`) names the first placement of the
+                        // parent image at put time.
+                        first == Some(parent)
+                    }
                 })
                 .map(|record| record.key)
                 .collect();
@@ -576,6 +604,42 @@ mod tests {
         assert_eq!(
             removed,
             vec![PlacementKey::new(1, 1), PlacementKey::new(2, 1)]
+        );
+    }
+
+    #[test]
+    fn anonymous_placements_keep_distinct_instances() {
+        let first = PlacementRecord::new(PlacementKey::new(1, 0).with_instance(1), 2, 3);
+        let second = PlacementRecord::new(PlacementKey::new(1, 0).with_instance(2), 7, 8);
+        let child = record(2, 1, 0, 0).with_parent(1, 0);
+        let mut graph = PlacementGraph::from_records([first, second, child]);
+        assert_eq!(
+            graph
+                .resolve(PlacementKey::new(1, 0).with_instance(1))
+                .unwrap()
+                .anchor_x,
+            2
+        );
+        assert_eq!(
+            graph
+                .resolve(PlacementKey::new(1, 0).with_instance(2))
+                .unwrap()
+                .anchor_x,
+            7
+        );
+        // Q=0 always names the first placement, so deleting a later anonymous
+        // placement must not take the child with it.
+        assert_eq!(
+            graph.remove_cascade(PlacementKey::new(1, 0).with_instance(2)),
+            vec![PlacementKey::new(1, 0).with_instance(2)]
+        );
+        assert!(graph.get(PlacementKey::new(2, 1)).is_some());
+        assert_eq!(
+            graph.remove_cascade(PlacementKey::new(1, 0).with_instance(1)),
+            vec![
+                PlacementKey::new(1, 0).with_instance(1),
+                PlacementKey::new(2, 1)
+            ]
         );
     }
 

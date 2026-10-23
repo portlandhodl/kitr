@@ -1115,7 +1115,7 @@ pub fn collect_protocol_images_with_palette(
         if placement.placement.unicode_placement {
             continue;
         }
-        let key = PlacementKey::new(placement.image_id, placement.placement_id);
+        let key = placement.graph_key();
         let Some(resolved) = resolved.get(&key) else {
             // Broken, cyclic, over-deep or self-referential relative chain.
             continue;

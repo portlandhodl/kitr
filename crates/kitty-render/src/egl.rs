@@ -260,6 +260,7 @@ pub const GL_RG8UI: u32 = 0x8238;
 pub const GL_RED_INTEGER: u32 = 0x8D94;
 pub const GL_RG_INTEGER: u32 = 0x8D98;
 pub const GL_RGBA8: u32 = 0x8058;
+pub const GL_RGBA16F: u32 = 0x881A;
 pub const GL_UNSIGNED_BYTE: u32 = 0x1401;
 pub const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 pub const GL_PACK_ALIGNMENT: u32 = 0x0D05;
@@ -280,6 +281,23 @@ pub const GL_COMPILE_STATUS: u32 = 0x8B81;
 pub const GL_LINK_STATUS: u32 = 0x8B82;
 pub const GL_INFO_LOG_LENGTH: u32 = 0x8B84;
 pub const GL_MAX_TEXTURE_SIZE: u32 = 0x0D33;
+pub const GL_MAX_ARRAY_TEXTURE_LAYERS: u32 = 0x88FF;
+
+pub const GL_TEXTURE_2D_ARRAY: u32 = 0x8C1A;
+pub const GL_TEXTURE_WRAP_R: u32 = 0x8072;
+pub const GL_TEXTURE_BORDER_COLOR: u32 = 0x1004;
+pub const GL_CLAMP_TO_BORDER: u32 = 0x812D;
+pub const GL_SRGB8_ALPHA8: u32 = 0x8C43;
+pub const GL_R32UI: u32 = 0x8236;
+pub const GL_UNSIGNED_INT: u32 = 0x1405;
+
+pub const GL_FRAMEBUFFER: u32 = 0x8D40;
+pub const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
+pub const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+pub const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+pub const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+pub const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+pub const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 
 // }}}
 // {{{ GL errors
@@ -405,6 +423,7 @@ gl_fns! {
     glDeleteBuffers: unsafe extern "C" fn(i32, *const u32) = "glDeleteBuffers",
     glEnableVertexAttribArray: unsafe extern "C" fn(u32) = "glEnableVertexAttribArray",
     glVertexAttribPointer: unsafe extern "C" fn(u32, i32, u32, u8, i32, *const c_void) = "glVertexAttribPointer",
+    glVertexAttribIPointer: unsafe extern "C" fn(u32, i32, u32, i32, *const c_void) = "glVertexAttribIPointer",
     glVertexAttribDivisor: unsafe extern "C" fn(u32, u32) = "glVertexAttribDivisor",
     glDrawArrays: unsafe extern "C" fn(u32, i32, i32) = "glDrawArrays",
     glDrawArraysInstanced: unsafe extern "C" fn(u32, i32, i32, i32) = "glDrawArraysInstanced",
@@ -433,6 +452,16 @@ gl_fns! {
     glBindBufferBase: unsafe extern "C" fn(u32, u32, u32) = "glBindBufferBase",
     glGetUniformBlockIndex: unsafe extern "C" fn(u32, *const c_char) -> u32 = "glGetUniformBlockIndex",
     glUniformBlockBinding: unsafe extern "C" fn(u32, u32, u32) = "glUniformBlockBinding",
+    glTexImage3D: unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, i32, u32, u32, *const c_void) = "glTexImage3D",
+    glTexSubImage3D: unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, i32, i32, u32, u32, *const c_void) = "glTexSubImage3D",
+    glCopyTexImage2D: unsafe extern "C" fn(u32, i32, u32, i32, i32, i32, i32, i32) = "glCopyTexImage2D",
+    glCopyTexSubImage2D: unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, i32, i32) = "glCopyTexSubImage2D",
+    glGenFramebuffers: unsafe extern "C" fn(i32, *mut u32) = "glGenFramebuffers",
+    glBindFramebuffer: unsafe extern "C" fn(u32, u32) = "glBindFramebuffer",
+    glDeleteFramebuffers: unsafe extern "C" fn(i32, *const u32) = "glDeleteFramebuffers",
+    glFramebufferTexture2D: unsafe extern "C" fn(u32, u32, u32, u32, i32) = "glFramebufferTexture2D",
+    glFramebufferTextureLayer: unsafe extern "C" fn(u32, u32, u32, i32, i32) = "glFramebufferTextureLayer",
+    glCheckFramebufferStatus: unsafe extern "C" fn(u32) -> u32 = "glCheckFramebufferStatus",
 }
 
 /// An entry point missing from `eglGetProcAddress`.

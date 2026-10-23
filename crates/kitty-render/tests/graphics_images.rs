@@ -81,6 +81,26 @@ fn indexed_image_keeps_indices_and_carries_the_live_palette() {
 }
 
 #[test]
+fn anonymous_placements_render_at_each_their_own_anchor() {
+    let mut screen = make_screen();
+    transmit(&mut screen, "a=t,f=32,i=1,s=1,v=1", vec![255, 0, 0, 255]);
+    screen.cursor_position(1, 1);
+    put(&mut screen, "a=p,i=1,c=1,r=1,C=1");
+    screen.cursor_position(3, 4);
+    put(&mut screen, "a=p,i=1,c=1,r=1,C=1");
+    let palette = IndexedPalette::default();
+    let (instances, uploads) = collect(&screen, &palette);
+    assert_eq!(instances.len(), 2);
+    assert_eq!(uploads.len(), 1, "placements share one image upload");
+    let mut anchors: Vec<(f32, f32)> = instances
+        .iter()
+        .map(|instance| (instance.rect.x, instance.rect.y))
+        .collect();
+    anchors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(anchors, vec![(0.0, 0.0), (30.0, 20.0)]);
+}
+
+#[test]
 fn relative_child_uses_parent_anchor_offsets_z_and_source() {
     let mut screen = make_screen();
     transmit(

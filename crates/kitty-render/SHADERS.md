@@ -70,7 +70,7 @@ lookups.
 
 ## Backend wiring
 
-Currently drawn with the real generated programs:
+Drawn with the real generated programs:
 
 | frame data | program |
 | --- | --- |
@@ -78,25 +78,74 @@ Currently drawn with the real generated programs:
 | rounded cursor rectangles | `rounded_rect` |
 | Gray8 glyphs | `graphics.alpha_mask` |
 | RGBA glyphs | `graphics` |
-| protocol/background/logo images | `graphics` (+ `tint` for background tint) |
+| protocol/logo images | `graphics`, `indexed_graphics` for integer textures |
+| background images (opaque, representable layouts) | `bgimage` (+ `tint` for tint) |
 | cursor trail | `trail` |
-| indexed image uploads without a palette | `indexed_graphics` |
+| fixed-cell grid (`set_cell_programs(true)`) | `cell`, `cell_bg`, `cell_fg` |
+| linear offscreen layer → window | `blit` |
+| scaled screenshots | `screenshot` |
+| custom post-processing groups | compiled `CUSTOM_END_PROGRAM`-style pipeline |
 
-Compiled, reflected and available, but not selected by the current `Frame`
-adapter:
+### Cell programs and the sprite array
 
-* the full `cell`/`cell_fg`/`cell_bg` vertex + UBO path, because the CPU atlas
-  packs arbitrary glyph rectangles into 2D pages instead of kitty's fixed-cell
-  `GL_TEXTURE_2D_ARRAY` sprite grid with its decorations map;
-* `border` and `padding`, because window borders and padding are emitted as
-  ordinary solid instances instead of the cell UBO/sprite stream;
-* `bgimage`, because background images use the explicit UV quad path (which
-  also supports the source rectangle and tint semantics of `ImageInstance`);
-* `blit`/`screenshot`, which need offscreen targets the current public frame
-  API does not expose;
-* kitty's multi-group animated custom-shader pipeline. `SlangCompiler` and
-  `GlBackend::install_custom_shader*` compile and link a user shader; applying
-  it as a post-process group is not wired.
+The CPU atlas keeps its arbitrary-rectangle shelf packing. When cell programs
+are enabled, `cell.rs` adapts it to kitty's GPU representation:
+
+* every distinct atlas slot is copied into a `cell_width` × `cell_height + 1`
+  tile in a `GL_TEXTURE_2D_ARRAY`, indexed from 1 (index 0 is the empty sprite);
+* a `GL_R32UI` decorations map gets one zero entry per sprite index; the
+  existing decoration rectangles keep using the ordinary solid path;
+* per-cell `colors`, `sprite_idx` and `is_selected` packed instance buffers feed
+  the preserved attribute locations 0/1/2;
+* `CellRenderData` is uploaded to binding 0 and the existing 272-entry
+  `ColorTable` to binding 1, with kitty's std140 layout;
+* the grid is rendered into an `RGBA16F` linear target and copied to the window
+  through `blit`, which performs kitty's `linear2srgb` conversion.
+
+Call `backend.set_cell_programs(true)` (or `render_cells_with_atlas`). Frames
+that are not an origin-aligned plain grid, or that contain multi-cell glyphs,
+fall back to the graphics path so shaped runs and wide characters remain
+correct. `RenderStats::cell_programs` / `cell_instances` report the selection.
+
+### Background images
+
+`bgimage` is used for opaque backgrounds whose clipped source starts at UV
+`(0, 0)` (tiling, mirrored, clamped, scaled and centred layouts). Its
+`tiled`/`sizes`/`positions` inputs are derived from the background quad.
+Transparent backgrounds (`opacity < 1`) and layouts that were clipped in both
+axes keep the explicit UV quad path, because `bgimage.slang` has no separate
+opacity input.
+
+### Blit and screenshot
+
+`GlBackend::blit_texture` runs `blit` for an arbitrary resident 2D texture.
+`screenshot_region`/`take_screenshot` capture the current framebuffer and either
+read it back 1:1 or let the `screenshot` program perform the
+colour-space-correct downsample into an offscreen target. Both return top-down
+RGBA8, matching `read_pixels`.
+
+### Custom shader pipelines
+
+`custom_shader.rs` ports kitty's pipeline definition, `.pipeline` parser and
+animation state machine (start/toggle/stop events, durations, reverse, loops,
+attach and per-group progress). `SlangCompiler::compile_custom_pipeline`
+combines each group's shader sources, renames their `fragment_main` entry
+points, injects a group dispatcher and compiles one program per pipeline.
+
+`GlBackend::install_custom_pipeline` installs it; `render_custom_pipeline`
+captures the backbuffer, runs active groups in order through ping-pong and
+named (`a`, `b`, `persist`) RGBA targets, and draws the last active group's
+linear output to the window with sRGB conversion. The wrapper converts the
+initial sRGB backbuffer to linear and keeps intermediate targets linear.
+
+Still deferred:
+
+* `border` and `padding`, because chrome is emitted as ordinary solid
+  instances rather than the cell UBO/sprite stream;
+* the full `KittyCustomShaderData` payload and `pointer_map()` remapping (the
+  pipeline uniform block is allocated and bound, but not populated);
+* per-window background-image lists and image transforms beyond source-rect
+  scaling.
 
 Indexed protocol images with a live palette are currently expanded through that
 palette on the CPU before upload, preserving the existing pixel tests; the
@@ -108,9 +157,11 @@ integer-texture path is used for uploads that do not carry a palette.
 
 * compilation/linking of all 40 generated variants and all 16 logical programs;
 * uniform, attribute and UBO reflection;
-* background, decoration, glyph, image, rounded-cursor, trail and indexed-image
-  pixel tests;
-* the custom Slang shader compile + link path.
+* background, decoration, glyph, image, rounded-cursor, trail, indexed-image,
+  cell sprite-array, `bgimage`, `blit`/`screenshot` and custom pipeline pixel
+  tests;
+* the custom Slang shader compile + link path and animation timing/state tests
+  in the CPU-only build.
 
 The C-kitty screenshot corpus (`scripts/screenshot_parity.py`) continues to
 cover cell/background/decoration/graphics cases through the same frame API.

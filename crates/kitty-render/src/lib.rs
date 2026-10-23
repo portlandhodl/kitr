@@ -103,8 +103,8 @@
 //!   EGL window context.
 //!
 //! The GLSL is checked in under `src/shaders/generated` so a normal build does
-//! not need `slangc`; `SHADERS.md` records which programs the backend currently
-//! drives and which generated variants are deferred.
+//! not need `slangc`; `SHADERS.md` records how each program in kitty's
+//! catalogue is driven.
 //!
 //! ```text
 //! cargo test -p kitty-render                    # CPU only, no EGL linked
@@ -139,8 +139,12 @@
 //!   they do not alter text extraction.
 //! * Tab-bar scrolling, vertical tab bars, tab-bar margins/edge colours beyond
 //!   the simple [`TabBarSpec`] geometry, and tab icons/close buttons.
-//! * Custom user shaders are compiled and linked, but kitty's animated
-//!   multi-group post-processing pipeline is not driven by frames yet.
+//! * Custom user shaders and animated multi-group pipelines are compiled,
+//!   linked and run as full-screen post-processing passes. The pipeline model
+//!   and animation state machine live in [`custom_shader`]; the GL backend
+//!   provides `GlBackend::install_custom_pipeline` and
+//!   `GlBackend::render_custom_pipeline`. Pointer remapping and the full
+//!   `KittyCustomShaderData` payload are not populated yet.
 //! * Shaped runs are limited to at most [`SHAPED_RUN_MAX_CELLS`] contiguous
 //!   single-width cells with the same style, foreground, background and
 //!   hyperlink, and to 24 codepoints per key. Selected/hovered runs, wide
@@ -163,8 +167,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod atlas;
+pub mod cell;
 pub mod colors;
 pub mod core;
+pub mod custom_shader;
 pub mod damage;
 pub mod decorations;
 pub mod font_rasterizer;
@@ -188,6 +194,7 @@ pub use atlas::{
     GlyphAtlas, GlyphBitmap, GlyphKey, GlyphRasterizer, GlyphSlot, GlyphText, UvRect,
     MAX_GLYPH_CODEPOINTS,
 };
+pub use cell::{build_cell_sprites, CellGrid, CellRecord, CellSpriteData, SpriteKey};
 pub use colors::{
     build_gamma_lut, contrast_ratio, decode_color, dimmed_color, encode_indexed, encode_rgb,
     encode_special, gamma_lut, gamma_lut_lookup, indexed_image_palette, kitty_default_palette,
@@ -195,6 +202,16 @@ pub use colors::{
     ColorResolver, Rgba8, KITTY_DEFAULT_ANSI_COLORS,
 };
 pub use core::RendererCore;
+pub use custom_shader::{
+    CustomShaderAnimationState, CustomShaderError, CustomShaderGroup, CustomShaderPipeline,
+    NamedTexture, ShaderEventMask, ShaderGroupAnimState, SHADER_ANIM_EVENT_BELL_IN_WINDOW,
+    SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE, SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP,
+    SHADER_ANIM_EVENT_OS_WINDOW_FOCUS_IN, SHADER_ANIM_EVENT_OS_WINDOW_FOCUS_OUT,
+    SHADER_ANIM_EVENT_POINTER_LEFT_BUTTON_PRESS, SHADER_ANIM_EVENT_TAB_CHANGE,
+    SHADER_ANIM_EVENT_USER_ACTIVITY, SHADER_ANIM_EVENT_USER_IDLE,
+    SHADER_ANIM_EVENT_WINDOW_FOCUS_IN, SHADER_ANIM_EVENT_WINDOW_FOCUS_OUT,
+    SHADER_ANIM_FIRST_USER_EVENT,
+};
 pub use damage::{coalesce_lines, CursorState, Damage, DamageTracker, FullRedrawReason, LineRange};
 pub use decorations::{
     add_borders, background_rect, beam_cursor_rect, curly_underline_mask, dashed_underline_mask,
@@ -240,5 +257,5 @@ pub use egl::{ContextConfig, EglError, GlApi, GlContext, GlError, GlFns, GlVersi
 #[cfg(feature = "gl")]
 pub use gl_backend::{
     validate_all_shader_variants, validate_builtin_programs, AtlasSyncStats, FilterMode, GammaMode,
-    GlBackend, GlBackendConfig, GlBackendError, ImageSyncStats, RenderStats,
+    GlBackend, GlBackendConfig, GlBackendError, ImageSyncStats, RenderStats, Screenshot,
 };

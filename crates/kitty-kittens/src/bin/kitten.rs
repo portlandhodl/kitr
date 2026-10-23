@@ -188,8 +188,8 @@ fn run_native_transfer(args: &[String]) -> Result<ExitCode, String> {
 
 fn run_native_ssh(args: &[String]) -> Result<ExitCode, String> {
     use kitty_kittens::ssh;
-    let (config, passthrough) = ssh::parse_ssh_cli(args).map_err(io_error)?;
-    if config.hostname == "__help__" {
+    let (cli_config, passthrough) = ssh::parse_ssh_cli(args).map_err(io_error)?;
+    if cli_config.hostname == "__help__" {
         println!("{}", ssh::SSH_USAGE);
         return Ok(ExitCode::SUCCESS);
     }
@@ -197,10 +197,58 @@ fn run_native_ssh(args: &[String]) -> Result<ExitCode, String> {
         println!("{}", ssh::SSH_USAGE);
         return Ok(ExitCode::SUCCESS);
     }
-    let mut argv = vec!["ssh".to_owned()];
-    argv.extend(passthrough);
-    let status = ssh::run_ssh_command(argv, std::env::vars().collect()).map_err(io_error)?;
-    Ok(if status == 0 {
+    let (ssh_args, server_args, raw_passthrough, _) =
+        ssh::parse_ssh_args(&passthrough, &["--kitten"]).map_err(io_error)?;
+    if raw_passthrough || server_args.is_empty() {
+        let mut argv = vec!["ssh".to_owned()];
+        argv.extend(passthrough);
+        let status = ssh::run_ssh_command(argv, std::env::vars().collect()).map_err(io_error)?;
+        return Ok(if status == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+    let destination = &server_args[0];
+    let data = ssh::connection_data(&[vec!["ssh".to_owned()], passthrough.clone()].concat());
+    let (username, hostname) = data
+        .map(|data| {
+            let (user, host) = data
+                .hostname
+                .split_once('@')
+                .map_or(("", data.hostname.as_str()), |(user, host)| (user, host));
+            (user.to_owned(), host.to_owned())
+        })
+        .unwrap_or_else(|| (String::new(), destination.clone()));
+    let mut host = ssh::load_ssh_config().for_host(&hostname, &username);
+    host.copy.extend(cli_config.copy.clone());
+    host.env.extend(cli_config.env.clone());
+    if cli_config.delegate != ssh::SshHostConfig::new().delegate {
+        host.delegate = cli_config.delegate.clone();
+    }
+    if cli_config.askpass != ssh::SshHostConfig::new().askpass {
+        host.askpass = cli_config.askpass.clone();
+    }
+    let options = ssh::BootstrapOptions::default();
+    let plan = ssh::prepare_ssh_session(
+        &host,
+        &ssh_args,
+        &server_args,
+        &std::collections::BTreeMap::new(),
+        &options,
+        &|key| std::env::var(key).ok(),
+    )
+    .map_err(io_error)?;
+    let Some(program) = plan.ssh_command.first() else {
+        return Err("empty ssh command".to_owned());
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(&plan.ssh_command[1..]);
+    for (key, value) in &plan.environment {
+        command.env(key, value);
+    }
+    let status = command.status().map_err(io_error)?;
+    Ok(if status.success() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -688,6 +736,14 @@ fn run_native(name: &str, args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn real_main(args: Vec<String>) -> Result<ExitCode, String> {
+    if std::env::var("KITTY_KITTEN_RUN_MODULE").as_deref() == Ok("ssh_askpass") {
+        let code = kitty_kittens::ssh::run_askpass_cli();
+        return Ok(if code == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(code as u8)
+        });
+    }
     if let Some((name, rest)) = native_invocation(&args) {
         return run_native(name, rest);
     }

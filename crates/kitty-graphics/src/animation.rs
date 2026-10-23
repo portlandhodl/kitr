@@ -74,6 +74,13 @@ impl FrameBlob {
             Self::Disk { path, .. } => std::fs::read(path).ok().map(Arc::new),
         }
     }
+
+    /// Remove a spilled frame from the private cache directory.
+    fn remove_file(&self) {
+        if let Self::Disk { path, .. } = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Storage for one animation frame.
@@ -100,6 +107,15 @@ struct DeltaPatch {
     blend: bool,
 }
 
+impl FrameStorage {
+    fn remove_files(&self) {
+        match self {
+            Self::Key(blob) => blob.remove_file(),
+            Self::Delta { patch, .. } => patch.rgba.remove_file(),
+        }
+    }
+}
+
 /// One animation frame.
 ///
 /// Frame pixel data is not stored inline: use [`AnimatedImage::frame_data`] or
@@ -122,6 +138,10 @@ impl AnimationFrame {
             FrameStorage::Key(data) => data.len(),
             FrameStorage::Delta { patch, .. } => patch.rgba.len() + 32,
         }
+    }
+
+    fn remove_files(&self) {
+        self.storage.remove_files();
     }
 
     pub fn is_keyframe(&self) -> bool {
@@ -289,7 +309,11 @@ impl AnimatedImage {
         let Some(data) = self.reconstruct_index(index, &mut Vec::new(), 0) else {
             return false;
         };
-        self.frames[index].storage = FrameStorage::Key(FrameBlob::Memory(data));
+        let old = std::mem::replace(
+            &mut self.frames[index].storage,
+            FrameStorage::Key(FrameBlob::Memory(data)),
+        );
+        old.remove_files();
         true
     }
 
@@ -597,7 +621,11 @@ impl AnimationManager {
                 continue;
             }
             if remove_image {
-                self.images.remove(&id);
+                if let Some(image) = self.images.remove(&id) {
+                    for frame in &image.frames {
+                        frame.remove_files();
+                    }
+                }
                 self.evicted_images += 1;
                 self.recompute_total();
                 return true;
@@ -623,7 +651,8 @@ impl AnimationManager {
                 continue;
             }
             let removed_gap = image.frames[index].gap_ms;
-            image.frames.remove(index);
+            let removed = image.frames.remove(index);
+            removed.remove_files();
             image.animation_duration_ms = image
                 .animation_duration_ms
                 .saturating_sub(u64::from(removed_gap));
@@ -683,7 +712,11 @@ impl AnimationManager {
             ));
         }
         let required = rgba.len();
-        self.images.remove(&id);
+        if let Some(old) = self.images.remove(&id) {
+            for frame in &old.frames {
+                frame.remove_files();
+            }
+        }
         self.recompute_total();
         if !self.make_room(required, id, None) {
             return Err(animation_error(
@@ -740,11 +773,14 @@ impl AnimationManager {
     }
 
     pub fn remove_image(&mut self, id: u32) -> bool {
-        let removed = self.images.remove(&id).is_some();
-        if removed {
+        let removed = self.images.remove(&id);
+        if let Some(image) = &removed {
+            for frame in &image.frames {
+                frame.remove_files();
+            }
             self.recompute_total();
         }
-        removed
+        removed.is_some()
     }
 
     /// Resolve an image by client id or image number.
@@ -783,7 +819,8 @@ impl AnimationManager {
             }
         }
         let removed_gap = image.frames[index].gap_ms;
-        image.frames.remove(index);
+        let removed = image.frames.remove(index);
+        removed.remove_files();
         image.animation_duration_ms = image
             .animation_duration_ms
             .saturating_sub(u64::from(removed_gap));
@@ -1049,7 +1086,8 @@ impl AnimationManager {
                 None
             };
             let frame = &mut image.frames[index];
-            frame.storage = edited_storage;
+            let old = std::mem::replace(&mut frame.storage, edited_storage);
+            old.remove_files();
             frame.transient |= transient;
             if let Some(gap) = gap {
                 let old_gap = frame.gap_ms;
@@ -1351,7 +1389,8 @@ impl AnimationManager {
             .frame_index_for_id(destination_id)
             .ok_or_else(|| animation_error("ENOENT", "Destination frame was evicted"))?;
         let frame = &mut image.frames[index];
-        frame.storage = composed_storage;
+        let old = std::mem::replace(&mut frame.storage, composed_storage);
+        old.remove_files();
         frame.transient |= transient;
         let redraw = index == image.current_frame_index;
         self.recompute_total();
@@ -1898,6 +1937,39 @@ mod tests {
             !cache_dir.exists(),
             "cache directory must be removed on exit"
         );
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn disk_cache_removes_deleted_and_replaced_frame_files() {
+        let root_dir =
+            std::env::temp_dir().join(format!("kitr-animation-delete-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let mut manager = AnimationManager::new_with_disk_cache(&root_dir).unwrap();
+        let cache_dir = manager.disk_cache_dir().unwrap().to_path_buf();
+        manager.insert_root(&root(1, 1, 1, [0, 0, 0, 255])).unwrap();
+        manager
+            .feed(
+                &simple_frame(1, 2, [1, 0, 0, 255]),
+                &ImageLimits::default(),
+                0,
+            )
+            .unwrap();
+        manager
+            .feed(
+                &simple_frame(1, 3, [2, 0, 0, 255]),
+                &ImageLimits::default(),
+                0,
+            )
+            .unwrap();
+        let files = || std::fs::read_dir(&cache_dir).unwrap().count();
+        assert_eq!(files(), 3, "root plus two delta patches are on disk");
+        assert!(manager.delete_frame(1, 2));
+        assert_eq!(files(), 2, "deleted frame file is unlinked");
+        assert!(manager.remove_image(1));
+        assert_eq!(files(), 0, "removing the image unlinks all frame files");
+        drop(manager);
+        assert!(!cache_dir.exists());
         let _ = std::fs::remove_dir_all(&root_dir);
     }
 

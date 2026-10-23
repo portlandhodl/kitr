@@ -32,7 +32,7 @@ it is marked **ported** in [PORTING.md](PORTING.md).
 | `kitty-graphics` | `graphics.c`, `png-reader.c`, `mime-cache.c`, graphics parser | PNG decode, MIME, base64, graphics command parser and image pipeline; Screen/GPU integration pending |
 | `kitty-remote` | `crypto.c`, `remote_control.py`, `client.py`, `rc/*` | X25519/ECDH, AES-256-GCM, framing, JSON, Unix-socket server + client, command dispatch, file-copy primitives |
 | `kitty-render` | `gl.c`, `shaders.c`, `decorations.c`, `glyph-cache.c` | EGL/GL backend: real Slang programs generated from `kitty/shaders`, variants/defines/reflection/custom shaders, damage, atlas, instances, decorations, images/backgrounds/logo/trail, overlays, shaped ligature sprites; fixed-cell sprite-array path pending |
-| `kitty-kittens` | `kittens.c`, Python/Go kittens | discovery, launch planning, DCS host, shell handoff; kitten programs/runtime pending |
+| `kitty-kittens` | `kittens.c`, Python/Go kittens | discovery, launch planning, DCS host, shell handoff; native kitten engines for transfer (simple + rsync), SSH bootstrap/askpass, desktop portal, panel/QAT launch and remote-file actions |
 | `kitty-ui` | `tabs.py`, `window.py`, `layout/*`, `session.py` | tabs/windows/layout/session model, wired into the GUI |
 | `kitty-window` | GLFW window/event layer | Linux X11 + Wayland: events, XKB keys, XIM/Wayland IME, mouse, XDND drag-and-drop, INCR clipboard, EGL, HiDPI; Cocoa/touch pending |
 | `kitty` (binary) | `main.py`, launcher | headless and X11 GUI terminal: tabs, splits, sessions, remote control, kitten launch |

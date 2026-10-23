@@ -11,6 +11,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -292,6 +294,60 @@ pub fn parse_copy_instruction(
     Ok(out)
 }
 
+/// Parse a full `copy` directive, including the leading `--glob`, `--dest`,
+/// `--exclude` and `--symlink-strategy` options used in `ssh.conf`.
+pub fn parse_copy_directive(text: &str, home: &Path) -> Result<Vec<CopyInstruction>, SshError> {
+    let words = shlex_split(text)?;
+    let mut glob = false;
+    let mut dest = String::new();
+    let mut excludes = Vec::new();
+    let mut strategy = "preserve".to_owned();
+    let mut locations = Vec::new();
+    let mut index = 0usize;
+    while index < words.len() {
+        match words[index].as_str() {
+            "--glob" => glob = true,
+            "--dest" => {
+                index += 1;
+                dest = words
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| SshError::Config("--dest requires a value".to_owned()))?;
+            }
+            "--exclude" => {
+                index += 1;
+                excludes.push(
+                    words
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| SshError::Config("--exclude requires a value".to_owned()))?,
+                );
+            }
+            "--symlink-strategy" => {
+                index += 1;
+                strategy = words.get(index).cloned().ok_or_else(|| {
+                    SshError::Config("--symlink-strategy requires a value".to_owned())
+                })?;
+            }
+            "--" => {
+                locations.extend(words[index + 1..].iter().cloned());
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(SshError::Config(format!("Unknown copy option: {other}")))
+            }
+            other => locations.push(other.to_owned()),
+        }
+        index += 1;
+    }
+    let locations = locations
+        .iter()
+        .map(|location| quote_sh(location))
+        .collect::<Vec<_>>()
+        .join(" ");
+    parse_copy_instruction(&locations, glob, &dest, &excludes, &strategy, home)
+}
+
 fn expand_env_and_home(text: &str, home: &Path) -> PathBuf {
     let mut value = text.to_owned();
     for (key, val) in std::env::vars() {
@@ -318,13 +374,16 @@ pub fn glob_path(pattern: &Path) -> Result<Vec<PathBuf>, SshError> {
             Vec::new()
         });
     }
-    let (base, tail) = split_glob_base(&text);
+    let (mut base, tail) = split_glob_base(&text);
+    if text.starts_with('/') && !base.starts_with('/') {
+        base.insert(0, '/');
+    }
     let base = if base.is_empty() {
         PathBuf::from(".")
     } else {
         PathBuf::from(base)
     };
-    let mut out = Vec::new();
+    let mut relative = Vec::new();
     walk_glob(
         &base,
         &[],
@@ -333,8 +392,9 @@ pub fn glob_path(pattern: &Path) -> Result<Vec<PathBuf>, SshError> {
             .filter(|x| !x.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>(),
-        &mut out,
+        &mut relative,
     )?;
+    let mut out: Vec<PathBuf> = relative.into_iter().map(|path| base.join(path)).collect();
     out.sort();
     Ok(out)
 }
@@ -937,44 +997,6 @@ pub fn serialize_ssh_env(
     final_env_instructions(local_env, &env)
 }
 
-/// Everything needed to bootstrap a remote session. The archive itself is
-/// assembled by the caller (or the Python shell-integration resource); this
-/// plan carries the command line, environment script and copy list.
-#[derive(Clone, Debug, Default)]
-pub struct BootstrapPlan {
-    pub remote_command: Vec<String>,
-    pub env_script: String,
-    pub copy: Vec<CopyInstruction>,
-    pub request_id: String,
-    pub parse_script: String,
-}
-
-pub fn build_bootstrap_plan(
-    config: &SshHostConfig,
-    copy: Vec<CopyInstruction>,
-    env_script: String,
-    remote_args: &[String],
-) -> BootstrapPlan {
-    let request_id = std::env::var("KITTY_PID").unwrap_or_else(|_| std::process::id().to_string());
-    let window_id = std::env::var("KITTY_WINDOW_ID").unwrap_or_default();
-    let request_id = if window_id.is_empty() {
-        request_id
-    } else {
-        format!("{request_id}-{window_id}")
-    };
-    let mut remote_command = vec![config.interpreter.clone(), "-c".to_owned()];
-    if !remote_args.is_empty() {
-        remote_command.push(remote_args.join(" "));
-    }
-    BootstrapPlan {
-        remote_command,
-        env_script,
-        copy,
-        request_id,
-        parse_script: String::new(),
-    }
-}
-
 /// Execute ssh with the computed arguments. Returns the exit status.
 pub fn run_ssh_command(mut argv: Vec<String>, env: HashMap<String, String>) -> io::Result<i32> {
     if argv.is_empty() {
@@ -1250,6 +1272,1054 @@ pub fn parse_ssh_cli(args: &[String]) -> Result<(SshHostConfig, Vec<String>), Ss
     Ok((config, passthrough))
 }
 
+// Bootstrap archive and askpass flow //////////////////////////////////////////
+
+const EMBEDDED_BOOTSTRAP_SH: &str = include_str!("../resources/ssh/bootstrap.sh");
+const EMBEDDED_BOOTSTRAP_PY: &str = include_str!("../resources/ssh/bootstrap.py");
+const EMBEDDED_BOOTSTRAP_UTILS_SH: &str = include_str!("../resources/ssh/bootstrap-utils.sh");
+const EMBEDDED_KITTY: &str = include_str!("../resources/ssh/kitty");
+const EMBEDDED_KITTEN: &str = include_str!("../resources/ssh/kitten");
+const EMBEDDED_TERMINFO: &[u8] = include_bytes!("../resources/ssh/terminfo/x/xterm-kitty");
+const EMBEDDED_BASH: &[u8] = include_bytes!("../resources/ssh/shell-integration/bash/kitty.bash");
+const EMBEDDED_ZSH_ENV: &[u8] = include_bytes!("../resources/ssh/shell-integration/zsh/.zshenv");
+const EMBEDDED_ZSH_INTEGRATION: &[u8] =
+    include_bytes!("../resources/ssh/shell-integration/zsh/kitty-integration");
+const EMBEDDED_FISH: &[u8] = include_bytes!(
+    "../resources/ssh/shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish"
+);
+
+/// Bootstrap files bundled into the remote tar archive.
+#[derive(Clone, Debug)]
+pub struct BootstrapResources {
+    pub bootstrap_sh: &'static str,
+    pub bootstrap_py: &'static str,
+    pub bootstrap_utils_sh: &'static str,
+    pub kitty: &'static str,
+    pub kitten: &'static str,
+    pub terminfo: &'static [u8],
+    pub shell_integration: Vec<(&'static str, &'static [u8])>,
+}
+
+impl Default for BootstrapResources {
+    fn default() -> Self {
+        Self {
+            bootstrap_sh: EMBEDDED_BOOTSTRAP_SH,
+            bootstrap_py: EMBEDDED_BOOTSTRAP_PY,
+            bootstrap_utils_sh: EMBEDDED_BOOTSTRAP_UTILS_SH,
+            kitty: EMBEDDED_KITTY,
+            kitten: EMBEDDED_KITTEN,
+            terminfo: EMBEDDED_TERMINFO,
+            shell_integration: vec![
+                ("bash/kitty.bash", EMBEDDED_BASH),
+                ("zsh/.zshenv", EMBEDDED_ZSH_ENV),
+                ("zsh/kitty-integration", EMBEDDED_ZSH_INTEGRATION),
+                (
+                    "fish/vendor_conf.d/kitty-shell-integration.fish",
+                    EMBEDDED_FISH,
+                ),
+            ],
+        }
+    }
+}
+
+/// Options controlling how a bootstrap archive and remote command are built.
+#[derive(Clone, Debug)]
+pub struct BootstrapOptions {
+    pub request_data: bool,
+    pub echo_on: bool,
+    pub script_type: String,
+    pub test_script: String,
+    pub remote_command: String,
+    pub remote_home: String,
+    pub create_shared_memory: bool,
+    pub resources: BootstrapResources,
+}
+
+impl Default for BootstrapOptions {
+    fn default() -> Self {
+        Self {
+            request_data: true,
+            echo_on: false,
+            script_type: "sh".to_owned(),
+            test_script: String::new(),
+            remote_command: String::new(),
+            remote_home: std::env::var("HOME").unwrap_or_default(),
+            create_shared_memory: true,
+            resources: BootstrapResources::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TarWriter {
+    out: Vec<u8>,
+}
+
+fn octal_field(value: u64, width: usize) -> Vec<u8> {
+    let text = format!("{value:0width$o}", width = width - 1);
+    let mut out = text.into_bytes();
+    out.truncate(width - 1);
+    while out.len() < width - 1 {
+        out.insert(0, b'0');
+    }
+    out.push(0);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tar_header(
+    name: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: i64,
+    typeflag: u8,
+    linkname: &str,
+) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    let name = name.strip_prefix('/').unwrap_or(name);
+    let name_bytes = name.as_bytes();
+    let link_bytes = linkname.as_bytes();
+    let (short_name, prefix) = if name_bytes.len() <= 100 {
+        (name_bytes, &b""[..])
+    } else if name_bytes.len() <= 255 {
+        let mut split = name_bytes.len().saturating_sub(100);
+        while split < name_bytes.len() && name_bytes[split] != b'/' {
+            split += 1;
+        }
+        if split >= name_bytes.len() {
+            (&name_bytes[..100], &b""[..])
+        } else {
+            (&name_bytes[split + 1..], &name_bytes[..split])
+        }
+    } else {
+        (&name_bytes[..100], &b""[..])
+    };
+    header[..short_name.len()].copy_from_slice(short_name);
+    header[100..108].copy_from_slice(&octal_field(u64::from(mode & 0o7777), 8));
+    header[108..116].copy_from_slice(&octal_field(u64::from(uid), 8));
+    header[116..124].copy_from_slice(&octal_field(u64::from(gid), 8));
+    header[124..136].copy_from_slice(&octal_field(size, 12));
+    header[136..148].copy_from_slice(&octal_field(mtime.max(0) as u64, 12));
+    header[148..156].fill(b' ');
+    header[156] = typeflag;
+    header[157..157 + link_bytes.len().min(100)]
+        .copy_from_slice(&link_bytes[..link_bytes.len().min(100)]);
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    header[345..345 + prefix.len()].copy_from_slice(prefix);
+    let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+    let text = format!("{checksum:06o}\0 ");
+    header[148..156].copy_from_slice(text.as_bytes());
+    header
+}
+
+fn pax_record(path: &str) -> Vec<u8> {
+    let body = format!("path={path}\n");
+    let mut length = body.len() + 3;
+    loop {
+        let prefix = format!("{length} ");
+        let total = prefix.len() + body.len();
+        if total == length {
+            return format!("{prefix}{body}").into_bytes();
+        }
+        length = total;
+    }
+}
+
+impl TarWriter {
+    #[allow(clippy::too_many_arguments)]
+    fn append(
+        &mut self,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime: i64,
+        typeflag: u8,
+        linkname: &str,
+        data: &[u8],
+    ) {
+        let clean_name = name.strip_prefix('/').unwrap_or(name);
+        if clean_name.len() > 100 {
+            let record = pax_record(clean_name);
+            let header = tar_header(
+                "././@PaxHeader",
+                0o644,
+                0,
+                0,
+                record.len() as u64,
+                mtime,
+                b'x',
+                "",
+            );
+            self.out.extend_from_slice(&header);
+            self.out.extend_from_slice(&record);
+            self.pad();
+        }
+        let short_name = if clean_name.len() > 100 {
+            &clean_name[..clean_name.len().min(100)]
+        } else {
+            clean_name
+        };
+        let header = tar_header(
+            short_name,
+            mode,
+            uid,
+            gid,
+            data.len() as u64,
+            mtime,
+            typeflag,
+            linkname,
+        );
+        self.out.extend_from_slice(&header);
+        self.out.extend_from_slice(data);
+        self.pad();
+    }
+
+    fn pad(&mut self) {
+        let remainder = self.out.len() % 512;
+        if remainder != 0 {
+            self.out.resize(self.out.len() + (512 - remainder), 0);
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.out.resize(self.out.len() + 1024, 0);
+        self.out
+    }
+}
+
+fn gzip(data: &[u8]) -> io::Result<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+fn should_exclude(patterns: &[String], path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    for pattern in patterns {
+        if pattern.is_empty() {
+            continue;
+        }
+        let target = if pattern.contains('/') {
+            text.as_ref()
+        } else {
+            name.as_ref()
+        };
+        if wildcard_match(pattern, target) || wildcard_match(pattern, text.as_ref()) {
+            return true;
+        }
+    }
+    false
+}
+
+struct TarContext {
+    seen: HashMap<(u64, u64), String>,
+    exclude: Vec<String>,
+}
+
+fn add_tar_path(
+    writer: &mut TarWriter,
+    context: &mut TarContext,
+    local: &Path,
+    arcname: &str,
+) -> Result<(), SshError> {
+    let metadata = fs::symlink_metadata(local)?;
+    let mode = metadata.permissions().mode() & 0o777;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(local)?;
+        writer.append(
+            arcname,
+            mode | 0o600,
+            uid,
+            gid,
+            mtime,
+            b'2',
+            &target.to_string_lossy(),
+            &[],
+        );
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        writer.append(
+            &format!("{}/", arcname.trim_end_matches('/')),
+            mode | 0o600,
+            uid,
+            gid,
+            mtime,
+            b'5',
+            "",
+            &[],
+        );
+        let mut entries: Vec<_> = fs::read_dir(local)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child_local = entry.path();
+            if should_exclude(&context.exclude, &child_local) {
+                continue;
+            }
+            let child_arc = format!("{}/{}", arcname.trim_end_matches('/'), name);
+            add_tar_path(writer, context, &child_local, &child_arc)?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        let key = (metadata.dev(), metadata.ino());
+        if let Some(first) = context.seen.get(&key) {
+            writer.append(arcname, mode | 0o600, uid, gid, mtime, b'1', first, &[]);
+            return Ok(());
+        }
+        context.seen.insert(key, arcname.to_owned());
+        let data = fs::read(local)?;
+        writer.append(arcname, mode | 0o600, uid, gid, mtime, b'0', "", &data);
+    }
+    // Sockets, FIFOs and device nodes cannot be represented safely in the
+    // bootstrap archive and are skipped, matching the Go kitten.
+    Ok(())
+}
+
+/// Build the gzip-compressed tar archive uploaded to the remote host.
+pub fn make_bootstrap_tar(
+    config: &SshHostConfig,
+    copies: &[CopyInstruction],
+    env_script: &str,
+    resources: &BootstrapResources,
+) -> Result<Vec<u8>, SshError> {
+    let mut writer = TarWriter::default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    writer.append("data.sh", 0o644, 0, 0, now, b'0', "", env_script.as_bytes());
+    writer.append(
+        "bootstrap-utils.sh",
+        0o644,
+        0,
+        0,
+        now,
+        b'0',
+        "",
+        resources.bootstrap_utils_sh.as_bytes(),
+    );
+    writer.append(
+        "bootstrap.py",
+        0o644,
+        0,
+        0,
+        now,
+        b'0',
+        "",
+        resources.bootstrap_py.as_bytes(),
+    );
+    let remote_dir = config.remote_dir.trim_matches('/');
+    if !remote_dir.is_empty() {
+        for (relative, data) in &resources.shell_integration {
+            let arcname = format!("home/{remote_dir}/shell-integration/{relative}");
+            writer.append(&arcname, 0o644, 0, 0, now, b'0', "", data);
+        }
+        let version = format!("kitty-kittens {}\n", env!("CARGO_PKG_VERSION"));
+        writer.append(
+            &format!("home/{remote_dir}/kitty/version"),
+            0o644,
+            0,
+            0,
+            now,
+            b'0',
+            "",
+            version.as_bytes(),
+        );
+        writer.append(
+            &format!("home/{remote_dir}/kitty/bin/kitty"),
+            0o755,
+            0,
+            0,
+            now,
+            b'0',
+            "",
+            resources.kitty.as_bytes(),
+        );
+        writer.append(
+            &format!("home/{remote_dir}/kitty/bin/kitten"),
+            0o755,
+            0,
+            0,
+            now,
+            b'0',
+            "",
+            resources.kitten.as_bytes(),
+        );
+    }
+    writer.append(
+        "home/.terminfo/x/xterm-kitty",
+        0o644,
+        0,
+        0,
+        now,
+        b'0',
+        "",
+        resources.terminfo,
+    );
+    let mut context = TarContext {
+        seen: HashMap::new(),
+        exclude: Vec::new(),
+    };
+    for copy in copies {
+        context.exclude = copy
+            .exclude_patterns
+            .iter()
+            .cloned()
+            .chain([
+                "**/__pycache__".to_owned(),
+                "**/__pycache__/**".to_owned(),
+                "**/.DS_Store".to_owned(),
+            ])
+            .collect();
+        add_tar_path(&mut writer, &mut context, &copy.local_path, &copy.arcname)?;
+    }
+    Ok(gzip(&writer.finish())?)
+}
+
+/// Standard kitty config locations for `ssh.conf`, highest priority first.
+pub fn ssh_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(dir) = std::env::var_os("KITTY_CONFIG_DIRECTORY") {
+        paths.push(PathBuf::from(dir).join("ssh.conf"));
+        return paths;
+    }
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(dir).join("kitty/ssh.conf"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".config/kitty/ssh.conf"));
+    }
+    let dirs = std::env::var("XDG_CONFIG_DIRS").unwrap_or_else(|_| "/etc/xdg".to_owned());
+    for dir in dirs.split(':').filter(|dir| !dir.is_empty()) {
+        paths.push(PathBuf::from(dir).join("kitty/ssh.conf"));
+    }
+    paths
+}
+
+/// Load and merge `ssh.conf` from the standard locations.
+pub fn load_ssh_config() -> SshConfigSet {
+    let mut set = SshConfigSet::new();
+    for path in ssh_config_paths() {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(parsed) = SshConfigSet::parse(&text) {
+                if !parsed.hosts.is_empty() {
+                    set.hosts.extend(parsed.hosts);
+                }
+                let defaults = parsed.default;
+                if !defaults.hostname.is_empty() {
+                    set.default.hostname = defaults.hostname;
+                }
+                set.default.copy.extend(defaults.copy);
+                set.default.env.extend(defaults.env);
+            }
+        }
+    }
+    set
+}
+
+fn replace_template_idents(script: &str, replacements: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(script.len());
+    let bytes = script.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+        {
+            index += 1;
+        }
+        if start == index {
+            out.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        let word = &script[start..index];
+        if let Some(value) = replacements.get(word) {
+            out.push_str(value);
+        } else {
+            out.push_str(word);
+        }
+    }
+    out
+}
+
+/// Substitute the bootstrap placeholders, respecting identifier boundaries.
+pub fn prepare_bootstrap_script(script: &str, replacements: &HashMap<String, String>) -> String {
+    replace_template_idents(script, replacements)
+}
+
+/// Build the command line executed by the remote login shell.
+pub fn wrap_bootstrap_command(config: &SshHostConfig, script: &str) -> Vec<String> {
+    let interpreter = &config.interpreter;
+    let is_python = Path::new(interpreter)
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("python")
+        })
+        .unwrap_or(false);
+    if is_python {
+        let encoded = base64_encode(script.as_bytes());
+        vec![
+            "exec".to_owned(),
+            interpreter.clone(),
+            "-c".to_owned(),
+            "\"import base64, sys; eval(compile(base64.standard_b64decode(sys.argv[-1]), 'bootstrap.py', 'exec'))\"".to_owned(),
+            encoded,
+        ]
+    } else {
+        let encoded = format!(
+            "'{}'",
+            script
+                .replace('\'', "\u{b}")
+                .replace('\\', "\u{c}")
+                .replace('\n', "\r")
+                .replace('!', "\u{8}")
+        );
+        vec![
+            "exec".to_owned(),
+            interpreter.clone(),
+            "-c".to_owned(),
+            "'eval \"$(echo \"$0\" | tr \\v\\f\\r\\b \\047\\134\\n\\041)\"' ".to_owned(),
+            encoded,
+        ]
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    String::from_utf8(kitty_remote::base64::encode(data, true)).expect("base64 is ASCII")
+}
+
+fn random_token_hex(bytes: usize) -> String {
+    let mut data = vec![0u8; bytes];
+    use std::io::Read;
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        if file.read_exact(&mut data).is_ok() {
+            return data.iter().map(|byte| format!("{byte:02x}")).collect();
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:032x}")
+}
+
+fn split_destination(hostname: &str) -> (String, String) {
+    if let Some(rest) = hostname.strip_prefix("ssh://") {
+        let (user, host) = match rest.split_once('@') {
+            Some((user, host)) => (user.to_owned(), host.to_owned()),
+            None => (String::new(), rest.to_owned()),
+        };
+        let host = host.split(':').next().unwrap_or(&host).to_owned();
+        return (user, host);
+    }
+    hostname
+        .split_once('@')
+        .map_or((String::new(), hostname.to_owned()), |(user, host)| {
+            (user.to_owned(), host.to_owned())
+        })
+}
+
+/// Create the shared-memory object holding the bootstrap JSON consumed by the
+/// terminal's ssh handler. The returned name is what is sent in the DCS.
+pub fn create_bootstrap_data_shm(
+    tarfile: &[u8],
+    password: &str,
+    hostname: &str,
+    username: &str,
+) -> Result<(String, crate::shm::SharedMemory), SshError> {
+    let data = kitty_remote::json::Value::object_from([
+        (
+            "tarfile",
+            kitty_remote::json::Value::from(base64_encode(tarfile).as_str()),
+        ),
+        ("pw", kitty_remote::json::Value::from(password)),
+        ("hostname", kitty_remote::json::Value::from(hostname)),
+        ("username", kitty_remote::json::Value::from(username)),
+    ])
+    .to_json()
+    .map_err(|err| SshError::Config(err.to_string()))?;
+    let mut shm = crate::shm::SharedMemory::create_temp("kssh-", data.len() + 8)?;
+    shm.write_all(data.as_bytes())?;
+    shm.flush()?;
+    Ok((shm.name().to_owned(), shm))
+}
+
+/// The DCS request that asks the terminal to send the bootstrap data to the
+/// remote child process.
+pub fn encode_ssh_data_request(request_id: &str, shm_name: &str, password: &str) -> String {
+    format!("\x1bP@kitty-ssh|id={request_id}:pwfile={shm_name}:pw={password}\x1b\\")
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BootstrapPlan {
+    pub remote_command: Vec<String>,
+    pub env_script: String,
+    pub copy: Vec<CopyInstruction>,
+    pub request_id: String,
+    pub parse_script: String,
+    pub tar: Vec<u8>,
+    pub bootstrap_script: String,
+    pub shared_memory_name: Option<String>,
+    #[allow(dead_code)]
+    pub shared_memory: Option<std::sync::Arc<crate::shm::SharedMemory>>,
+    pub data_password: String,
+    pub request_data: bool,
+    pub script_type: String,
+}
+
+/// Build a complete bootstrap plan. This includes the tar archive, shared
+/// memory object and the wrapped remote command, so it can be executed without
+/// a second round of host-side setup.
+pub fn build_bootstrap_plan(
+    config: &SshHostConfig,
+    copy: Vec<CopyInstruction>,
+    env_script: String,
+    remote_args: &[String],
+) -> BootstrapPlan {
+    build_bootstrap_plan_with_options(
+        config,
+        copy,
+        env_script,
+        remote_args,
+        &BootstrapOptions::default(),
+    )
+}
+
+pub fn build_bootstrap_plan_with_options(
+    config: &SshHostConfig,
+    copy: Vec<CopyInstruction>,
+    env_script: String,
+    remote_args: &[String],
+    options: &BootstrapOptions,
+) -> BootstrapPlan {
+    let request_id = std::env::var("KITTY_PID").unwrap_or_else(|_| std::process::id().to_string());
+    let window_id = std::env::var("KITTY_WINDOW_ID").unwrap_or_default();
+    let request_id = if window_id.is_empty() {
+        request_id
+    } else {
+        format!("{request_id}-{window_id}")
+    };
+    let (username, hostname) = split_destination(&config.hostname);
+    let tar =
+        make_bootstrap_tar(config, &copy, &env_script, &options.resources).unwrap_or_default();
+    let data_password = random_token_hex(32);
+    let mut shared_memory_name = None;
+    let mut shared_memory = None;
+    if options.create_shared_memory && !tar.is_empty() {
+        if let Ok((name, shm)) =
+            create_bootstrap_data_shm(&tar, &data_password, &hostname, &username)
+        {
+            shared_memory_name = Some(name);
+            shared_memory = Some(std::sync::Arc::new(shm));
+        }
+    }
+    let is_python = options.script_type == "py";
+    let exec_cmd = if remote_args.is_empty() {
+        String::new()
+    } else if is_python {
+        base64_encode(remote_args.join(" ").as_bytes())
+    } else {
+        let joined = remote_args
+            .iter()
+            .map(|arg| arg.replace('\'', "'\"'\"'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("unset KITTY_SHELL_INTEGRATION; exec \"$login_shell\" -c '{joined}'")
+    };
+    let remote_cmd = if options.remote_command.is_empty() {
+        String::new()
+    } else if is_python {
+        base64_encode(options.remote_command.as_bytes())
+    } else {
+        format!("{}\n\nexit", options.remote_command)
+    };
+    let export_home = if options.remote_home.is_empty() {
+        String::new()
+    } else if is_python {
+        base64_encode(options.remote_home.as_bytes())
+    } else {
+        format!(
+            "export HOME={}; cd \"$HOME\"",
+            quote_sh(&options.remote_home)
+        )
+    };
+    let mut replacements: HashMap<String, String> = HashMap::from([
+        ("EXPORT_HOME_CMD".to_owned(), export_home),
+        ("EXEC_CMD".to_owned(), exec_cmd),
+        ("REMOTE_CMD".to_owned(), remote_cmd),
+        ("TEST_SCRIPT".to_owned(), options.test_script.clone()),
+        ("REQUEST_ID".to_owned(), request_id.clone()),
+        (
+            "PASSWORD_FILENAME".to_owned(),
+            shared_memory_name.clone().unwrap_or_default(),
+        ),
+        ("DATA_PASSWORD".to_owned(), data_password.clone()),
+        (
+            "REQUEST_DATA".to_owned(),
+            if options.request_data { "1" } else { "0" }.to_owned(),
+        ),
+        (
+            "ECHO_ON".to_owned(),
+            if options.echo_on { "1" } else { "0" }.to_owned(),
+        ),
+    ]);
+    replacements
+        .entry("HAS_REMOTE_CMD".to_owned())
+        .or_insert_with(|| {
+            if options.remote_command.is_empty() {
+                "n".to_owned()
+            } else {
+                "y".to_owned()
+            }
+        });
+    let template = if is_python {
+        options.resources.bootstrap_py
+    } else {
+        options.resources.bootstrap_sh
+    };
+    let bootstrap_script = prepare_bootstrap_script(template, &replacements);
+    let remote_command = wrap_bootstrap_command(config, &bootstrap_script);
+    BootstrapPlan {
+        remote_command,
+        env_script,
+        copy,
+        request_id,
+        parse_script: String::new(),
+        tar,
+        bootstrap_script,
+        shared_memory_name,
+        shared_memory,
+        data_password,
+        request_data: options.request_data,
+        script_type: options.script_type.clone(),
+    }
+}
+
+/// A complete host-side ssh launch, including the bootstrap archive and the
+/// DCS that asks the terminal to hand the archive to the remote child.
+#[derive(Clone, Debug)]
+pub struct SshSessionPlan {
+    pub ssh_command: Vec<String>,
+    pub environment: HashMap<String, String>,
+    pub bootstrap: BootstrapPlan,
+    pub data_request: String,
+}
+
+/// Build an ssh session plan without executing it. `ssh_args` are the options
+/// intended for ssh itself and `server_args` start with the destination.
+pub fn prepare_ssh_session(
+    config: &SshHostConfig,
+    ssh_args: &[String],
+    server_args: &[String],
+    literal_env: &BTreeMap<String, String>,
+    options: &BootstrapOptions,
+    get_local: &dyn Fn(&str) -> Option<String>,
+) -> Result<SshSessionPlan, SshError> {
+    let Some(hostname) = server_args.first() else {
+        return Err(SshError::Usage(
+            "Must specify a destination host for ssh".to_owned(),
+        ));
+    };
+    let home = get_local("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut copies = Vec::new();
+    for spec in &config.copy {
+        copies.extend(parse_copy_directive(spec, &home)?);
+    }
+    let env_script = serialize_ssh_env(config, literal_env, &options.remote_home, get_local);
+    let remote_args = &server_args[1..];
+    let bootstrap =
+        build_bootstrap_plan_with_options(config, copies, env_script, remote_args, options);
+    let mut ssh_command = vec![
+        "ssh".to_owned(),
+        "-o".to_owned(),
+        "RemoteCommand=none".to_owned(),
+    ];
+    ssh_command.extend_from_slice(ssh_args);
+    if remote_args.is_empty() {
+        ssh_command.push("-t".to_owned());
+    }
+    ssh_command.push("--".to_owned());
+    ssh_command.push(hostname.clone());
+    ssh_command.extend(bootstrap.remote_command.iter().cloned());
+    let mut environment: HashMap<String, String> = HashMap::new();
+    let use_kitty_askpass = match config.askpass.as_str() {
+        "native" => true,
+        "unless-set" => get_local("SSH_ASKPASS").is_none(),
+        _ => false,
+    };
+    if use_kitty_askpass {
+        if let Ok(exe) = std::env::current_exe() {
+            environment.insert("SSH_ASKPASS".to_owned(), exe.to_string_lossy().into_owned());
+            environment.insert(
+                "KITTY_KITTEN_RUN_MODULE".to_owned(),
+                "ssh_askpass".to_owned(),
+            );
+            let (username, host) = split_destination(hostname);
+            environment.insert("KITTY_SSH_ASKPASS_HOST".to_owned(), host);
+            environment.insert("KITTY_SSH_ASKPASS_USER".to_owned(), username);
+            environment.insert("KITTY_SSH_ASKPASS_OVERRIDES".to_owned(), "[]".to_owned());
+            environment.insert("SSH_ASKPASS_REQUIRE".to_owned(), "force".to_owned());
+        }
+    }
+    let data_request = encode_ssh_data_request(
+        &bootstrap.request_id,
+        bootstrap.shared_memory_name.as_deref().unwrap_or(""),
+        &bootstrap.data_password,
+    );
+    Ok(SshSessionPlan {
+        ssh_command,
+        environment,
+        bootstrap,
+        data_request,
+    })
+}
+
+// Askpass ////////////////////////////////////////////////////////////////////
+
+/// A question asked through the terminal's `@kitty-ask` protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskpassRequest {
+    pub message: String,
+    pub kind: String,
+    pub is_password: bool,
+}
+
+impl AskpassRequest {
+    pub fn from_message(message: &str, confirm: bool) -> Self {
+        let fingerprint = message.contains("(yes/no/[fingerprint])");
+        Self {
+            message: message.to_owned(),
+            kind: if confirm { "confirm" } else { "get_line" }.to_owned(),
+            is_password: !fingerprint,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        kitty_remote::json::Value::object_from([
+            (
+                "message",
+                kitty_remote::json::Value::from(self.message.as_str()),
+            ),
+            ("type", kitty_remote::json::Value::from(self.kind.as_str())),
+            (
+                "is_password",
+                kitty_remote::json::Value::from(self.is_password),
+            ),
+        ])
+        .to_json()
+        .unwrap_or_else(|_| "{}".to_owned())
+    }
+}
+
+/// Where askpass sends the DCS and waits for the terminal response.
+pub trait AskpassHost {
+    fn trigger(&mut self, shm_name: &str) -> io::Result<()>;
+    /// Wait until the first byte of shared memory becomes 1.
+    fn wait_for_response(&mut self, shm: &crate::shm::SharedMemory) -> io::Result<()>;
+}
+
+fn parse_json_prefix(data: &[u8]) -> Option<kitty_remote::json::Value> {
+    // The terminal writes the answer over the question. A shorter answer can
+    // leave old bytes after the JSON value, so accept the longest valid prefix.
+    let end = data
+        .iter()
+        .rposition(|byte| *byte != 0 && !byte.is_ascii_whitespace())
+        .map(|index| index + 1)?;
+    for candidate in (1..=end).rev() {
+        if let Ok(value) = kitty_remote::json::parse(&data[..candidate]) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Ask the terminal a question using shared memory, returning the text that
+/// OpenSSH should print. `confirm` questions return `yes`/`no`.
+pub fn perform_askpass(
+    request: &AskpassRequest,
+    host: &mut dyn AskpassHost,
+) -> Result<String, SshError> {
+    let json = request.to_json();
+    let mut shm = crate::shm::SharedMemory::create_temp("askpass-", json.len() + 32)?;
+    shm.as_mut_slice()[0] = 0;
+    shm.write_at(1, json.as_bytes())?;
+    shm.flush()?;
+    host.trigger(shm.name())?;
+    host.wait_for_response(&shm)?;
+    let payload = shm.read_at(1, shm.len() - 1)?;
+    let end = payload
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let value = parse_json_prefix(&payload[..end])
+        .ok_or_else(|| SshError::Config("Failed to parse askpass response".to_owned()))?;
+    if request.kind == "confirm" {
+        let yes = value.as_bool().unwrap_or(false);
+        return Ok(if yes { "yes" } else { "no" }.to_owned());
+    }
+    let mut response = value.as_str().unwrap_or("").to_owned();
+    if request.message.contains("(yes/no/[fingerprint])") {
+        match response.to_ascii_lowercase().as_str() {
+            "y" => response = "yes".to_owned(),
+            "n" => response = "no".to_owned(),
+            _ => {}
+        }
+    }
+    Ok(response)
+}
+
+/// The default askpass transport: write to and poll the controlling terminal.
+pub struct TtyAskpassHost {
+    tty: io::BufReader<fs::File>,
+    writer: fs::File,
+    timeout: std::time::Duration,
+}
+
+impl TtyAskpassHost {
+    pub fn open() -> io::Result<Self> {
+        let tty = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")?;
+        let writer = tty.try_clone()?;
+        Ok(Self {
+            tty: io::BufReader::new(tty),
+            writer,
+            timeout: std::time::Duration::from_secs(300),
+        })
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl AskpassHost for TtyAskpassHost {
+    fn trigger(&mut self, shm_name: &str) -> io::Result<()> {
+        self.writer
+            .write_all(format!("\x1bP@kitty-ask|{shm_name}\x1b\\").as_bytes())?;
+        self.writer.flush()
+    }
+
+    fn wait_for_response(&mut self, shm: &crate::shm::SharedMemory) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + self.timeout;
+        while std::time::Instant::now() < deadline {
+            if shm.as_slice().first().copied() == Some(1) {
+                return Ok(());
+            }
+            let mut byte = [0u8; 1];
+            let _ = std::io::Read::read(&mut self.tty, &mut byte);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for the terminal to answer the askpass prompt",
+        ))
+    }
+}
+
+fn askpass_env_config() -> Option<SshHostConfig> {
+    let host = std::env::var("KITTY_SSH_ASKPASS_HOST").ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    let user = std::env::var("KITTY_SSH_ASKPASS_USER").unwrap_or_default();
+    let overrides: Vec<String> = std::env::var("KITTY_SSH_ASKPASS_OVERRIDES")
+        .ok()
+        .and_then(|text| kitty_remote::json::parse(text.as_bytes()).ok())
+        .and_then(|value| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(kitty_remote::json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let set = load_ssh_config();
+    let mut config = set.for_host(&host, &user);
+    for override_value in overrides {
+        if let Some((key, value)) = override_value.split_once('=') {
+            let _ = config.apply(key, value);
+        }
+    }
+    Some(config)
+}
+
+/// The `ssh_askpass` kitten entry point. Returns a process exit status.
+pub fn run_askpass_cli() -> i32 {
+    let Some(message) = std::env::args().next_back() else {
+        return 1;
+    };
+    let confirm = std::env::var("SSH_ASKPASS_PROMPT").as_deref() == Ok("confirm");
+    let fingerprint = message.contains("(yes/no/[fingerprint])");
+    if !confirm && !fingerprint {
+        if let Some(config) = askpass_env_config() {
+            if is_password_prompt(&message) && !config.password.is_empty() {
+                println!("{}", config.password);
+                return 0;
+            }
+            if is_otp_prompt(&message) && !config.totp_secret.is_empty() {
+                if let Ok(code) = generate_totp(
+                    &config.totp_secret,
+                    config.totp_digits,
+                    config.totp_period,
+                    SystemTime::now(),
+                ) {
+                    println!("{code}");
+                    return 0;
+                }
+            }
+        }
+    }
+    let request = AskpassRequest::from_message(&message, confirm);
+    let mut host = match TtyAskpassHost::open() {
+        Ok(host) => host,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    match perform_askpass(&request, &mut host) {
+        Ok(response) => {
+            if !response.is_empty() {
+                println!("{response}");
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +2383,38 @@ mod tests {
     }
 
     #[test]
+    fn copy_directive_parses_inline_options() {
+        let dir = std::env::temp_dir().join(format!(
+            "kitty-ssh-copyopts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::write(dir.join("skip.tmp"), b"s").unwrap();
+        let copies = parse_copy_directive(
+            &format!(
+                "--glob --exclude *.tmp --dest remote/ {}/a*",
+                dir.to_string_lossy()
+            ),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(copies.len(), 1);
+        assert!(copies
+            .iter()
+            .all(|copy| copy.arcname.starts_with("home/remote/")));
+        assert!(copies
+            .iter()
+            .all(|copy| copy.exclude_patterns.iter().any(|p| p == "*.tmp")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn copy_directive_and_arcname() {
         let dir = std::env::temp_dir().join(format!("kitty-ssh-{}-{}", std::process::id(), 1));
         let _ = fs::remove_dir_all(&dir);
@@ -1334,6 +2436,184 @@ mod tests {
             "root/etc/passwd"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn read_tar_names(data: &[u8]) -> Vec<String> {
+        use flate2::read::GzDecoder;
+        let mut decoder = GzDecoder::new(data);
+        let mut tar = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut tar).unwrap();
+        let mut names = Vec::new();
+        let mut offset = 0usize;
+        while offset + 512 <= tar.len() {
+            let header = &tar[offset..offset + 512];
+            if header.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let name_end = header[..100].iter().position(|b| *b == 0).unwrap_or(100);
+            let name = String::from_utf8_lossy(&header[..name_end]).into_owned();
+            let size_text = String::from_utf8_lossy(&header[124..136]);
+            let size = usize::from_str_radix(size_text.trim_matches('\0').trim(), 8).unwrap_or(0);
+            let typeflag = header[156];
+            names.push(format!("{typeflag}:{name}"));
+            offset += 512 + size.div_ceil(512) * 512;
+        }
+        names
+    }
+
+    struct FakeAskpassHost {
+        response: String,
+    }
+
+    impl AskpassHost for FakeAskpassHost {
+        fn trigger(&mut self, shm_name: &str) -> io::Result<()> {
+            let mut shm = crate::shm::SharedMemory::open_existing(shm_name)?;
+            let question_end = shm.as_slice()[1..]
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .map(|index| index + 2)
+                .unwrap_or(1);
+            let question = std::str::from_utf8(&shm.as_slice()[1..question_end]).unwrap();
+            assert!(question.contains("\"type\""));
+            let response = if self.response == "true" || self.response == "false" {
+                self.response.clone()
+            } else {
+                serde_json_quote(&self.response)
+            };
+            shm.write_at(1, response.as_bytes())?;
+            shm.as_mut_slice()[0] = 1;
+            shm.flush()
+        }
+
+        fn wait_for_response(&mut self, _shm: &crate::shm::SharedMemory) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn serde_json_quote(text: &str) -> String {
+        let mut out = String::from("\"");
+        for ch in text.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    #[test]
+    fn bootstrap_tar_contains_scripts_copies_and_terminfo() {
+        let dir = std::env::temp_dir().join(format!(
+            "kitty-ssh-tar-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("tree/sub")).unwrap();
+        fs::write(dir.join("tree/a.txt"), b"hello").unwrap();
+        fs::write(dir.join("tree/sub/b.txt"), b"world").unwrap();
+        let copies = parse_copy_instruction(
+            &dir.join("tree").to_string_lossy(),
+            false,
+            "dest",
+            &[],
+            "preserve",
+            &dir,
+        )
+        .unwrap();
+        let config = SshHostConfig::new();
+        let tar = make_bootstrap_tar(
+            &config,
+            &copies,
+            "export TEST=1\n",
+            &BootstrapResources::default(),
+        )
+        .unwrap();
+        let names = read_tar_names(&tar);
+        assert!(names.iter().any(|name| name.contains("data.sh")));
+        assert!(names.iter().any(|name| name.contains("bootstrap-utils.sh")));
+        assert!(names.iter().any(|name| name.contains("dest/a.txt")));
+        assert!(names.iter().any(|name| name.contains("dest/sub/b.txt")));
+        assert!(names
+            .iter()
+            .any(|name| name.contains("home/.terminfo/x/xterm-kitty")));
+        assert!(names.iter().any(|name| name.contains("kitty/bin/kitten")));
+        let plan = build_bootstrap_plan(
+            &config,
+            copies,
+            "export TEST=1\n".to_owned(),
+            &["echo hi".to_owned()],
+        );
+        assert!(!plan.tar.is_empty());
+        assert!(plan.remote_command[0] == "exec");
+        assert!(plan.bootstrap_script.contains("KITTY_DATA_START"));
+        assert!(plan.bootstrap_script.contains("echo hi"));
+        if let Some(name) = &plan.shared_memory_name {
+            let shm = crate::shm::SharedMemory::open_existing(name).unwrap();
+            let text = String::from_utf8_lossy(shm.as_slice()).into_owned();
+            assert!(text.contains("\"tarfile\""));
+            assert!(text.contains("\"pw\""));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn askpass_shared_memory_flow_confirm_and_line() {
+        let request = AskpassRequest::from_message("Password:", false);
+        let mut host = FakeAskpassHost {
+            response: "hunter2".to_owned(),
+        };
+        assert_eq!(perform_askpass(&request, &mut host).unwrap(), "hunter2");
+        let confirm = AskpassRequest::from_message("Continue?", true);
+        let mut host = FakeAskpassHost {
+            response: "true".to_owned(),
+        };
+        assert_eq!(perform_askpass(&confirm, &mut host).unwrap(), "yes");
+        let fingerprint = AskpassRequest::from_message(
+            "The authenticity of host x can't be established (yes/no/[fingerprint])?",
+            false,
+        );
+        let mut host = FakeAskpassHost {
+            response: "y".to_owned(),
+        };
+        assert_eq!(perform_askpass(&fingerprint, &mut host).unwrap(), "yes");
+    }
+
+    #[test]
+    fn prepare_ssh_session_sets_bootstrap_and_askpass_environment() {
+        let mut config = SshHostConfig::new();
+        config.hostname = "u@example.com".to_owned();
+        config.askpass = "native".to_owned();
+        let options = BootstrapOptions::default();
+        let env = BTreeMap::from([("TERM".to_owned(), "xterm-kitty".to_owned())]);
+        let plan = prepare_ssh_session(
+            &config,
+            &["-p".to_owned(), "2222".to_owned()],
+            &["u@example.com".to_owned(), "uname -a".to_owned()],
+            &env,
+            &options,
+            &|key| (key == "HOME").then(|| "/home/u".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(plan.ssh_command[0], "ssh");
+        assert!(plan.ssh_command.contains(&"2222".to_owned()));
+        assert!(plan.ssh_command.contains(&"exec".to_owned()));
+        assert_eq!(
+            plan.environment
+                .get("KITTY_SSH_ASKPASS_HOST")
+                .map(String::as_str),
+            Some("example.com")
+        );
+        assert!(plan.data_request.starts_with("\x1bP@kitty-ssh|"));
+        assert!(plan
+            .data_request
+            .contains(plan.bootstrap.request_id.as_str()));
     }
 
     #[test]
