@@ -451,15 +451,11 @@ pub fn run_command_palette_ui(tty: &mut dyn Tty, data: &InputData) -> io::Result
         };
         match key {
             Key::Esc | Key::Ctrl('c') | Key::Ctrl('d') => break,
-            Key::Ctrl('j') | Key::Down => {
-                if !filtered.is_empty() {
-                    selected = (selected + 1) % filtered.len();
-                }
+            Key::Ctrl('j') | Key::Down if !filtered.is_empty() => {
+                selected = (selected + 1) % filtered.len();
             }
-            Key::Ctrl('k') | Key::Up => {
-                if !filtered.is_empty() {
-                    selected = (selected + filtered.len() - 1) % filtered.len();
-                }
+            Key::Ctrl('k') | Key::Up if !filtered.is_empty() => {
+                selected = (selected + filtered.len() - 1) % filtered.len();
             }
             Key::PageDown => selected = (selected + rows).min(filtered.len().saturating_sub(1)),
             Key::PageUp => selected = selected.saturating_sub(rows),

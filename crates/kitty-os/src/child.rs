@@ -524,7 +524,11 @@ impl ChildProcess {
                 continue;
             }
             if err == sys::ECHILD {
-                return Ok(None);
+                // Someone else reaped the child; report an unknown exit rather
+                // than pretending it is still running forever.
+                let status = ExitStatus::Unknown(-1);
+                self.exit_status = Some(status);
+                return Ok(Some(status));
             }
             return Err(io::Error::from_raw_os_error(err));
         }

@@ -49,12 +49,19 @@ impl Feature {
 
 impl fmt::Display for Feature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tag = self.tag.to_be_bytes();
+        if self.value == 0 {
+            return write!(
+                f,
+                "-{}{}{}{}",
+                tag[0] as char, tag[1] as char, tag[2] as char, tag[3] as char
+            );
+        }
         let mut raw = self.as_hb();
         let mut buf = [0 as core::ffi::c_char; 128];
         let n =
             unsafe { harfbuzz::hb_feature_to_string(&mut raw, buf.as_mut_ptr(), buf.len() as u32) };
         if n == 0 {
-            let tag = self.tag.to_be_bytes();
             write!(
                 f,
                 "{}{}{}{}={}",

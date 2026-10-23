@@ -288,6 +288,8 @@ pub const GL_TEXTURE_WRAP_R: u32 = 0x8072;
 pub const GL_TEXTURE_BORDER_COLOR: u32 = 0x1004;
 pub const GL_CLAMP_TO_BORDER: u32 = 0x812D;
 pub const GL_SRGB8_ALPHA8: u32 = 0x8C43;
+pub const GL_TEXTURE_SWIZZLE_RGBA: u32 = 0x8E46;
+pub const GL_CONSTANT_COLOR: u32 = 0x8001;
 pub const GL_R32UI: u32 = 0x8236;
 pub const GL_UNSIGNED_INT: u32 = 0x1405;
 
@@ -400,6 +402,8 @@ gl_fns! {
     glEnable: unsafe extern "C" fn(u32) = "glEnable",
     glDisable: unsafe extern "C" fn(u32) = "glDisable",
     glBlendFunc: unsafe extern "C" fn(u32, u32) = "glBlendFunc",
+    glBlendColor: unsafe extern "C" fn(f32, f32, f32, f32) = "glBlendColor",
+    glTexParameteriv: unsafe extern "C" fn(u32, u32, *const i32) = "glTexParameteriv",
     glClearColor: unsafe extern "C" fn(f32, f32, f32, f32) = "glClearColor",
     glClear: unsafe extern "C" fn(u32) = "glClear",
     glFinish: unsafe extern "C" fn() = "glFinish",

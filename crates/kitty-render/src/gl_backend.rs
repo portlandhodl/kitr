@@ -106,14 +106,14 @@ use crate::custom_shader::{
 use crate::egl::{
     ConfigAttribs, ContextConfig, EglError, GlApi, GlContext, GlError, GlFns, GlVersion, LoadError,
     GL_ARRAY_BUFFER, GL_BLEND, GL_CLAMP_TO_EDGE, GL_COLOR_ATTACHMENT0, GL_COLOR_BUFFER_BIT,
-    GL_COMPILE_STATUS, GL_CULL_FACE, GL_DEPTH_TEST, GL_DYNAMIC_DRAW, GL_FALSE, GL_FLOAT,
-    GL_FRAGMENT_SHADER, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_INFO_LOG_LENGTH, GL_LINEAR,
-    GL_LINK_STATUS, GL_NEAREST, GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_PACK_ALIGNMENT, GL_R32UI, GL_R8,
-    GL_R8UI, GL_RED, GL_RED_INTEGER, GL_RG8UI, GL_RGBA, GL_RGBA16F, GL_RGBA8, GL_RG_INTEGER,
-    GL_SCISSOR_TEST, GL_SRGB8_ALPHA8, GL_STATIC_DRAW, GL_TEXTURE0, GL_TEXTURE_2D,
-    GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S,
-    GL_TEXTURE_WRAP_T, GL_TRIANGLE_FAN, GL_UNIFORM_BUFFER, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE,
-    GL_UNSIGNED_INT, GL_VERTEX_SHADER,
+    GL_COMPILE_STATUS, GL_CONSTANT_COLOR, GL_CULL_FACE, GL_DEPTH_TEST, GL_DYNAMIC_DRAW, GL_FALSE,
+    GL_FLOAT, GL_FRAGMENT_SHADER, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_FRAMEBUFFER_SRGB,
+    GL_INFO_LOG_LENGTH, GL_LINEAR, GL_LINK_STATUS, GL_NEAREST, GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+    GL_PACK_ALIGNMENT, GL_R32UI, GL_R8, GL_R8UI, GL_RED, GL_RED_INTEGER, GL_RG8UI, GL_RGBA,
+    GL_RGBA16F, GL_RGBA8, GL_RG_INTEGER, GL_SCISSOR_TEST, GL_SRGB8_ALPHA8, GL_STATIC_DRAW,
+    GL_TEXTURE0, GL_TEXTURE_2D, GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
+    GL_TEXTURE_SWIZZLE_RGBA, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TRIANGLE_FAN,
+    GL_UNIFORM_BUFFER, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE, GL_UNSIGNED_INT, GL_VERTEX_SHADER,
 };
 use crate::geom::{Rect, Region};
 use crate::images::{ImageFilter, ImageKey, ImageWrap};
@@ -196,6 +196,11 @@ pub struct GlBackendConfig {
     pub text_contrast: f32,
     /// kitty cell-shader text gamma adjustment (reciprocal of the option).
     pub text_gamma_adjustment: f32,
+    /// Composite the frame in linear light, like kitty: draw into an sRGB
+    /// offscreen target with `GL_FRAMEBUFFER_SRGB` enabled, then blit it to
+    /// the window. Use together with [`GammaMode::Linear`] so instance
+    /// colours are linear; RGBA textures are uploaded as `SRGB8_ALPHA8`.
+    pub srgb_compositing: bool,
 }
 
 impl Default for GlBackendConfig {
@@ -207,6 +212,7 @@ impl Default for GlBackendConfig {
             cursor_radius: 0.0,
             text_contrast: 1.0,
             text_gamma_adjustment: 1.0,
+            srgb_compositing: false,
         }
     }
 }
@@ -1085,6 +1091,7 @@ pub struct GlBackend {
     cell_instance_capacity: usize,
     cell_sprites: Option<CellSprites>,
     cell_offscreen: Option<OffscreenTarget>,
+    composite_target: Option<OffscreenTarget>,
     cell_programs: bool,
     custom_pipeline: Option<InstalledCustomPipeline>,
     // Keep the context last: Rust drops fields in declaration order, so all
@@ -1228,6 +1235,7 @@ impl GlBackend {
             cell_instance_capacity: 0,
             cell_sprites: None,
             cell_offscreen: None,
+            composite_target: None,
             cell_programs: false,
             custom_pipeline: None,
             context,
@@ -2019,7 +2027,7 @@ impl GlBackend {
                     );
                     let (internal, format_enum) = match format {
                         AtlasFormat::Gray8 => (GL_R8 as i32, GL_RED),
-                        AtlasFormat::Rgba8 => (GL_RGBA8 as i32, GL_RGBA),
+                        AtlasFormat::Rgba8 => (self.rgba_texture_format() as i32, GL_RGBA),
                     };
                     (self.gl.glTexImage2D)(
                         GL_TEXTURE_2D,
@@ -2032,6 +2040,17 @@ impl GlBackend {
                         GL_UNSIGNED_BYTE,
                         page.data().as_ptr() as *const c_void,
                     );
+                    if format == AtlasFormat::Gray8 {
+                        // Sample coverage as premultiplied white (a, a, a, a)
+                        // so glyph masks are drawn with a single
+                        // premultiplication; see the Glyph batch in draw().
+                        let swizzle = [GL_RED as i32; 4];
+                        (self.gl.glTexParameteriv)(
+                            GL_TEXTURE_2D,
+                            GL_TEXTURE_SWIZZLE_RGBA,
+                            swizzle.as_ptr(),
+                        );
+                    }
                 }
                 self.atlas_pages.insert(
                     page_index,
@@ -2273,7 +2292,7 @@ impl GlBackend {
             let (internal_format, pixel_format) = match indexed_format {
                 Some(ImageFormat::IndexedAlpha) => (GL_RG8UI, GL_RG_INTEGER),
                 Some(_) => (GL_R8UI, GL_RED_INTEGER),
-                None => (GL_RGBA8, GL_RGBA),
+                None => (self.rgba_texture_format(), GL_RGBA),
             };
             let bytes_per_pixel = upload.bytes_per_pixel();
             let alignment = if indexed || bytes_per_pixel != 4 {
@@ -2856,7 +2875,10 @@ impl GlBackend {
             stats,
         );
 
+        // The cell programs blit their own linear layer with linear2srgb,
+        // which would be encoded twice into the sRGB composite target.
         let cell_mode = self.cell_programs
+            && !self.config.srgb_compositing
             && self
                 .cell_sprites
                 .as_ref()
@@ -3311,10 +3333,20 @@ impl GlBackend {
         use crate::shaders::ProgramKind;
 
         let background = self.storage_color(frame.default_bg);
+        let composite = if self.config.srgb_compositing {
+            Some(self.ensure_composite_target()?)
+        } else {
+            None
+        };
 
         // SAFETY: a context is current, the VAO holds the unit quad and every
         // program/texture id used below is live.
         unsafe {
+            if let Some(target) = composite {
+                (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, target.framebuffer);
+                (self.gl.glViewport)(0, 0, self.width as i32, self.height as i32);
+                (self.gl.glEnable)(GL_FRAMEBUFFER_SRGB);
+            }
             (self.gl.glBindVertexArray)(self.vao);
             (self.gl.glEnable)(GL_BLEND);
             (self.gl.glBlendFunc)(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -3430,10 +3462,17 @@ impl GlBackend {
                                 (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
                             }
                             BatchKind::Glyph { page, is_color } => {
+                                // Grey masks use the premultiplied graphics
+                                // program on the swizzled (a, a, a, a) atlas
+                                // and are tinted by the blend constant:
+                                // fg * a + dst * (1 - a), premultiplied once.
+                                // The alpha-mask program premultiplies its
+                                // output a second time, which squares the
+                                // coverage and makes text look thin.
                                 let kind = if is_color {
                                     ProgramKind::Graphics
                                 } else {
-                                    ProgramKind::GraphicsAlphaMask
+                                    ProgramKind::GraphicsPremult
                                 };
                                 let program = self.programs.get(kind);
                                 (self.gl.glUseProgram)(program.id);
@@ -3459,23 +3498,19 @@ impl GlBackend {
                                     ndc[3],
                                 );
                                 (self.gl.glUniform1i)(program.uniform("image"), 0);
-                                (self.gl.glUniform1f)(program.uniform("extra_alpha"), 1.0);
-                                if !is_color {
-                                    // Fold the foreground alpha into the mask
-                                    // colour; the generated alpha-mask pass has
-                                    // no separate alpha uniform.
-                                    (self.gl.glUniform3f)(
-                                        program.uniform("amask_fg"),
+                                if is_color {
+                                    (self.gl.glUniform1f)(program.uniform("extra_alpha"), 1.0);
+                                } else {
+                                    (self.gl.glUniform1f)(program.uniform("extra_alpha"), color[3]);
+                                    (self.gl.glBlendColor)(
                                         color[0] * color[3],
                                         color[1] * color[3],
                                         color[2] * color[3],
+                                        1.0,
                                     );
-                                    (self.gl.glUniform4f)(
-                                        program.uniform("amask_bg_premult"),
-                                        0.0,
-                                        0.0,
-                                        0.0,
-                                        0.0,
+                                    (self.gl.glBlendFunc)(
+                                        GL_CONSTANT_COLOR,
+                                        GL_ONE_MINUS_SRC_ALPHA,
                                     );
                                 }
                                 let texture = self
@@ -3485,6 +3520,9 @@ impl GlBackend {
                                     .unwrap_or(0);
                                 (self.gl.glBindTexture)(GL_TEXTURE_2D, texture);
                                 (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+                                if !is_color {
+                                    (self.gl.glBlendFunc)(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                                }
                             }
                             BatchKind::Image(key) => {
                                 let tint = instance.params[0].clamp(0.0, 1.0);
@@ -3692,9 +3730,73 @@ impl GlBackend {
             (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
             (self.gl.glBindVertexArray)(0);
             (self.gl.glUseProgram)(0);
+            if let Some(target) = composite {
+                (self.gl.glDisable)(GL_FRAMEBUFFER_SRGB);
+                self.blit_composite_target(target);
+            }
         }
         self.gl.check("draw")?;
         Ok(())
+    }
+
+    /// Internal format for RGBA colour textures (colour glyphs and images).
+    fn rgba_texture_format(&self) -> u32 {
+        if self.config.srgb_compositing {
+            GL_SRGB8_ALPHA8
+        } else {
+            GL_RGBA8
+        }
+    }
+
+    fn ensure_composite_target(&mut self) -> Result<OffscreenTarget, GlBackendError> {
+        let (width, height) = (self.width.max(1), self.height.max(1));
+        if let Some(target) = self.composite_target {
+            if target.width == width && target.height == height {
+                return Ok(target);
+            }
+        }
+        if let Some(old) = self.composite_target.take() {
+            // SAFETY: the objects are owned by this backend.
+            unsafe {
+                (self.gl.glDeleteFramebuffers)(1, &old.framebuffer);
+                (self.gl.glDeleteTextures)(1, &old.texture);
+            }
+        }
+        // SAFETY: a context is current.
+        let target =
+            unsafe { create_offscreen_target(&self.gl, width, height, GL_SRGB8_ALPHA8 as i32)? };
+        self.composite_target = Some(target);
+        Ok(target)
+    }
+
+    /// Copy the sRGB composite target to the window. Sampling the
+    /// `SRGB8_ALPHA8` texture decodes to linear and the blit program encodes
+    /// back to sRGB, as kitty's offscreen-to-window blit does.
+    ///
+    /// # Safety
+    /// A context must be current and `target` must be live.
+    unsafe fn blit_composite_target(&self, target: OffscreenTarget) {
+        use crate::shaders::ProgramKind;
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            (self.gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.glViewport)(0, 0, self.width as i32, self.height as i32);
+            (self.gl.glDisable)(GL_BLEND);
+            (self.gl.glDisable)(GL_SCISSOR_TEST);
+            let blit = self.programs.get(ProgramKind::Blit);
+            (self.gl.glUseProgram)(blit.id);
+            (self.gl.glUniform4f)(blit.uniform("src_rect"), 0.0, 0.0, 1.0, 1.0);
+            (self.gl.glUniform4f)(blit.uniform("dest_rect"), -1.0, -1.0, 1.0, 1.0);
+            (self.gl.glUniform1i)(blit.uniform("image"), 0);
+            (self.gl.glActiveTexture)(GL_TEXTURE0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, target.texture);
+            (self.gl.glBindVertexArray)(self.vao);
+            (self.gl.glDrawArrays)(GL_TRIANGLE_FAN, 0, 4);
+            (self.gl.glBindVertexArray)(0);
+            (self.gl.glBindTexture)(GL_TEXTURE_2D, 0);
+            (self.gl.glUseProgram)(0);
+            (self.gl.glEnable)(GL_BLEND);
+        }
     }
 
     fn scissor_rects(&self, frame: &Frame, config: &RenderConfig) -> Vec<ScissorRect> {
@@ -3841,6 +3943,10 @@ impl Drop for GlBackend {
             if let Some(sprites) = self.cell_sprites.take() {
                 let textures = [sprites.texture, sprites.decorations];
                 (self.gl.glDeleteTextures)(2, textures.as_ptr());
+            }
+            if let Some(target) = self.composite_target.take() {
+                (self.gl.glDeleteFramebuffers)(1, &target.framebuffer);
+                (self.gl.glDeleteTextures)(1, &target.texture);
             }
             if let Some(target) = self.cell_offscreen.take() {
                 (self.gl.glDeleteFramebuffers)(1, &target.framebuffer);

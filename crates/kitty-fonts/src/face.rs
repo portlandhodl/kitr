@@ -614,7 +614,7 @@ impl Face {
         let baseline = self.font_units_to_pixels_y(self.metrics.ascender);
         let bitmap_top = slot.bitmap_top;
         let rows = slot.bitmap.rows;
-        if bitmap_top <= 0 || (bitmap_top > 0 && (bitmap_top as u32) < baseline) {
+        if bitmap_top <= 0 || (bitmap_top as u32) < baseline {
             baseline.saturating_sub(bitmap_top.max(0) as u32) + rows
         } else {
             0

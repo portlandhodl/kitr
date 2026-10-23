@@ -18,6 +18,7 @@ use super::input::ModeTracker;
 use crate::inherited_env;
 
 const MAX_PENDING_INPUT: usize = 4 * 1024 * 1024;
+const EIO: i32 = 5;
 
 /// Everything needed to start a pane's child.
 #[derive(Clone, Debug, Default)]
@@ -40,6 +41,7 @@ pub(crate) struct Pane {
     pub exit_status: Option<ExitStatus>,
     pub exited_at: Option<Instant>,
     pub last_title: Option<String>,
+    pub default_title: String,
     pub columns: u32,
     pub rows: u32,
 }
@@ -59,6 +61,7 @@ impl Pane {
         } else {
             spec.argv.clone()
         };
+        let default_title = super::default_window_title(&command);
         let mut config = SpawnConfig::new(command[0].clone());
         config.argv = command;
         let mut env = inherited_env();
@@ -99,7 +102,8 @@ impl Pane {
             pty_eof: false,
             exit_status: None,
             exited_at: None,
-            last_title: spec.title.clone(),
+            last_title: Some(spec.title.clone().unwrap_or_else(|| default_title.clone())),
+            default_title,
             columns: columns.max(1),
             rows: rows.max(1),
         })
@@ -122,20 +126,29 @@ impl Pane {
         }
         let mut total = 0usize;
         for _ in 0..16 {
-            match loop_utils::read_once(self.child.master_fd(), &mut self.read_buffer)? {
-                IoOutcome::Completed(0) => {
+            match loop_utils::read_once(self.child.master_fd(), &mut self.read_buffer) {
+                Ok(IoOutcome::Completed(0)) => {
                     self.pty_eof = true;
                     break;
                 }
-                IoOutcome::Completed(n) => {
+                Ok(IoOutcome::Completed(n)) => {
                     let chunk = self.read_buffer[..n].to_vec();
                     self.tracker.feed(&chunk);
                     self.handler.feed(&mut self.parser, &chunk);
                     self.output_bytes += n as u64;
                     total += n;
                 }
-                IoOutcome::WouldBlock => break,
-                IoOutcome::Interrupted => continue,
+                Ok(IoOutcome::WouldBlock) => break,
+                Ok(IoOutcome::Interrupted) => continue,
+                Err(error) => {
+                    // Linux PTYs report EIO on the master once the slave side
+                    // is closed. Treat it as EOF so the child is still reaped.
+                    if error.raw_os_error() == Some(EIO) {
+                        self.pty_eof = true;
+                        break;
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(total)
@@ -162,6 +175,14 @@ impl Pane {
     pub(crate) fn check(&mut self) -> io::Result<Option<ExitStatus>> {
         if self.exit_status.is_none() {
             if let Some(status) = self.child.try_wait()? {
+                self.exit_status = Some(status);
+                self.exited_at = Some(Instant::now());
+                return Ok(Some(status));
+            }
+            if self.pty_eof {
+                // The slave closed but the status is not available (for
+                // example because it was reaped elsewhere). Close the pane.
+                let status = ExitStatus::Unknown(-1);
                 self.exit_status = Some(status);
                 self.exited_at = Some(Instant::now());
                 return Ok(Some(status));

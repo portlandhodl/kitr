@@ -1,3 +1,28 @@
+kitr (0.1.3-1) unstable; urgency=medium
+
+  * Fix text drawn too thin: glyph masks were premultiplied twice.
+  * Composite frames in linear light into an sRGB target, like kitty.
+  * Draw emoji-presentation text from a colour font, like kitty.
+  * Downscale colour glyphs with area averaging instead of point sampling.
+  * Show command/host-based tab and window titles and keep them updated from
+    OSC 0/2, with sanitised single-line fallbacks.
+  * Make the tab bar clickable, add middle-click close and text-select cursors.
+  * Restore drag selection, double/triple-click word and line selection,
+    selection rendering and copy.
+  * Keep the application alive when one tab exits; treat PTY EIO as EOF so
+    exited tabs are reaped reliably.
+
+ -- kitr contributors <maintainers@portlandhodl.example>  Fri, 23 Oct 2026 03:30:00 +0000
+
+kitr (0.1.2-1) unstable; urgency=medium
+
+  * Send mouse reports with the CSI introducer.
+  * Do not treat xterm modifyOtherKeys (CSI > ... m) as SGR.
+  * Load kitty.conf from the kitty config directory by default.
+  * Match font names as full and PostScript names, like kitty.
+
+ -- kitr contributors <maintainers@portlandhodl.example>  Fri, 23 Oct 2026 02:30:00 +0000
+
 kitr (0.1.1-1) unstable; urgency=medium
 
   * Fix runtime dependencies for current distributions.

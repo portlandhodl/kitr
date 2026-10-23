@@ -191,7 +191,8 @@ Options:\n\
   --timeout SECONDS  Kill the child after SECONDS (fractional values allowed)\n\
   --headless         Force the old headless runner\n\
   --gui              Force the X11/EGL window frontend\n\
-  --config PATH      Load configuration from PATH\n\
+  --config PATH      Load configuration from PATH (default: kitty.conf from\n\
+                     the kitty config directory; NONE loads no file)\n\
   --title TITLE      Set the window title\n\
   --screenshot FILE  Render a few frames, write FILE as PPM (P6), then exit\n\
   --session FILE     Restore tabs/windows/layouts from a kitty session file\n\

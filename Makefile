@@ -28,7 +28,7 @@ PARITY_THRESHOLD ?= 5.0
 PARITY_ARTIFACTS ?= artifacts/screenshot-parity
 PARITY_ARGS ?=
 DIST ?= dist
-VERSION ?= 0.1.1
+VERSION ?= 0.1.3
 PARITY_CORPUS ?= scripts/parity_corpus
 ARCH ?= $(shell uname -m)
 

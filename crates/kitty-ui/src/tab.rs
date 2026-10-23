@@ -277,7 +277,8 @@ impl Tab {
             self.windows
                 .active_window()
                 .map(|w| w.effective_title().to_string())
-                .unwrap_or_default()
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "kitr".to_string())
         }
     }
 

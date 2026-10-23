@@ -3,7 +3,7 @@
 %global _hardened_build 1
 
 Name:           kitr
-Version:        0.1.1
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Fast GPU-accelerated terminal emulator (kitty-compatible Rust port)
 License:        GPL-3.0-or-later
@@ -64,6 +64,14 @@ cargo test --workspace --lib
 %{_mandir}/man1/kitr.1*
 
 %changelog
+* Fri Oct 23 2026 kitr contributors <maintainers@portlandhodl.example> - 0.1.3-1
+- Render text and colour emoji like kitty
+- Add live tab/window titles, clickable tabs and restored mouse selection
+- Keep the app running when an individual tab exits
+
+* Fri Oct 23 2026 kitr contributors <maintainers@portlandhodl.example> - 0.1.2-1
+- Fix mouse reports, modifyOtherKeys handling, config loading and font matching
+
 * Thu Oct 22 2026 kitr contributors <maintainers@portlandhodl.example> - 0.1.1-1
 - Fix Debian dependencies and bundle the application icon
 

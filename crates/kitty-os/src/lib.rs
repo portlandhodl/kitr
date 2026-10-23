@@ -23,7 +23,7 @@ pub mod monotonic;
 pub mod pty;
 
 #[cfg(target_os = "linux")]
-mod sys;
+pub mod sys;
 
 pub use child::{
     decode_wait_status, reap_pid, spawn, Child, ChildProcess, ExecFailure, ExecStage, ExecStatus,

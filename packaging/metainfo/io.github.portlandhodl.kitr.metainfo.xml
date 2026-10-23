@@ -35,6 +35,23 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.3" date="2026-10-23">
+      <description>
+        <p>Renders text like kitty: glyph coverage is no longer squared,
+        frames are composited in linear light, colour emoji come from a
+        colour font and are downscaled with area averaging. Tab and window
+        titles now follow the active command and OSC titles, the tab bar and
+        text selection are fully mouse-driven, and one exiting tab no longer
+        closes the application.</p>
+      </description>
+    </release>
+    <release version="0.1.2" date="2026-10-23">
+      <description>
+        <p>Fixes mouse reports, stops treating xterm modifyOtherKeys as SGR,
+        loads kitty.conf by default and matches fonts by full and PostScript
+        name like kitty.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-10-22">
       <description>
         <p>Fixes Debian runtime dependencies, bundles application icons and

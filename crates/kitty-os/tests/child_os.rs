@@ -717,3 +717,43 @@ fn monitor_does_not_leave_children_behind() {
     let status = kitty_os::reap_pid(pid, Some(Duration::from_secs(5))).unwrap();
     assert!(status.signal().is_some(), "unexpected status {status:?}");
 }
+
+#[test]
+fn try_wait_reaps_an_exited_child() {
+    let mut child = spawn(&sh("exit 0")).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child was never reaped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn try_wait_reports_exit_after_an_external_reap() {
+    let mut child = spawn(&sh("exit 0")).unwrap();
+    let pid = child.pid();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let mut status = 0i32;
+        let ret = unsafe { kitty_os::sys::waitpid(pid, &mut status, kitty_os::sys::WNOHANG) };
+        if ret == pid {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child was never reaped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        child.try_wait().unwrap(),
+        Some(kitty_os::child::ExitStatus::Unknown(-1))
+    );
+}

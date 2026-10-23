@@ -121,11 +121,9 @@ fn parse_color(params: &[i32], i: &mut usize, result: &mut u32) {
     let attr = params[*i] as u32;
     *i += 1;
     match attr {
-        5 => {
-            if *i < params.len() {
-                *result = (((params[*i] as u32) & 0xff) << 8) | 1;
-                *i += 1;
-            }
+        5 if *i < params.len() => {
+            *result = (((params[*i] as u32) & 0xff) << 8) | 1;
+            *i += 1;
         }
         2 if *i + 2 < params.len() => {
             if *i + 3 < params.len() {

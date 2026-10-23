@@ -1,5 +1,5 @@
 .\" SPDX-License-Identifier: GPL-3.0-or-later
-.TH KITR 1 "2026-10-22" "kitr 0.1.1" "User Commands"
+.TH KITR 1 "2026-10-23" "kitr 0.1.3" "User Commands"
 .SH NAME
 kitr \- early Linux/X11 Rust port of the kitty terminal emulator
 .SH SYNOPSIS
@@ -30,7 +30,8 @@ Force the Linux/X11 + EGL GUI frontend. This requires a working X11 display,
 EGL, and system fonts.
 .TP
 .BI \-\-config " PATH"
-Load configuration from \fIPATH\fR instead of the default locations. The
+Load configuration from \fIPATH\fR instead of the default locations. Use
+\fBNONE\fR to load no configuration file. The
 current port implements a subset of kitty's options; unknown options are
 ignored leniently.
 .TP

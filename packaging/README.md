@@ -133,7 +133,7 @@ experimentation, not as a claim of full shell-integration support.
 - `icons/` contains original SVG artwork and rendered hicolor PNGs;
   `make install` installs every available size plus the scalable SVG.
 - `metainfo/io.github.portlandhodl.kitr.metainfo.xml` is an AppStream skeleton.
-  The release is a packaging placeholder for version 0.1.1.
+  The release is a packaging placeholder for version 0.1.3.
 - `man/kitr.1` documents the current CLI: `--headless`, `--gui`, `--config`,
   `--size`, `--screenshot`, `--timeout`, `-e`/`--`, plus the currently
   implemented `--dump-screen`, `--scrollback`, `--title`, `-c`, `-h`, `-V`.
@@ -175,7 +175,7 @@ decorations for C kitty, but does not attempt to match fonts or scale.
 `make package` builds the workspace, stages a `DESTDIR` install under
 `dist/stage` with `PREFIX=/usr`, checks the installed layout and launcher, runs
 `scripts/package_smoke.py`, and writes
-`dist/kitr-0.1.1-linux-<arch>.tar.gz`.
+`dist/kitr-0.1.3-linux-<arch>.tar.gz`.
 
 Distribution metadata skeletons live in:
 

@@ -38,10 +38,10 @@ use kitty_remote::{
 };
 use kitty_render::{
     pane_border_rects, AtlasConfig, CellMetrics, ColorResolver, DecorationInstance, DecorationKind,
-    Frame, GlBackend, GlBackendConfig, GlFns, InstanceFlags, LineRange, PaneBorderPane,
+    Frame, GammaMode, GlBackend, GlBackendConfig, GlFns, InstanceFlags, LineRange, PaneBorderPane,
     RenderConfig, RendererCore, Rgba8, SelectionRange, SolidRect,
 };
-use kitty_screen::{CursorShape, Modes, Screen};
+use kitty_screen::{CursorShape, Modes, Screen, SelectionMode};
 use kitty_ui::{
     parse_sessions, AddWindowOptions, Edge, Edges, LayoutAddOptions, LayoutConfig, Region,
     RestorePlan, SessionOptions, TabId, TabManager, Window, WindowId, WindowLocation,
@@ -74,6 +74,55 @@ fn config_cursor(shape: ConfigCursorShape) -> CursorShape {
 
 fn layout_base(name: &str) -> &str {
     name.split_once(':').map(|(base, _)| base).unwrap_or(name)
+}
+
+/// Default title for a window: the basename of the launched program, matching
+/// kitty's `Window.default_title`.
+fn default_window_title(argv: &[OsString]) -> String {
+    let name = argv
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "kitr".to_string());
+    if matches!(name.as_str(), "ssh" | "mosh" | "telnet") {
+        let mut args = argv.iter().skip(1);
+        while let Some(arg) = args.next() {
+            let arg = arg.to_string_lossy();
+            if arg.starts_with('-') {
+                if matches!(
+                    arg.as_ref(),
+                    "-p" | "-l"
+                        | "-o"
+                        | "-i"
+                        | "-F"
+                        | "-J"
+                        | "-c"
+                        | "-D"
+                        | "-E"
+                        | "-e"
+                        | "-m"
+                        | "-S"
+                        | "-b"
+                        | "-w"
+                        | "-O"
+                        | "-Q"
+                        | "-R"
+                        | "-W"
+                ) {
+                    args.next();
+                }
+                continue;
+            }
+            return format!("{name}: {arg}");
+        }
+    }
+    name
+}
+
+/// Titles come from untrusted OSC data; keep them on one line.
+fn sanitize_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Enabled layouts for a new tab. When `splits` is enabled it is made the
@@ -424,6 +473,8 @@ pub struct GuiSession {
     mouse_down: bool,
     /// Visual cell under the pointer, used for OSC 8 hover highlighting.
     hover_cell: Option<(u32, u32)>,
+    /// Previous left click for double/triple click selection.
+    last_click: Option<(Instant, (u32, u32), u8)>,
     last_title: Option<String>,
     timed_out: bool,
     exit_status: Option<ExitStatus>,
@@ -514,7 +565,14 @@ impl GuiSession {
             gl,
             surface_width,
             surface_height,
-            GlBackendConfig::default(),
+            // kitty composites text and colours in linear light into an
+            // sRGB framebuffer; plain sRGB blending makes light-on-dark text
+            // look thinner than in kitty.
+            GlBackendConfig {
+                gamma: GammaMode::Linear,
+                srgb_compositing: true,
+                ..GlBackendConfig::default()
+            },
         )
         .map_err(|error| io_err(format!("cannot create OpenGL backend: {error}")))?;
 
@@ -585,6 +643,7 @@ impl GuiSession {
             should_close: false,
             mouse_down: false,
             hover_cell: None,
+            last_click: None,
             last_title: Some(title),
             timed_out: false,
             exit_status: None,
@@ -676,7 +735,15 @@ impl GuiSession {
                     .title
                     .clone()
                     .or_else(|| window_spec.launch.title.clone())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| {
+                        let argv: Vec<OsString> =
+                            window_spec.launch.args.iter().map(OsString::from).collect();
+                        if argv.is_empty() {
+                            default_window_title(&[self.default_shell()])
+                        } else {
+                            default_window_title(&argv)
+                        }
+                    });
                 let mut window = Window::new(wid, title);
                 self.apply_window_decorations(&mut window);
                 window.serialized_id = if window_spec.serialized_id != 0 {
@@ -966,8 +1033,14 @@ impl GuiSession {
         opts: LayoutAddOptions,
     ) -> io::Result<WindowId> {
         let wid = self.alloc_window_id();
-        let title = spec.title.clone().unwrap_or_default();
-        let mut window = Window::new(wid, title);
+        let title = spec.title.clone().unwrap_or_else(|| {
+            if spec.argv.is_empty() {
+                default_window_title(&[self.default_shell()])
+            } else {
+                default_window_title(&spec.argv)
+            }
+        });
+        let mut window = Window::new(wid, title.clone());
         self.apply_window_decorations(&mut window);
         let tab = self
             .tab_manager
@@ -985,6 +1058,7 @@ impl GuiSession {
                 .into_iter()
                 .chain(self.base_env(Some(wid)))
                 .collect(),
+            title: Some(title),
             ..spec
         };
         match Pane::spawn(
@@ -1078,6 +1152,7 @@ impl GuiSession {
         }
         self.relayout_all();
         self.need_redraw = true;
+        self.update_window_title();
         true
     }
 
@@ -1177,6 +1252,33 @@ impl GuiSession {
 
     pub fn window_size(&self) -> (u32, u32) {
         self.pixel_size
+    }
+
+    /// Width and height of one terminal cell in device pixels.
+    pub fn cell_size(&self) -> (f32, f32) {
+        (self.metrics.cell_width, self.metrics.cell_height)
+    }
+
+    /// Title currently applied to the OS window.
+    pub fn window_title(&self) -> &str {
+        self.window.title()
+    }
+
+    /// Read the current clipboard contents (best effort; for tests).
+    pub fn clipboard_text(&mut self) -> Option<String> {
+        self.window
+            .clipboard_text_blocking(WindowSelection::Clipboard, Duration::from_millis(500))
+            .ok()
+    }
+
+    /// Rendered tab hit boxes as `(tab index, start cell, end cell)`.
+    pub fn tab_ranges(&self) -> &[(usize, u32, u32)] {
+        &self.tab_ranges
+    }
+
+    /// Whether the tab bar is currently drawn at the top edge.
+    pub fn tab_bar_at_top(&self) -> bool {
+        self.config_options.tab_bar_edge.is_top()
     }
 
     /// Height of the tab-bar strip in device pixels (zero when hidden).
@@ -1466,6 +1568,12 @@ impl GuiSession {
                 self.output_bytes += count as u64;
             }
             if let Some(title) = pane.tracker.title.take() {
+                let title = sanitize_title(&title);
+                let title = if title.is_empty() {
+                    pane.default_title.clone()
+                } else {
+                    title
+                };
                 if pane.last_title.as_deref() != Some(title.as_str()) {
                     pane.last_title = Some(title.clone());
                     titles.push((*wid, title));
@@ -1553,6 +1661,8 @@ impl GuiSession {
             WindowEvent::Leave { .. } => {
                 self.mouse_down = false;
                 self.hover_cell = None;
+                self.window
+                    .set_pointer_shape(kitty_window::PointerShape::Default);
             }
             WindowEvent::SelectionNotify { .. } | WindowEvent::SelectionRequest { .. } => {}
             WindowEvent::Wakeup
@@ -1737,12 +1847,14 @@ impl GuiSession {
                     tab.next_window(1);
                 }
                 self.need_redraw = true;
+                self.update_window_title();
             }
             "previous_window" => {
                 if let Some(tab) = self.tab_manager.active_tab_mut() {
                     tab.next_window(-1);
                 }
                 self.need_redraw = true;
+                self.update_window_title();
             }
             "neighboring_window" | "focus_window" => {
                 if let Some(edge) = words.get(1).and_then(|word| edge_from_name(word)) {
@@ -1875,6 +1987,7 @@ impl GuiSession {
                 ..Default::default()
             },
         );
+        self.update_window_title();
     }
 
     fn focus_direction(&mut self, edge: Edge) {
@@ -1883,6 +1996,7 @@ impl GuiSession {
         };
         tab.neighboring_window(edge);
         self.need_redraw = true;
+        self.update_window_title();
     }
 
     fn copy_selection(&mut self) {
@@ -1927,9 +2041,17 @@ impl GuiSession {
         modifiers: kitty_window::Modifiers,
     ) {
         if self.in_tab_bar(y) {
-            if pressed && button == kitty_window::MouseButton::Left {
+            if pressed {
                 if let Some(idx) = self.tab_at_x(x) {
-                    self.select_tab(idx);
+                    match button {
+                        kitty_window::MouseButton::Left => {
+                            self.select_tab(idx);
+                        }
+                        kitty_window::MouseButton::Middle => {
+                            self.close_tab_at(idx);
+                        }
+                        _ => {}
+                    }
                 }
             }
             return;
@@ -1940,6 +2062,7 @@ impl GuiSession {
                     tab.set_active_window(wid);
                 }
                 self.need_redraw = true;
+                self.update_window_title();
             }
         }
         let Some(wid) = self.tab_manager.active_window_id() else {
@@ -1983,9 +2106,34 @@ impl GuiSession {
         }
         if pressed {
             self.mouse_down = true;
-            pane.handler
-                .screen
-                .start_selection(position.cell_x, position.cell_y);
+            let cell = (position.cell_x, position.cell_y);
+            let clicks = match self.last_click {
+                Some((at, previous, count))
+                    if at.elapsed() < Duration::from_millis(400) && previous == cell =>
+                {
+                    (count % 3) + 1
+                }
+                _ => 1,
+            };
+            self.last_click = Some((Instant::now(), cell, clicks));
+            if clicks == 1 {
+                pane.handler
+                    .screen
+                    .start_selection(position.cell_x, position.cell_y);
+            } else {
+                let mode = if clicks == 2 {
+                    SelectionMode::Word
+                } else {
+                    SelectionMode::Line
+                };
+                pane.handler.screen.start_selection_mode(
+                    position.cell_x,
+                    position.cell_y,
+                    mode,
+                    false,
+                    true,
+                );
+            }
         } else {
             self.mouse_down = false;
             pane.handler
@@ -2001,8 +2149,20 @@ impl GuiSession {
 
     fn handle_mouse_move(&mut self, x: f64, y: f64, modifiers: kitty_window::Modifiers) {
         if self.in_tab_bar(y) {
+            let shape = if self.tab_at_x(x).is_some() {
+                kitty_window::PointerShape::Pointer
+            } else {
+                kitty_window::PointerShape::Default
+            };
+            self.window.set_pointer_shape(shape);
             return;
         }
+        self.window
+            .set_pointer_shape(if self.pane_at(x, y).is_some() {
+                kitty_window::PointerShape::Text
+            } else {
+                kitty_window::PointerShape::Default
+            });
         let Some(wid) = self.tab_manager.active_window_id() else {
             return;
         };
@@ -2085,7 +2245,7 @@ impl GuiSession {
                 button,
                 mods,
             ) {
-                pane.write(&bytes);
+                pane.write(&input::with_csi(bytes));
             }
         } else if delta_y > 0.0 {
             pane.scrollback_up();
@@ -2121,7 +2281,9 @@ impl GuiSession {
     }
 
     fn tab_at_x(&self, x: f64) -> Option<usize> {
-        let x = x.max(0.0) as u32;
+        // `tab_ranges` are cell columns; pointer coordinates are device pixels.
+        let cell_width = self.metrics.cell_width.max(1.0) as f64;
+        let x = (x.max(0.0) / cell_width).floor() as u32;
         self.tab_ranges
             .iter()
             .find(|(_, start, end)| x >= *start && x < *end)
@@ -3068,8 +3230,36 @@ fn start_remote(listen_on: Option<&OsStr>) -> io::Result<RemoteRuntime> {
 }
 
 fn load_config(options: &Options) -> Config {
-    let paths: Vec<PathBuf> = options.config.iter().map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = match options.config.as_deref() {
+        // kitty's `--config NONE` skips config files entirely.
+        Some(path) if path == "NONE" => Vec::new(),
+        Some(path) => vec![PathBuf::from(path)],
+        None => default_config_path().into_iter().collect(),
+    };
     Config::load_lenient(&paths, &[] as &[&str])
+}
+
+/// The first existing `kitty.conf`, searched in kitty's config-directory
+/// order: only `$KITTY_CONFIG_DIRECTORY` when set, otherwise
+/// `$XDG_CONFIG_HOME/kitty` (or `~/.config/kitty`), then `$XDG_CONFIG_DIRS`.
+fn default_config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("KITTY_CONFIG_DIRECTORY") {
+        let path = PathBuf::from(dir).join("kitty.conf");
+        return path.is_file().then_some(path);
+    }
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+        dirs.push(PathBuf::from(dir).join("kitty"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".config/kitty"));
+    }
+    let system = std::env::var("XDG_CONFIG_DIRS").unwrap_or_else(|_| "/etc/xdg".to_owned());
+    for dir in system.split(':').filter(|dir| !dir.is_empty()) {
+        dirs.push(PathBuf::from(dir).join("kitty"));
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join("kitty.conf"))
+        .find(|path| path.is_file())
 }
 
 fn write_ppm(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
@@ -3137,6 +3327,65 @@ mod keymap_tests {
         assert_eq!(
             keys.dispatch(&event),
             MappingResult::Action("previous_tab".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_window_title, sanitize_title, tab_title_chars};
+    use std::ffi::OsString;
+
+    fn argv(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn default_titles_use_the_program_basename() {
+        assert_eq!(default_window_title(&argv(&["/usr/bin/bash"])), "bash");
+        assert_eq!(
+            default_window_title(&argv(&["/bin/sh", "-c", "true"])),
+            "sh"
+        );
+    }
+
+    #[test]
+    fn default_titles_include_the_ssh_host() {
+        assert_eq!(
+            default_window_title(&argv(&["ssh", "-p", "2222", "user@example.com"])),
+            "ssh: user@example.com"
+        );
+        assert_eq!(
+            default_window_title(&argv(&["/usr/bin/mosh", "example.com"])),
+            "mosh: example.com"
+        );
+    }
+
+    #[test]
+    fn default_titles_fall_back_to_kitr() {
+        assert_eq!(default_window_title(&[]), "kitr");
+        assert_eq!(default_window_title(&argv(&[""])), "kitr");
+    }
+
+    #[test]
+    fn titles_are_collapsed_onto_one_line() {
+        assert_eq!(sanitize_title("build\r\nhost"), "build host");
+        assert_eq!(sanitize_title("  spaced\tout  "), "spaced out");
+    }
+
+    #[test]
+    fn tab_titles_truncate_with_an_ellipsis() {
+        assert_eq!(
+            tab_title_chars("abcdef", 4).into_iter().collect::<String>(),
+            "abc…"
+        );
+        assert_eq!(
+            tab_title_chars("abc", 10).into_iter().collect::<String>(),
+            "abc"
+        );
+        assert_eq!(
+            tab_title_chars("abc", 0).into_iter().collect::<String>(),
+            ""
         );
     }
 }

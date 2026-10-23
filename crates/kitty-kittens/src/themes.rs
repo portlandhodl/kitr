@@ -191,12 +191,11 @@ pub fn parse_theme_text(text: &str) -> (ThemeMetadata, BTreeMap<String, String>)
                     let key = key.trim().to_ascii_lowercase();
                     let value = value.trim().to_owned();
                     match key.as_str() {
-                        "name" => {
+                        "name"
                             if value
-                                != "The name of the theme (if not present, derived from filename)"
-                            {
-                                metadata.name = value;
-                            }
+                                != "The name of the theme (if not present, derived from filename)" =>
+                        {
+                            metadata.name = value;
                         }
                         "author" => metadata.author = value,
                         "upstream" => metadata.upstream = value,

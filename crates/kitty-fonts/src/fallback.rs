@@ -81,6 +81,7 @@ impl FontStack {
         if let Some(requested) = spec.primary_family() {
             if (style == FontStyle::Regular || explicit_bold_or_italic)
                 && !family_matches(requested, &matched)
+                && !face_name_matches(requested, &matched)
             {
                 eprintln!(
                     "kitr: configured font family {requested:?} did not match; using {:?}",
@@ -191,6 +192,24 @@ impl FontStack {
                 return Ok(Some(idx));
             }
         }
+        if wants_color(&[codepoint]) {
+            if let Some(idx) = self
+                .faces
+                .iter()
+                .position(|f| f.has_color() && f.has_codepoint(codepoint))
+            {
+                return Ok(Some(idx));
+            }
+            if let Some(fc) = self.fontconfig {
+                if let Some(matched) = fc.match_for_codepoint(codepoint, self.style, true)? {
+                    if matched.color {
+                        if let Some(idx) = self.consider_fallback(&matched, &[codepoint])? {
+                            return Ok(Some(idx));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(idx) = self.faces.iter().position(|f| f.has_codepoint(codepoint)) {
             return Ok(Some(idx));
         }
@@ -217,11 +236,24 @@ impl FontStack {
                 return Ok(Some(idx));
             }
         }
-        if let Some(idx) = self
-            .faces
-            .iter()
-            .position(|f| codepoints.iter().all(|&cp| f.has_codepoint(cp)))
-        {
+        let covers = |f: &Face| codepoints.iter().all(|&cp| f.has_codepoint(cp));
+        if wants_color(codepoints) {
+            if let Some(idx) = self.faces.iter().position(|f| f.has_color() && covers(f)) {
+                return Ok(Some(idx));
+            }
+            if let Some(fc) = self.fontconfig {
+                if let Some(matched) =
+                    fc.match_for_codepoints(codepoints.iter().copied(), self.style, true)?
+                {
+                    if matched.color {
+                        if let Some(idx) = self.consider_fallback(&matched, codepoints)? {
+                            return Ok(Some(idx));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(idx) = self.faces.iter().position(covers) {
             return Ok(Some(idx));
         }
         if let Some(fc) = self.fontconfig {
@@ -388,6 +420,45 @@ fn family_matches(requested: &str, matched: &MatchedFace) -> bool {
         .unwrap_or(false)
 }
 
+/// kitty's `has_emoji_presentation()`: an emoji drawn two cells wide
+/// (by default, or via VS16) and not followed by VS15 is drawn from a colour
+/// font when one covers it.
+fn wants_color(codepoints: &[u32]) -> bool {
+    let Some(&first) = codepoints.first() else {
+        return false;
+    };
+    if codepoints.get(1) == Some(&0xFE0E) {
+        return false;
+    }
+    let props = kitty_unicode::char_props_for(first);
+    props.is_emoji()
+        && (kitty_unicode::wcwidth_std(props) == 2 || codepoints.get(1) == Some(&0xFE0F))
+}
+
+/// Match `name` as an exact full name or PostScript name.
+fn match_face_name(fc: &Fontconfig, name: &str) -> Result<Option<MatchedFace>> {
+    let query = crate::discovery::FontQuery::new().full_name(name);
+    if let Some(m) = fc.match_font(&query)? {
+        if face_name_matches(name, &m) {
+            return Ok(Some(m));
+        }
+    }
+    if let Some(m) = fc.match_postscript_name(name)? {
+        if face_name_matches(name, &m) {
+            return Ok(Some(m));
+        }
+    }
+    Ok(None)
+}
+
+fn face_name_matches(requested: &str, matched: &MatchedFace) -> bool {
+    let requested = family_key(requested);
+    [&matched.full_name, &matched.postscript_name]
+        .into_iter()
+        .flatten()
+        .any(|name| family_key(name) == requested)
+}
+
 fn match_spec(
     fc: &Fontconfig,
     spec: &FontSpec,
@@ -414,6 +485,11 @@ fn match_spec(
                 best = Some(m);
             }
         }
+        // Like kitty's `find_best_match()`, a plain name may also be a face's
+        // full name ("JetBrainsMono NF Bold") or PostScript name.
+        if let Some(m) = match_face_name(fc, family)? {
+            return Ok(Some(m));
+        }
     }
     if best.is_some() {
         // Fontconfig substituted a different family. Prefer the configured
@@ -439,6 +515,28 @@ mod tests {
         assert!(family_matches("jetbrainsmononerdfont", &matched));
         assert!(family_matches("JetBrainsMono Nerd Font", &matched));
         assert!(!family_matches("Some Other Font", &matched));
+    }
+
+    #[test]
+    fn emoji_presentation_wants_color() {
+        assert!(wants_color(&[0x1F600]));
+        assert!(!wants_color(&[0x1F600, 0xFE0E]));
+        assert!(wants_color(&[0x2764, 0xFE0F]));
+        assert!(!wants_color(&[0x2764]));
+        assert!(!wants_color(&['a' as u32]));
+    }
+
+    #[test]
+    fn full_and_postscript_names_match() {
+        let matched = MatchedFace {
+            family: Some("JetBrainsMono Nerd Font".into()),
+            full_name: Some("JetBrainsMono NF Bold".into()),
+            postscript_name: Some("JetBrainsMonoNF-Bold".into()),
+            ..MatchedFace::default()
+        };
+        assert!(face_name_matches("JetBrainsMono NF Bold", &matched));
+        assert!(face_name_matches("jetbrainsmononf-bold", &matched));
+        assert!(!face_name_matches("JetBrainsMono NF Italic", &matched));
     }
 
     #[test]

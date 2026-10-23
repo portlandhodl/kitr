@@ -404,23 +404,17 @@ pub fn run_line_ui(
                 tty.write_all(b"\r\n")?;
                 return Ok(None);
             }
-            Key::Backspace => {
-                if cursor > 0 {
-                    cursor -= 1;
-                    let byte = text
-                        .char_indices()
-                        .nth(cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(text.len());
-                    text.remove(byte);
-                }
+            Key::Backspace if cursor > 0 => {
+                cursor -= 1;
+                let byte = text
+                    .char_indices()
+                    .nth(cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(text.len());
+                text.remove(byte);
             }
             Key::Left => cursor = cursor.saturating_sub(1),
-            Key::Right => {
-                if cursor < text.chars().count() {
-                    cursor += 1;
-                }
-            }
+            Key::Right if cursor < text.chars().count() => cursor += 1,
             Key::Home => cursor = 0,
             Key::End => cursor = text.chars().count(),
             Key::Char(ch) => {

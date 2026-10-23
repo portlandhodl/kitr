@@ -372,7 +372,17 @@ impl Handler for ScreenHandler {
             }
             b'h' => self.handle_mode(params, true),
             b'l' => self.handle_mode(params, false),
-            b'm' => self.handle_sgr(params),
+            b'm' => {
+                // `CSI > Pp ; Pv m` is xterm's XTMODKEYS (modifyOtherKeys),
+                // not SGR; applying it as SGR turns `>4;2m` into underline+dim.
+                if params.primary() == 0 && secondary == 0 {
+                    self.handle_sgr(params);
+                } else if params.primary() == b'>' {
+                    self.report_error("Ignoring xterm modifyOtherKeys (XTMODKEYS) escape code");
+                } else {
+                    self.report_error("Unsupported CSI m sequence");
+                }
+            }
             b's' => {
                 if params.primary() == 0 && secondary == 0 && params.is_empty() {
                     self.screen.save_cursor();
@@ -593,6 +603,14 @@ mod tests {
         assert_eq!(h.screen.cursor.sgr.fg, (200 << 8) | 1);
         feed(&mut h, b"\x1b[38;2;1;2;3m");
         assert_eq!(h.screen.cursor.sgr.fg, (1 << 24) | (2 << 16) | (3 << 8) | 2);
+    }
+
+    #[test]
+    fn xtmodkeys_is_not_sgr() {
+        let mut h = handler(5, 5);
+        feed(&mut h, b"\x1b[>4;2m");
+        assert_eq!(h.screen.cursor.sgr.decoration, 0);
+        assert!(!h.screen.cursor.sgr.dim);
     }
 
     #[test]

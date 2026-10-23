@@ -234,18 +234,35 @@ fn scale_glyph(
     let width = ((bitmap.width as f64 * scale).round() as u32).max(1);
     let height = ((bitmap.height as f64 * scale).round() as u32).max(1);
     let bpp = bitmap.bytes_per_pixel();
+    // Average every source pixel a destination pixel covers, like kitty's
+    // downsample_32bit_image(). Point sampling a 136px emoji down to a cell
+    // skips most of the image and garbles it. Colour bitmaps are
+    // premultiplied, so averaging the channels directly is correct.
     let mut data = vec![0u8; width as usize * height as usize * bpp];
+    let span = |dest: usize, dest_len: u32, src_len: u32| {
+        let start = dest * src_len as usize / dest_len as usize;
+        let end = ((dest + 1) * src_len as usize).div_ceil(dest_len as usize);
+        start..end.clamp(start + 1, src_len as usize)
+    };
+    let mut sums = vec![0u32; bpp];
     for y in 0..height as usize {
-        let sy = ((y as f64 + 0.5) * bitmap.height as f64 / height as f64)
-            .floor()
-            .min(bitmap.height as f64 - 1.0) as usize;
+        let rows = span(y, height, bitmap.height);
         for x in 0..width as usize {
-            let sx = ((x as f64 + 0.5) * bitmap.width as f64 / width as f64)
-                .floor()
-                .min(bitmap.width as f64 - 1.0) as usize;
-            let src = sy * bitmap.pitch + sx * bpp;
+            let cols = span(x, width, bitmap.width);
+            sums.fill(0);
+            for sy in rows.clone() {
+                for sx in cols.clone() {
+                    let src = sy * bitmap.pitch + sx * bpp;
+                    for (sum, value) in sums.iter_mut().zip(&bitmap.data[src..src + bpp]) {
+                        *sum += u32::from(*value);
+                    }
+                }
+            }
+            let count = (rows.len() * cols.len()) as u32;
             let dst = (y * width as usize + x) * bpp;
-            data[dst..dst + bpp].copy_from_slice(&bitmap.data[src..src + bpp]);
+            for (out, sum) in data[dst..dst + bpp].iter_mut().zip(&sums) {
+                *out = ((sum + count / 2) / count) as u8;
+            }
         }
     }
     let scaled_left = (bitmap.left as f64 * scale).round() as i32;

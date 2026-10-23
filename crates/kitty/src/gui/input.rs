@@ -349,7 +349,17 @@ pub fn send_mouse(
     action: MouseAction,
     modifiers: Modifiers,
 ) -> Option<Vec<u8>> {
-    dispatch_mouse_event(ctx, position, button, action, modifiers)
+    dispatch_mouse_event(ctx, position, button, action, modifiers).map(with_csi)
+}
+
+/// The mouse encoders return only the report body, matching
+/// `encode_mouse_event()` in mouse.c; kitty adds the CSI introducer when it
+/// writes the report with `write_escape_code_to_child()`.
+pub fn with_csi(body: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 2);
+    out.extend_from_slice(b"\x1b[");
+    out.extend_from_slice(&body);
+    out
 }
 
 /// Whether a press/release should be sent to the child rather than used for a

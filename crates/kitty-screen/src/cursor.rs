@@ -192,12 +192,10 @@ fn parse_color(params: &[i32], i: &mut usize, result: &mut u32) {
     let attr = params[*i] as u32;
     *i += 1;
     match attr {
-        5 => {
-            if *i < params.len() {
-                let idx = (params[*i] as u32) & 0xff;
-                *i += 1;
-                *result = (idx << 8) | 1;
-            }
+        5 if *i < params.len() => {
+            let idx = (params[*i] as u32) & 0xff;
+            *i += 1;
+            *result = (idx << 8) | 1;
         }
         2 if *i + 2 < params.len() => {
             // Ignore the optional colour-space id in a four parameter RGB
